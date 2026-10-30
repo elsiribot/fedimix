@@ -439,13 +439,83 @@ fn in_range(name: &str, v: f64, min: f64, max: f64) -> Result<u64, String> {
     }
 }
 
+/// `host[:port]`, or `[ipv6][:port]`.
+fn valid_host_port(authority: &str, port_required: bool) -> bool {
+    let host_ok = |h: &str| {
+        !h.is_empty()
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    };
+    let port_ok = |p: &str| p.parse::<u16>().is_ok_and(|p| p != 0);
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        let good_host =
+            !host.is_empty() && host.bytes().all(|b| b.is_ascii_hexdigit() || b == b':');
+        return good_host
+            && match tail.strip_prefix(':') {
+                Some(port) => port_ok(port),
+                None => tail.is_empty() && !port_required,
+            };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => host_ok(host) && port_ok(port),
+        None => host_ok(authority) && !port_required,
+    }
+}
+
+/// Esplora: `http(s)://host[:port][/path]`. Electrum: `ssl|tcp://host:port`.
+pub fn validate_server_url(electrum: bool, url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if electrum {
+        let authority = url
+            .strip_prefix("ssl://")
+            .or_else(|| url.strip_prefix("tcp://"));
+        return match authority {
+            Some(a) if valid_host_port(a, true) => Ok(()),
+            _ => Err("Enter the server as ssl://host:port or tcp://host:port".to_string()),
+        };
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("Server URL must start with https:// or http://")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if valid_host_port(authority, false) && !path.contains(char::is_whitespace) {
+        Ok(())
+    } else {
+        Err("Server URL needs a valid host, for example https://host/api".to_string())
+    }
+}
+
+/// Empty, or `[socks5://|socks5h://]host:port`. A proxy that does not parse
+/// must never be dropped in favour of a direct connection.
+pub fn validate_proxy(proxy: &str) -> Result<(), String> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return Ok(());
+    }
+    let authority = proxy
+        .strip_prefix("socks5://")
+        .or_else(|| proxy.strip_prefix("socks5h://"))
+        .unwrap_or(proxy);
+    if valid_host_port(authority, true) {
+        Ok(())
+    } else {
+        Err("Enter the proxy as host:port, for example 127.0.0.1:9050".to_string())
+    }
+}
+
 /// Validate the Settings form and build the new [`Settings`] from it.
 pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
     let url = form.url.trim();
     if url.is_empty() {
         return Err("Enter a server URL".to_string());
     }
+    validate_server_url(form.electrum, url)?;
     let proxy = form.proxy.trim();
+    validate_proxy(proxy)?;
     Ok(Settings {
         spending_target: parse_btc(form.target_btc).map_err(|e| user_message(&e))?,
         anonymity_target: in_range("Anonymity target", form.anonymity_target, 1.0, 1000.0)? as u32,
@@ -1097,6 +1167,83 @@ mod settings_form_tests {
         f.proxy = " 127.0.0.1:9050 ";
         let s = settings_from_form(&f).unwrap();
         assert_eq!(s.socks5_proxy.as_deref(), Some("127.0.0.1:9050"));
+    }
+
+    #[test]
+    fn esplora_urls_need_http_and_a_host() {
+        for good in [
+            "https://blockstream.info/api",
+            "http://localhost:3000",
+            "http://[::1]:3000/api",
+            "https://mempool.space/api/",
+        ] {
+            assert_eq!(validate_server_url(false, good), Ok(()), "{good}");
+        }
+        for bad in [
+            "",
+            "https",
+            "https:",
+            "https://",
+            "https://:80",
+            "ftp://example.com",
+            "ssl://example.com:50002",
+            "example.com",
+            "https://exa mple.com",
+            "https://example.com:notaport",
+            "https://example.com:99999",
+        ] {
+            assert!(validate_server_url(false, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn electrum_urls_need_a_port() {
+        for good in ["ssl://electrum.example:50002", "tcp://10.0.0.1:50001"] {
+            assert_eq!(validate_server_url(true, good), Ok(()), "{good}");
+        }
+        for bad in [
+            "ssl://electrum.example",
+            "https://electrum.example:50002",
+            "electrum.example:50002",
+            "ssl://electrum.example:50002/path",
+        ] {
+            assert!(validate_server_url(true, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn proxy_is_host_and_port() {
+        for good in [
+            "",
+            "127.0.0.1:9050",
+            "localhost:9050",
+            "[::1]:9050",
+            "socks5://127.0.0.1:9050",
+            "socks5h://tor.local:9050",
+        ] {
+            assert_eq!(validate_proxy(good), Ok(()), "{good}");
+        }
+        for bad in [
+            "127.0.0.1",
+            ":9050",
+            "127.0.0.1:",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "http://127.0.0.1:9050",
+            "exa mple:9050",
+        ] {
+            assert!(validate_proxy(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn form_with_a_bad_network_field_is_refused() {
+        let mut f = form();
+        f.url = "https://electrum.example:50002";
+        assert!(settings_from_form(&f).is_err());
+        let mut f = form();
+        f.proxy = "127.0.0.1";
+        assert!(settings_from_form(&f).is_err());
     }
 
     #[test]

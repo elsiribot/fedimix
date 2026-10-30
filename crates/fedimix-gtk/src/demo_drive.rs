@@ -10,11 +10,14 @@
 //!   `<label>`; open dialogs are searched first. Polls up to 3 s.
 //! - `type <title> <text>` (title optionally in double quotes): set an entry
 //!   or spin row by title.
-//! - `expect <text>`: wait up to 3 s for a mapped label containing `<text>`.
+//! - `expect <text>`: wait up to 3 s for a mapped label or entry containing
+//!   `<text>`.
 //! - `wait <ms>`, `shot <name>` (prints `SHOT <name>`, then waits for a line
 //!   on stdin, or 500 ms when stdin is a terminal or closed).
 //! - `expect-not <text>`: wait up to 3 s until no mapped label contains `<text>`.
 //! - `expect-absent <text>`: no label holds `<text>`, even on a hidden page.
+//! - `expect-pinned`: the page on top of the window cannot be popped.
+//! - `apply <title>`: press the apply button of an entry row.
 //! - `expect-locked`: the open dialog cannot be closed and its page cannot be
 //!   popped, which is what Escape and Back go through.
 //! - `activate`: activate the application again, as a second launch does.
@@ -46,6 +49,8 @@ pub enum Step {
     ExpectNot(String),
     ExpectAbsent(String),
     ExpectLocked,
+    ExpectPinned,
+    Apply(String),
     CloseDialog,
     Activate,
     ExpectWindows(usize),
@@ -83,6 +88,8 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "expect-not" => Step::ExpectNot(need("text")?),
         "expect-absent" => Step::ExpectAbsent(need("text")?),
         "expect-locked" => Step::ExpectLocked,
+        "expect-pinned" => Step::ExpectPinned,
+        "apply" => Step::Apply(need("a title")?),
         "close-dialog" => Step::CloseDialog,
         "activate" => Step::Activate,
         "expect-windows" => Step::ExpectWindows(
@@ -126,6 +133,8 @@ impl fmt::Display for Step {
             Step::ExpectNot(t) => write!(f, "expect-not {t}"),
             Step::ExpectAbsent(t) => write!(f, "expect-absent {t}"),
             Step::ExpectLocked => write!(f, "expect-locked"),
+            Step::ExpectPinned => write!(f, "expect-pinned"),
+            Step::Apply(t) => write!(f, "apply {t}"),
             Step::CloseDialog => write!(f, "close-dialog"),
             Step::Activate => write!(f, "activate"),
             Step::ExpectWindows(n) => write!(f, "expect-windows {n}"),
@@ -199,6 +208,17 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             poll(|| locked(env).then_some(()))
                 .await
                 .ok_or("the dialog can still be closed or popped")?;
+        }
+        Step::ExpectPinned => {
+            poll(|| pinned(env).then_some(()))
+                .await
+                .ok_or("the page can still be popped")?;
+        }
+        Step::Apply(title) => {
+            poll(|| apply_entry(env, title).then_some(()))
+                .await
+                .ok_or_else(|| format!("no entry titled '{title}'"))?;
+            glib::timeout_future(Duration::from_millis(150)).await;
         }
         Step::CloseDialog => {
             let dialog = env.window.visible_dialog().ok_or("no dialog is open")?;
@@ -322,6 +342,29 @@ fn locked(env: &Env) -> bool {
     pinned && !dialog.can_close()
 }
 
+fn pinned(env: &Env) -> bool {
+    descendants(env.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::NavigationView>().ok())
+        .filter(|nav| nav.is_mapped() && nav.navigation_stack().n_items() > 1)
+        .filter_map(|nav| nav.visible_page())
+        .any(|page| !page.can_pop())
+}
+
+fn apply_entry(env: &Env, title: &str) -> bool {
+    for root in roots(env) {
+        for w in descendants(&root).iter().filter(|w| live(w)) {
+            if let Some(row) = w.downcast_ref::<adw::EntryRow>()
+                && row.title() == title
+            {
+                row.emit_by_name::<()>("apply", &[]);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn live(w: &gtk::Widget) -> bool {
     w.is_mapped() && w.is_sensitive()
 }
@@ -335,11 +378,17 @@ fn label_texts(w: &gtk::Widget) -> Vec<String> {
         .collect()
 }
 
+/// Labels and entry contents count as visible text.
 fn has_label_containing(env: &Env, text: &str) -> bool {
     roots(env).iter().any(|r| {
         descendants(r).iter().any(|d| {
-            d.downcast_ref::<gtk::Label>()
-                .is_some_and(|l| l.is_mapped() && l.text().contains(text))
+            let label = d
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|l| l.text().contains(text));
+            let entry = d
+                .downcast_ref::<gtk::Text>()
+                .is_some_and(|t| t.text().contains(text));
+            d.is_mapped() && (label || entry)
         })
     })
 }
@@ -474,6 +523,8 @@ expect Fedi Alpha
 expect-not Cover traffic
 expect-absent bc1q
 expect-locked
+expect-pinned
+apply Server URL
 close-dialog
 activate
 expect-windows 1
@@ -497,6 +548,8 @@ action app.settings
                 Step::ExpectNot("Cover traffic".into()),
                 Step::ExpectAbsent("bc1q".into()),
                 Step::ExpectLocked,
+                Step::ExpectPinned,
+                Step::Apply("Server URL".into()),
                 Step::CloseDialog,
                 Step::Activate,
                 Step::ExpectWindows(1),

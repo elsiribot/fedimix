@@ -1,0 +1,39 @@
+# scenario: funded
+# Network fields wait for Apply. An invalid one shows why, blocks Back, and Revert undoes it.
+action app.settings
+expect Server URL
+type "Server URL" ftp://bad
+expect Server URL must start with
+expect-pinned
+shot invalid-url
+apply Server URL
+expect Server URL must start with
+click Revert
+expect-not Server URL must start with
+expect https://blockstream.info/api
+# A partial proxy is an error, never a silent direct connection.
+type "SOCKS5 proxy (optional)" 127.0.0.1
+expect Enter the proxy as host:port
+expect-pinned
+# Valid but not applied: Back drops it, even after the old debounce delay.
+type "SOCKS5 proxy (optional)" 127.0.0.1:9050
+expect-not Enter the proxy as host:port
+wait 600
+click Back
+action app.settings
+expect Server URL
+expect-not 127.0.0.1:9050
+# Applied: it survives reopening.
+type "SOCKS5 proxy (optional)" 127.0.0.1:9050
+apply SOCKS5 proxy (optional)
+click Back
+action app.settings
+expect 127.0.0.1:9050
+shot proxy-kept
+# A bad spending target is held too.
+type "Target (BTC)" abc
+expect Enter a valid amount
+expect-pinned
+click Revert
+expect-not Enter a valid amount
+click Back

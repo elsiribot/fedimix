@@ -1,5 +1,6 @@
-//! Settings page. Changes apply as they are made: spin rows and entries feed
-//! one debounced write through `set_settings`.
+//! Settings page. Exit, cover and target changes apply as they are made,
+//! through one debounced write. Network fields apply on request instead: a
+//! half-typed server or proxy must never take effect.
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -36,7 +37,45 @@ struct Inner {
     proxy: adw::EntryRow,
     /// Last settings written (or loaded); fields the form lacks come from it.
     current: RefCell<Settings>,
+    /// Network values in force. Debounced writes use these, not the fields.
+    network: RefCell<Network>,
+    /// Says what is wrong with the form, and offers to revert it.
+    banner: adw::Banner,
+    page: glib::WeakRef<adw::NavigationPage>,
     timer: RefCell<Option<glib::SourceId>>,
+}
+
+#[derive(Clone)]
+struct Network {
+    backend: ChainBackend,
+    proxy: Option<String>,
+}
+
+impl Network {
+    fn of(settings: &Settings) -> Self {
+        Self {
+            backend: settings.chain_backend.clone(),
+            proxy: settings.socks5_proxy.clone(),
+        }
+    }
+
+    fn is_electrum(&self) -> bool {
+        matches!(self.backend, ChainBackend::Electrum { .. })
+    }
+
+    fn url(&self) -> &str {
+        match &self.backend {
+            ChainBackend::Esplora { url } | ChainBackend::Electrum { url } => url,
+        }
+    }
+}
+
+fn target_text(settings: &Settings) -> String {
+    format::btc_exact(settings.spending_target)
+        .trim_end_matches(" BTC")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 fn spin(title: &str, min: f64, max: f64, value: f64) -> adw::SpinRow {
@@ -49,6 +88,12 @@ fn spin(title: &str, min: f64, max: f64, value: f64) -> adw::SpinRow {
 fn entry(title: &str, text: &str) -> adw::EntryRow {
     let row = adw::EntryRow::builder().title(title).build();
     row.set_text(text);
+    row
+}
+
+fn network_entry(title: &str, text: &str) -> adw::EntryRow {
+    let row = entry(title, text);
+    row.set_show_apply_button(true);
     row
 }
 
@@ -67,15 +112,14 @@ pub fn push(ctx: &Rc<AppContext>) {
 }
 
 fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInfo>) {
-    let (backend_index, url) = match &settings.chain_backend {
-        ChainBackend::Esplora { url } => (0, url.as_str()),
-        ChainBackend::Electrum { url } => (1, url.as_str()),
-    };
+    let network = Network::of(&settings);
     let backend = adw::ComboRow::builder()
         .title("Server type")
         .model(&gtk::StringList::new(&["Esplora", "Electrum"]))
-        .selected(backend_index)
+        .selected(u32::from(network.is_electrum()))
         .build();
+    let toolbar = adw::ToolbarView::new();
+    let nav_page = adw::NavigationPage::new(&toolbar, "Settings");
 
     let inner = Rc::new(Inner {
         ctx: ctx.clone(),
@@ -86,13 +130,7 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
         fed_shown: RefCell::default(),
         hw_name: adw::ActionRow::builder().title("Device").build(),
         hw_status: adw::ActionRow::builder().title("Status").build(),
-        target: entry(
-            "Target (BTC)",
-            format::btc_exact(settings.spending_target)
-                .trim_end_matches(" BTC")
-                .trim_end_matches('0')
-                .trim_end_matches('.'),
-        ),
+        target: entry("Target (BTC)", &target_text(&settings)),
         anonymity: spin(
             "Anonymity target",
             1.0,
@@ -124,12 +162,15 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
             settings.cover_budget_sat_per_month as f64,
         ),
         backend,
-        url: entry("Server URL", url),
-        proxy: entry(
+        url: network_entry("Server URL", network.url()),
+        proxy: network_entry(
             "SOCKS5 proxy (optional)",
-            settings.socks5_proxy.as_deref().unwrap_or(""),
+            network.proxy.as_deref().unwrap_or(""),
         ),
         current: RefCell::new(settings),
+        network: RefCell::new(network),
+        banner: adw::Banner::builder().button_label("Revert").build(),
+        page: nav_page.downgrade(),
         timer: RefCell::default(),
     });
     inner
@@ -188,23 +229,34 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
             move |_, _| schedule(&weak)
         });
     }
-    for row in [&inner.target, &inner.url, &inner.proxy] {
+    inner.target.connect_changed({
+        let weak = weak.clone();
+        move |_| schedule(&weak)
+    });
+    for row in [&inner.url, &inner.proxy] {
         row.connect_changed({
             let weak = weak.clone();
-            move |_| schedule(&weak)
+            move |_| with(&weak, |inner| inner.validate())
+        });
+        row.connect_apply({
+            let weak = weak.clone();
+            move |_| with(&weak, Inner::apply_network)
         });
     }
     inner.backend.connect_selected_notify({
         let weak = weak.clone();
-        move |_| schedule(&weak)
+        move |_| with(&weak, Inner::apply_network)
+    });
+    inner.banner.connect_button_clicked({
+        let weak = weak.clone();
+        move |_| with(&weak, |inner| inner.revert())
     });
 
     inner.render_federations(&federations, ctx.latest().as_ref());
 
-    let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&inner.banner);
     toolbar.set_content(Some(&page));
-    let nav_page = adw::NavigationPage::new(&toolbar, "Settings");
 
     ctx.on_snapshots({
         let weak = weak.clone();
@@ -228,9 +280,16 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
     ctx.nav.push(&nav_page);
 }
 
+fn with(weak: &Weak<Inner>, f: impl FnOnce(&Rc<Inner>)) {
+    if let Some(inner) = weak.upgrade() {
+        f(&inner);
+    }
+}
+
 /// (Re)start the quiet period; the write happens when it expires.
 fn schedule(weak: &Weak<Inner>) {
     let Some(inner) = weak.upgrade() else { return };
+    inner.validate();
     if let Some(id) = inner.timer.borrow_mut().take() {
         id.remove();
     }
@@ -254,53 +313,110 @@ fn flush(weak: &Weak<Inner>) {
 }
 
 impl Inner {
-    fn apply(self: &Rc<Self>) {
+    /// The form's settings with the given network values.
+    fn build(&self, electrum: bool, url: &str, proxy: &str) -> Result<Settings, String> {
         let target = self.target.text();
-        let url = self.url.text();
-        let proxy = self.proxy.text();
-        let form = SettingsForm {
+        present::settings_from_form(&SettingsForm {
             target_btc: &target,
             anonymity_target: self.anonymity.value(),
             min_hours: self.min_hours.value(),
             grace_minutes: self.grace.value(),
             fee_guard_percent: self.fee_guard.value(),
             cover_budget_sat: self.budget.value(),
-            electrum: self.backend.selected() == 1,
-            url: &url,
-            proxy: &proxy,
-        };
-        let result = present::settings_from_form(&form);
-        let target_bad = parse_btc(&target).is_err();
-        let url_bad = url.trim().is_empty();
-        set_error(&self.target, target_bad);
-        set_error(&self.url, url_bad);
-        match result {
-            Ok(settings) => {
-                if *self.current.borrow() == settings {
-                    return;
-                }
-                let core = self.ctx.bridge.core();
-                let weak = Rc::downgrade(self);
-                let saved = settings.clone();
-                // `current` only advances once the write succeeded, so a
-                // failed write is retried by the next edit.
-                self.ctx.run(
-                    async move { core.set_settings(settings).await },
-                    move |()| {
-                        if let Some(inner) = weak.upgrade() {
+            electrum,
+            url,
+            proxy,
+        })
+    }
+
+    /// The settings the fields say, network included.
+    fn field_settings(&self) -> Result<Settings, String> {
+        self.build(
+            self.backend.selected() == 1,
+            &self.url.text(),
+            &self.proxy.text(),
+        )
+    }
+
+    /// Show what is wrong, if anything. An invalid form cannot be popped:
+    /// leaving would lose it unsaid, so the banner offers Revert instead.
+    fn validate(&self) {
+        let electrum = self.backend.selected() == 1;
+        let url = self.url.text();
+        set_error(&self.target, parse_btc(&self.target.text()).is_err());
+        set_error(
+            &self.url,
+            present::validate_server_url(electrum, &url).is_err(),
+        );
+        set_error(
+            &self.proxy,
+            present::validate_proxy(&self.proxy.text()).is_err(),
+        );
+        let problem = self.field_settings().err();
+        self.banner.set_title(problem.as_deref().unwrap_or(""));
+        self.banner.set_revealed(problem.is_some());
+        if let Some(page) = self.page.upgrade() {
+            page.set_can_pop(problem.is_none());
+        }
+    }
+
+    /// Debounced write of everything but the network fields.
+    fn apply(self: &Rc<Self>) {
+        let network = self.network.borrow().clone();
+        let proxy = network.proxy.as_deref().unwrap_or("");
+        if let Ok(settings) = self.build(network.is_electrum(), network.url(), proxy) {
+            self.write(settings);
+        }
+    }
+
+    fn apply_network(self: &Rc<Self>) {
+        self.validate();
+        if let Ok(settings) = self.field_settings() {
+            *self.network.borrow_mut() = Network::of(&settings);
+            self.write(settings);
+        }
+    }
+
+    fn write(self: &Rc<Self>, settings: Settings) {
+        if *self.current.borrow() == settings {
+            return;
+        }
+        let core = self.ctx.bridge.core();
+        let weak = Rc::downgrade(self);
+        let saved = settings.clone();
+        let ctx = self.ctx.clone();
+        // `current` only advances once the write succeeded, so a failed
+        // write is retried by the next edit.
+        self.ctx.bridge.call(
+            async move { core.set_settings(settings).await },
+            move |res| {
+                let inner = weak.upgrade();
+                match res {
+                    Ok(()) => {
+                        if let Some(inner) = inner {
                             *inner.current.borrow_mut() = saved;
                         }
-                    },
-                );
-            }
-            Err(msg) => {
-                self.target.set_tooltip_text(Some(if target_bad {
-                    &msg
-                } else {
-                    "In BTC, for example 0.05"
-                }));
-            }
-        }
+                    }
+                    Err(e) => {
+                        ctx.toast(&present::user_message(&e));
+                        if let Some(inner) = inner {
+                            let network = Network::of(&inner.current.borrow());
+                            *inner.network.borrow_mut() = network;
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Put every field back to the values in force.
+    fn revert(&self) {
+        let network = self.network.borrow().clone();
+        self.target.set_text(&target_text(&self.current.borrow()));
+        self.url.set_text(network.url());
+        self.proxy.set_text(network.proxy.as_deref().unwrap_or(""));
+        self.backend.set_selected(u32::from(network.is_electrum()));
+        self.validate();
     }
 
     fn update(self: &Rc<Self>, s: &Snapshots) {
