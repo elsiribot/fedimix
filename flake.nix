@@ -47,8 +47,18 @@
           libadwaita
         ];
 
+        # cleanCargoSource keeps only Cargo and Rust files, but the GTK crate
+        # embeds style.css via include_str!. Every target shares this source.
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          name = "source";
+          filter =
+            path: type: craneLib.filterCargoSources path type || builtins.match ".*\\.css$" path != null;
+        };
+
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          inherit src;
+          pname = "fedimix";
           strictDeps = true;
           inherit nativeBuildInputs buildInputs;
         };
@@ -59,6 +69,10 @@
           commonArgs
           // {
             inherit cargoArtifacts;
+            # Test binaries are not wrapped; they load GTK from here.
+            preCheck = ''
+              export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath buildInputs}
+            '';
             meta.mainProgram = "fedimix";
           }
         );
@@ -75,7 +89,7 @@
               cargoClippyExtraArgs = "--all-targets -- -D warnings";
             }
           );
-          fmt = craneLib.cargoFmt { src = commonArgs.src; };
+          fmt = craneLib.cargoFmt { inherit src; inherit (commonArgs) pname; };
         };
 
         devShells.default = pkgs.mkShell {

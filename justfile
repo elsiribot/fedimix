@@ -22,6 +22,11 @@ clippy:
 fmt:
     cargo fmt --all
 
+# Build the release package and run the flake checks (clippy, fmt, tests)
+build-nix:
+    nix build
+    nix flake check
+
 # Render the app headlessly to target/screenshots/<name>.png
 screenshot name *args:
     scripts/screenshot.sh target/screenshots/{{name}}.png -- {{args}}
