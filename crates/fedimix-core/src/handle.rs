@@ -58,17 +58,32 @@ impl Fedimix {
     pub async fn prepare_send(&self, request: SendRequest) -> Result<SendPreview> {
         self.backend.prepare_send(request).await
     }
-    pub async fn confirm_send(&self, preview_id: String) -> Result<()> {
+    /// Starts the send and returns at once; see [`crate::Event::Operation`].
+    pub async fn confirm_send(&self, preview_id: String) -> Result<OperationId> {
         self.backend.confirm_send(preview_id).await
     }
     pub async fn prepare_refill(&self) -> Result<RefillPreview> {
         self.backend.prepare_refill().await
     }
-    pub async fn confirm_refill(&self, preview_id: String) -> Result<()> {
+    /// Starts the refill and returns at once; see [`crate::Event::Operation`].
+    pub async fn confirm_refill(&self, preview_id: String) -> Result<OperationId> {
         self.backend.confirm_refill(preview_id).await
     }
-    pub async fn exit_now(&self, item_id: String) -> Result<()> {
-        self.backend.exit_now(item_id).await
+    pub async fn prepare_exit(&self, item_id: String) -> Result<ExitPreview> {
+        self.backend.prepare_exit(item_id).await
+    }
+    /// Starts the exit and returns at once; see [`crate::Event::Operation`].
+    pub async fn exit_now(&self, preview_id: String) -> Result<OperationId> {
+        self.backend.exit_now(preview_id).await
+    }
+    /// Forget a preview the user walked away from. Unknown ids are fine.
+    pub async fn discard_preview(&self, preview_id: String) -> Result<()> {
+        self.backend.discard_preview(preview_id).await
+    }
+    /// Ask to stop an operation. Only possible before it broadcasts; once
+    /// too late it runs on, and the outcome arrives as usual.
+    pub async fn cancel_operation(&self, id: OperationId) -> Result<()> {
+        self.backend.cancel_operation(id).await
     }
     pub async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()> {
         self.backend.set_coin_frozen(outpoint, frozen).await

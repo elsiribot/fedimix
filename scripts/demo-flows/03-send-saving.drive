@@ -11,6 +11,12 @@ click 0.01230000 BTC
 expect Change → Spending
 shot review-details
 click Confirm on Ledger Nano S+
+# Back and Escape are off while the operation runs; each state is shown.
+expect-locked
+expect Signing on Ledger Nano S+
+shot signing
+expect Broadcasting
+expect Payment sent
 # Only true after the send: no fixture row has -0.0123 or this change.
 expect −0.0123
 expect change → Spending · 0.941

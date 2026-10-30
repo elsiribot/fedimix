@@ -2,7 +2,7 @@
 
 use crate::format;
 use fedimix_core::api::*;
-use fedimix_core::{DestinationKind, parse_btc, parse_destination};
+use fedimix_core::{DestinationKind, Event, parse_btc, parse_destination};
 
 const DOT: &str = "\u{b7}";
 const CHEVRON: &str = "\u{203a}";
@@ -264,6 +264,46 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::Cancelled => "Cancelled".to_string(),
         E::Internal(why) => format!("Something went wrong: {why}"),
     }
+}
+
+/// Whether an event can change the snapshots. Progress of an operation does
+/// not; its end usually does.
+pub fn event_needs_refresh(event: &Event) -> bool {
+    match event {
+        Event::Operation { state, .. } => state.is_final(),
+        Event::Notification(_) => false,
+        _ => true,
+    }
+}
+
+/// What the Send review says while an operation runs. `device` is the name
+/// of the signing device.
+pub fn operation_caption(state: &OperationState, device: &str) -> String {
+    match state {
+        OperationState::AwaitingDevice => format!("Waiting for {device}\u{2026}"),
+        OperationState::Signing => format!("Signing on {device}\u{2026}"),
+        OperationState::Broadcasting => "Broadcasting\u{2026}".to_string(),
+        OperationState::Done => "Done".to_string(),
+        OperationState::Failed { error } => user_message(error),
+        OperationState::Cancelled => "Cancelled".to_string(),
+    }
+}
+
+/// Whether an operation in `state` can still be stopped.
+pub fn operation_cancellable(state: &OperationState) -> bool {
+    matches!(
+        state,
+        OperationState::AwaitingDevice | OperationState::Signing
+    )
+}
+
+/// Body of the "Exit now?" dialog.
+pub fn exit_warning(preview: &ExitPreview) -> String {
+    format!(
+        "Leaving early lowers your privacy: this note will be withdrawn with a \
+         smaller anonymity set. Withdrawal fee: {}.",
+        format::sats(preview.fee)
+    )
 }
 
 /// Whether the amount field is hidden: the destination carries an amount.
@@ -841,6 +881,41 @@ mod tests {
     }
 
     #[test]
+    fn only_final_operation_states_refresh() {
+        let op = |state| Event::Operation {
+            id: "a".into(),
+            kind: OperationKind::Send,
+            state,
+        };
+        assert!(!event_needs_refresh(&op(OperationState::Signing)));
+        assert!(event_needs_refresh(&op(OperationState::Done)));
+        assert!(event_needs_refresh(&Event::QueueChanged));
+        assert!(!event_needs_refresh(&Event::Notification(
+            fedimix_core::Notice::SendConfirmed {
+                amount: Amount::ZERO
+            }
+        )));
+    }
+
+    #[test]
+    fn operation_captions() {
+        use OperationState as S;
+        let text = |s: S| operation_caption(&s, "Coldcard");
+        assert_eq!(text(S::AwaitingDevice), "Waiting for Coldcard\u{2026}");
+        assert_eq!(text(S::Signing), "Signing on Coldcard\u{2026}");
+        assert_eq!(text(S::Broadcasting), "Broadcasting\u{2026}");
+        assert_eq!(
+            text(S::Failed {
+                error: fedimix_core::FedimixError::DeviceRejected
+            }),
+            "The device rejected the transaction"
+        );
+        assert!(operation_cancellable(&S::AwaitingDevice));
+        assert!(operation_cancellable(&S::Signing));
+        assert!(!operation_cancellable(&S::Broadcasting));
+    }
+
+    #[test]
     fn refill_overshoot_note_text() {
         assert_eq!(
             refill_overshoot_note(sat(2_120_000)),
@@ -852,11 +927,30 @@ mod tests {
     /// Same call sequence the UI uses, checked through the presentation layer.
     #[tokio::test]
     async fn demo_flow_presentation() {
-        use fedimix_core::{DemoBackend, DemoScenario, Fedimix, SendRequest};
+        use fedimix_core::{
+            DemoBackend, DemoScenario, DemoTiming, EventStream, Fedimix, SendRequest,
+        };
+        use std::time::Duration;
         const NOW: Timestamp = 1_793_318_400;
+        const FAST: DemoTiming = DemoTiming {
+            step: Duration::from_millis(1),
+            preview_ttl: Duration::from_secs(600),
+        };
+        let demo = |scenario| Fedimix::new(DemoBackend::with_timing(scenario, FAST));
+        async fn done(events: &EventStream, id: OperationId) {
+            loop {
+                if let Some(Event::Operation { id: got, state, .. }) = events.next().await
+                    && got == id
+                    && state.is_final()
+                {
+                    assert_eq!(state, OperationState::Done);
+                    return;
+                }
+            }
+        }
 
         // First run: join, then set up Saving.
-        let core = Fedimix::new(DemoBackend::new(DemoScenario::FirstRun));
+        let core = demo(DemoScenario::FirstRun);
         let invite = core.suggested_federations().await.unwrap()[0]
             .invite
             .clone();
@@ -868,7 +962,8 @@ mod tests {
         assert!(sp.federation.is_some());
 
         // Funded: caption, send review, history rows, exit now.
-        let core = Fedimix::new(DemoBackend::new(DemoScenario::Funded));
+        let core = demo(DemoScenario::Funded);
+        let events = core.subscribe();
         let sp = core.spending_state().await.unwrap();
         let caption = spending_caption(&sp);
         assert!(caption.opens_queue && !caption.shows_refill);
@@ -886,7 +981,7 @@ mod tests {
         assert!(change_text(&preview.change).is_some());
         let (label, enabled) = confirm_button(WalletKind::Saving, saving.device.as_ref());
         assert!(enabled && label.starts_with("Confirm on "));
-        core.confirm_send(preview.id).await.unwrap();
+        done(&events, core.confirm_send(preview.id).await.unwrap()).await;
         let saving = core.saving_state().await.unwrap();
         let row = history_row(&saving.history[0], NOW);
         assert_eq!(row.title, "Sent");
@@ -896,21 +991,24 @@ mod tests {
         let n = q.items.len();
         let rows: Vec<_> = q.items.iter().map(|i| queue_row(i, 50)).collect();
         assert!(rows.iter().all(|r| (0.0..=1.0).contains(&r.fraction)));
-        core.exit_now(q.items[0].id.clone()).await.unwrap();
+        let exit = core.prepare_exit(q.items[0].id.clone()).await.unwrap();
+        assert!(exit_warning(&exit).contains("Withdrawal fee: 420 sat"));
+        done(&events, core.exit_now(exit.id).await.unwrap()).await;
         let q = core.queue_state().await.unwrap();
         assert_eq!(q.items.len(), n - 1);
         assert!(queue_summary(&q).contains("typical exit"));
 
         // Below target: refill moves the caption to "for spending".
-        let core = Fedimix::new(DemoBackend::new(DemoScenario::BelowTarget));
+        let core = demo(DemoScenario::BelowTarget);
+        let events = core.subscribe();
         let sp = core.spending_state().await.unwrap();
         assert!(spending_caption(&sp).shows_refill);
         let p = core.prepare_refill().await.unwrap();
-        core.confirm_refill(p.id).await.unwrap();
+        done(&events, core.confirm_refill(p.id).await.unwrap()).await;
         let sp = core.spending_state().await.unwrap();
         let caption = spending_caption(&sp);
         assert!(!caption.shows_refill);
-        assert!(caption.text.ends_with("for spending"));
+        assert!(caption.text.contains("for spending"), "{}", caption.text);
         assert_eq!(visible_history(&sp.history, false).len(), sp.history.len());
     }
 }

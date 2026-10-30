@@ -1,4 +1,4 @@
-use crate::api::{Amount, HistoryItem, WalletKind};
+use crate::api::{Amount, HistoryItem, OperationId, OperationKind, OperationState, WalletKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Notice {
@@ -30,9 +30,18 @@ pub enum Event {
     SavingChanged,
     SettingsChanged,
     Notification(Notice),
+    Operation {
+        id: OperationId,
+        kind: OperationKind,
+        state: OperationState,
+    },
 }
 
 /// Stream of backend events. Ends (`None`) once all senders are dropped.
+///
+/// Clones share one queue: each event reaches exactly one clone, so a clone
+/// is another consumer of the same work, not a second copy of the stream.
+/// Call `subscribe()` for an independent stream.
 #[derive(Debug, Clone)]
 pub struct EventStream {
     rx: async_channel::Receiver<Event>,

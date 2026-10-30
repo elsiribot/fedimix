@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use fedimix_core::RefillPreview;
+use fedimix_core::{OperationState, RefillPreview};
 
 use crate::format;
 use crate::present;
@@ -145,21 +145,43 @@ fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {
         let ctx = ctx.clone();
         let id = preview.id.clone();
         move |_, response| {
-            if response != "confirm" {
-                return;
-            }
             let core = ctx.bridge.core();
             let id = id.clone();
-            let done = ctx.clone();
-            ctx.bridge
-                .call(async move { core.confirm_refill(id).await }, move |res| {
-                    match res {
-                        Ok(()) => done.toast("Refill confirmed"),
-                        Err(e) => done.toast(&present::user_message(&e)),
-                    }
-                    done.refresh();
-                });
+            if response == "confirm" {
+                confirm(&ctx, id);
+            } else {
+                ctx.bridge
+                    .call(async move { core.discard_preview(id).await }, |_| {});
+            }
         }
     });
     dialog.present(Some(&ctx.nav));
+}
+
+/// The dialog is gone by now, so the context reports how it ends.
+fn confirm(ctx: &Rc<AppContext>, preview_id: String) {
+    let core = ctx.bridge.core();
+    let ctx = ctx.clone();
+    ctx.clone().bridge.call(
+        async move { core.confirm_refill(preview_id).await },
+        move |res| {
+            let id = match res {
+                Ok(id) => id,
+                Err(e) => {
+                    ctx.toast(&present::user_message(&e));
+                    return;
+                }
+            };
+            ctx.toast("Refill started");
+            let done = ctx.clone();
+            ctx.watch_operation(id, move |state| match state {
+                OperationState::Done => done.toast_now("Refill confirmed"),
+                OperationState::Failed { error } => {
+                    done.toast_now(&present::user_message(error));
+                }
+                OperationState::Cancelled => done.toast_now("Refill cancelled"),
+                _ => {}
+            });
+        },
+    );
 }

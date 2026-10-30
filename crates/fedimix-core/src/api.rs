@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::error::FedimixError;
+
 /// Amounts from this many sats up display in BTC, smaller ones in sat.
 const DISPLAY_BTC_FROM_SAT: u64 = 100_000;
 const SATS_PER_BTC: u64 = 100_000_000;
@@ -66,6 +68,35 @@ impl fmt::Display for Amount {
 
 /// Unix seconds.
 pub type Timestamp = u64;
+
+/// Identifies a running operation; its progress arrives as
+/// [`crate::Event::Operation`].
+pub type OperationId = String;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationKind {
+    Send,
+    Refill,
+    Exit,
+}
+
+/// `Done`, `Failed` and `Cancelled` are final. Operations that need no
+/// signature start at `Broadcasting`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OperationState {
+    AwaitingDevice,
+    Signing,
+    Broadcasting,
+    Done,
+    Failed { error: FedimixError },
+    Cancelled,
+}
+
+impl OperationState {
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Done | Self::Failed { .. } | Self::Cancelled)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletKind {
@@ -282,6 +313,7 @@ pub struct SendPreview {
     pub fee: Amount,
     pub inputs: Vec<SendInput>,
     pub change: ChangeDestination,
+    pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,6 +324,16 @@ pub struct RefillPreview {
     pub coins: Vec<Coin>,
     pub overshoot: Amount,
     pub device_name: String,
+    pub expires_at: Timestamp,
+}
+
+/// What a manual exit of `item_id` costs. Pass `id` to `exit_now`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExitPreview {
+    pub id: String,
+    pub item_id: String,
+    pub fee: Amount,
+    pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq)]

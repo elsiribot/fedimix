@@ -4,9 +4,10 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
 
-use fedimix_core::{QueueState, SavingState, SpendingState};
+use fedimix_core::{OperationId, OperationState, QueueState, SavingState, SpendingState};
 
 use crate::bridge::CoreBridge;
+use crate::operations::OperationTable;
 use crate::present::user_message;
 
 #[derive(Debug, Clone)]
@@ -17,9 +18,10 @@ pub struct Snapshots {
 }
 
 type Subscriber = Rc<dyn Fn(&Snapshots) -> bool>;
+type OperationWatcher = Rc<dyn Fn(&OperationState)>;
 
-#[derive(Default)]
 struct Shared {
+    operations: RefCell<OperationTable<OperationWatcher>>,
     latest: RefCell<Option<Snapshots>>,
     subscribers: RefCell<Vec<Subscriber>>,
     /// Number of refreshes started so far.
@@ -49,12 +51,45 @@ impl AppContext {
             toasts,
             nav,
             stack,
-            shared: Rc::default(),
+            shared: Rc::new(Shared {
+                operations: RefCell::new(OperationTable::new()),
+                latest: RefCell::default(),
+                subscribers: RefCell::default(),
+                started: Cell::default(),
+                applied: Cell::default(),
+            }),
         }
     }
 
     pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
+    }
+
+    /// Show `message` now, ahead of any toast on screen. For outcomes, which
+    /// must not wait behind "started".
+    pub fn toast_now(&self, message: &str) {
+        let toast = adw::Toast::new(message);
+        toast.set_priority(adw::ToastPriority::High);
+        self.toasts.add_toast(toast);
+    }
+
+    /// Call `f` with each state of operation `id`, up to the final one. This
+    /// outlives the dialog that started the operation, so `f` is where its
+    /// outcome gets reported.
+    pub fn watch_operation(&self, id: OperationId, f: impl Fn(&OperationState) + 'static) {
+        let f: OperationWatcher = Rc::new(f);
+        let replay = self.shared.operations.borrow_mut().watch(id, Rc::clone(&f));
+        if let Some(state) = replay {
+            f(&state);
+        }
+    }
+
+    /// Feed an `Event::Operation` to its watcher.
+    pub fn operation_event(&self, id: &str, state: &OperationState) {
+        let watcher = self.shared.operations.borrow_mut().record(id, state);
+        if let Some(f) = watcher {
+            f(state);
+        }
     }
 
     /// Register `f` to run on every new snapshot set, and once immediately if

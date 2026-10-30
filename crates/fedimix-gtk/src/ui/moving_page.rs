@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use fedimix_core::{QueueState, Settings};
+use fedimix_core::{ExitPreview, OperationState, QueueState, Settings};
 use gtk::gio;
 
 use crate::format;
@@ -165,36 +165,62 @@ impl Inner {
     }
 }
 
-fn confirm_exit(ctx: &Rc<AppContext>, id: String) {
-    let dialog = adw::AlertDialog::new(
-        Some("Exit now?"),
-        Some(
-            "Leaving early lowers your privacy: this note will be withdrawn with a \
-             smaller anonymity set. A withdrawal fee applies.",
-        ),
+/// Quote the exit, then ask. A refused quote is a toast and no dialog.
+fn confirm_exit(ctx: &Rc<AppContext>, item_id: String) {
+    let core = ctx.bridge.core();
+    let shown = ctx.clone();
+    ctx.run(
+        async move { core.prepare_exit(item_id).await },
+        move |preview| {
+            show_exit_dialog(&shown, preview);
+        },
     );
+}
+
+fn show_exit_dialog(ctx: &Rc<AppContext>, preview: ExitPreview) {
+    let dialog = adw::AlertDialog::new(Some("Exit now?"), Some(&present::exit_warning(&preview)));
     dialog.add_responses(&[("cancel", "Cancel"), ("exit", "Exit now")]);
     dialog.set_response_appearance("exit", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     dialog.connect_response(None, {
         let ctx = ctx.clone();
+        let id = preview.id;
         move |_, response| {
-            if response != "exit" {
-                return;
-            }
             let core = ctx.bridge.core();
             let id = id.clone();
-            let done = ctx.clone();
-            ctx.bridge
-                .call(async move { core.exit_now(id).await }, move |res| {
-                    if let Err(e) = res {
-                        done.toast(&present::user_message(&e));
-                    }
-                    done.refresh();
-                });
+            if response == "exit" {
+                exit(&ctx, id);
+            } else {
+                ctx.bridge
+                    .call(async move { core.discard_preview(id).await }, |_| {});
+            }
         }
     });
     // Rows are rebuilt on every snapshot, so parent on the stable nav view.
     dialog.present(Some(&ctx.nav));
+}
+
+fn exit(ctx: &Rc<AppContext>, preview_id: String) {
+    let core = ctx.bridge.core();
+    let ctx = ctx.clone();
+    ctx.clone()
+        .bridge
+        .call(async move { core.exit_now(preview_id).await }, move |res| {
+            let id = match res {
+                Ok(id) => id,
+                Err(e) => {
+                    ctx.toast(&present::user_message(&e));
+                    return;
+                }
+            };
+            let done = ctx.clone();
+            ctx.watch_operation(id, move |state| match state {
+                OperationState::Done => done.toast_now("Moved to Saving"),
+                OperationState::Failed { error } => {
+                    done.toast_now(&present::user_message(error));
+                }
+                _ => {}
+            });
+        });
 }

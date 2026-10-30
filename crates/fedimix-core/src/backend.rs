@@ -20,9 +20,12 @@ pub trait Backend: Send + Sync + 'static {
     async fn setup_saving(&self, device_id: String) -> Result<()>;
     async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo>;
     async fn prepare_send(&self, request: SendRequest) -> Result<SendPreview>;
-    async fn confirm_send(&self, preview_id: String) -> Result<()>;
+    async fn confirm_send(&self, preview_id: String) -> Result<OperationId>;
     async fn prepare_refill(&self) -> Result<RefillPreview>;
-    async fn confirm_refill(&self, preview_id: String) -> Result<()>;
-    async fn exit_now(&self, item_id: String) -> Result<()>;
+    async fn confirm_refill(&self, preview_id: String) -> Result<OperationId>;
+    async fn prepare_exit(&self, item_id: String) -> Result<ExitPreview>;
+    async fn exit_now(&self, preview_id: String) -> Result<OperationId>;
+    async fn discard_preview(&self, preview_id: String) -> Result<()>;
+    async fn cancel_operation(&self, id: OperationId) -> Result<()>;
     async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()>;
 }

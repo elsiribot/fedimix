@@ -2,6 +2,7 @@ mod bridge;
 mod cli;
 mod demo_drive;
 mod format;
+mod operations;
 mod present;
 mod ui;
 mod window;

@@ -8,8 +8,11 @@ click Refill from Saving
 expect Refill Spending
 shot dialog
 click Confirm on Ledger Nano S+
+expect Refill started
 expect Refill confirmed
 expect 0.0711 BTC
 expect-not 0.0112 BTC
 expect-not Refill from Saving
+# The overshoot joined the exit queue instead of Spending.
+expect 0.021 moving to Saving
 shot after

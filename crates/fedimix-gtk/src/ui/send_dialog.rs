@@ -1,10 +1,12 @@
 //! Send dialog: recipient and amount, then a review page with Confirm.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use fedimix_core::{SendAmount, SendPreview, SendRequest, WalletKind};
+use fedimix_core::{
+    FedimixError, OperationId, OperationState, SendAmount, SendPreview, SendRequest, WalletKind,
+};
 use gtk::glib;
 
 use crate::format;
@@ -209,7 +211,7 @@ fn build(
                         button.set_sensitive(true);
                         match res {
                             Ok(preview) => {
-                                nav.push(&review_page(&ctx, &dialog, preview));
+                                nav.push(&review_page(&ctx, &dialog, &nav, &error, preview));
                             }
                             Err(e) => set_error(&error, Some(&present::user_message(&e))),
                         }
@@ -265,9 +267,107 @@ fn detail_lines(preview: &SendPreview) -> gtk::Box {
     details
 }
 
+/// The running part of a review: what confirming locks, and how it ends.
+///
+/// Closures hold this strongly only through the operation watcher, which the
+/// context drops at the final state; the dialog cannot close before that, so
+/// the outcome always finds its way here.
+struct Progress {
+    dialog: adw::Dialog,
+    nav: adw::NavigationView,
+    page: adw::NavigationPage,
+    form_error: gtk::Label,
+    error: gtk::Label,
+    caption: gtk::Label,
+    spinner: gtk::Spinner,
+    confirm: gtk::Button,
+    cancel: gtk::Button,
+    device: String,
+    /// Set while confirming, so a second activation does nothing.
+    sending: Rc<Cell<bool>>,
+    /// The preview, until it is confirmed.
+    preview_id: RefCell<Option<String>>,
+    operation: RefCell<Option<OperationId>>,
+}
+
+impl Progress {
+    /// Back and Escape would drop the outcome, so both are off while sending.
+    fn set_busy(&self, busy: bool) {
+        self.dialog.set_can_close(!busy);
+        self.page.set_can_pop(!busy);
+        self.sending.set(busy);
+        self.spinner.set_visible(busy);
+        self.spinner.set_spinning(busy);
+        self.confirm.set_sensitive(!busy);
+        if !busy {
+            self.caption.set_visible(false);
+            self.cancel.set_visible(false);
+        }
+    }
+
+    fn back_to_form(&self, message: &str) {
+        self.set_busy(false);
+        self.nav.pop();
+        set_error(&self.form_error, Some(message));
+    }
+
+    fn on_confirm_reply(
+        self: Rc<Self>,
+        ctx: &Rc<AppContext>,
+        preview_id: String,
+        res: Result<OperationId, FedimixError>,
+    ) {
+        match res {
+            Ok(id) => {
+                *self.operation.borrow_mut() = Some(id.clone());
+                let ctx2 = ctx.clone();
+                ctx.watch_operation(id, move |state| self.on_state(&ctx2, state));
+            }
+            Err(e @ FedimixError::PreviewExpired) => {
+                self.back_to_form(&present::user_message(&e));
+            }
+            Err(e) => {
+                *self.preview_id.borrow_mut() = Some(preview_id);
+                self.set_busy(false);
+                set_error(&self.error, Some(&present::user_message(&e)));
+            }
+        }
+    }
+
+    fn on_state(&self, ctx: &Rc<AppContext>, state: &OperationState) {
+        self.caption
+            .set_label(&present::operation_caption(state, &self.device));
+        self.caption.set_visible(true);
+        self.cancel
+            .set_visible(present::operation_cancellable(state));
+        match state {
+            OperationState::Done => {
+                self.set_busy(false);
+                self.dialog.close();
+                ctx.toast_now("Payment sent");
+            }
+            OperationState::Failed { .. } | OperationState::Cancelled => {
+                self.back_to_form(&present::operation_caption(state, &self.device));
+            }
+            _ => {}
+        }
+    }
+
+    /// Tell the core a preview the user walked away from is not needed.
+    fn discard(&self, ctx: &Rc<AppContext>) {
+        if let Some(id) = self.preview_id.borrow_mut().take() {
+            let core = ctx.bridge.core();
+            ctx.bridge
+                .call(async move { core.discard_preview(id).await }, |_| {});
+        }
+    }
+}
+
 fn review_page(
     ctx: &Rc<AppContext>,
     dialog: &adw::Dialog,
+    nav: &adw::NavigationView,
+    form_error: &gtk::Label,
     preview: SendPreview,
 ) -> adw::NavigationPage {
     let wallet = preview.wallet;
@@ -298,7 +398,9 @@ fn review_page(
     body.append(&long_text(&format::sats(preview.fee)));
 
     let error = error_label();
-    let label = gtk::Label::new(None);
+    let label = gtk::Label::builder()
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
     let spinner = gtk::Spinner::builder().visible(false).build();
     let confirm = gtk::Button::builder()
         .child(&button_content(&label, &spinner))
@@ -306,8 +408,18 @@ fn review_page(
         .build();
     confirm.add_css_class("pill");
     confirm.add_css_class("suggested-action");
-    let sending = Rc::new(Cell::new(false));
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("pill");
+    cancel.set_halign(gtk::Align::Center);
+    cancel.set_visible(false);
+    let state = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .visible(false)
+        .build();
+    state.add_css_class("dim-label");
 
+    let sending = Rc::new(Cell::new(false));
     let apply_device = {
         let label = label.downgrade();
         let confirm = confirm.downgrade();
@@ -324,7 +436,8 @@ fn review_page(
             confirm.set_sensitive(enabled);
         }
     };
-    apply_device(ctx.latest().and_then(|s| s.saving.device).as_ref());
+    let device = ctx.latest().and_then(|s| s.saving.device);
+    apply_device(device.as_ref());
     ctx.on_snapshots({
         let alive = confirm.downgrade();
         move |s| {
@@ -336,64 +449,85 @@ fn review_page(
         }
     });
 
-    confirm.connect_clicked(glib::clone!(
-        #[strong]
-        ctx,
-        #[strong]
-        sending,
-        #[weak]
-        spinner,
-        #[weak]
-        error,
-        #[strong(rename_to = dialog)]
-        dialog.downgrade(),
-        move |button| {
-            // Second activation while the call is in flight does nothing.
-            if sending.replace(true) {
-                return;
-            }
-            button.set_sensitive(false);
-            set_error(&error, None);
-            spinner.set_visible(true);
-            spinner.start();
-            let core = ctx.bridge.core();
-            let id = preview.id.clone();
-            let dialog = dialog.clone();
-            ctx.bridge.call(
-                async move { core.confirm_send(id).await },
-                glib::clone!(
-                    #[strong]
-                    ctx,
-                    #[strong]
-                    sending,
-                    #[weak]
-                    button,
-                    #[weak]
-                    spinner,
-                    #[weak]
-                    error,
-                    move |res| match res {
-                        Ok(()) => {
-                            // The button stays insensitive; the dialog goes away.
-                            if let Some(dialog) = dialog.upgrade() {
-                                dialog.close();
-                            }
-                            ctx.toast("Payment sent");
-                            ctx.refresh();
-                        }
-                        Err(e) => {
-                            sending.set(false);
-                            spinner.stop();
-                            spinner.set_visible(false);
-                            button.set_sensitive(true);
-                            set_error(&error, Some(&present::user_message(&e)));
-                        }
-                    }
-                ),
-            );
-        }
-    ));
     body.append(&error);
+    body.append(&state);
     body.append(&confirm);
-    page("Review", &body)
+    body.append(&cancel);
+    let review = page("Review", &body);
+
+    let progress = Rc::new(Progress {
+        dialog: dialog.clone(),
+        nav: nav.clone(),
+        page: review.clone(),
+        form_error: form_error.clone(),
+        error: error.clone(),
+        caption: state,
+        spinner,
+        confirm: confirm.clone(),
+        cancel: cancel.clone(),
+        device: device.map_or("your device".to_string(), |d| d.name),
+        sending,
+        preview_id: RefCell::new(Some(preview.id.clone())),
+        operation: RefCell::new(None),
+    });
+    let weak = Rc::downgrade(&progress);
+
+    confirm.connect_clicked({
+        let ctx = ctx.clone();
+        let weak = weak.clone();
+        move |_| {
+            let Some(progress) = weak.upgrade() else {
+                return;
+            };
+            let Some(id) = progress.preview_id.borrow_mut().take() else {
+                return;
+            };
+            progress.set_busy(true);
+            set_error(&progress.error, None);
+            let core = ctx.bridge.core();
+            let ctx2 = ctx.clone();
+            let id2 = id.clone();
+            ctx.bridge
+                .call(async move { core.confirm_send(id2).await }, move |res| {
+                    progress.on_confirm_reply(&ctx2, id, res)
+                });
+        }
+    });
+    cancel.connect_clicked({
+        let ctx = ctx.clone();
+        let weak = weak.clone();
+        move |button| {
+            let Some(id) = weak.upgrade().and_then(|p| p.operation.borrow().clone()) else {
+                return;
+            };
+            button.set_sensitive(false);
+            let core = ctx.bridge.core();
+            // Too late or already over: the operation's own state says so.
+            ctx.bridge
+                .call(async move { core.cancel_operation(id).await }, |_| {});
+        }
+    });
+    // Leaving the review for good, by Back or by closing the dialog.
+    review.connect_hidden({
+        let ctx = ctx.clone();
+        let weak = weak.clone();
+        move |_| {
+            if let Some(progress) = weak.upgrade() {
+                progress.discard(&ctx);
+            }
+        }
+    });
+    dialog.connect_closed({
+        let ctx = ctx.clone();
+        move |_| {
+            if let Some(progress) = weak.upgrade() {
+                progress.discard(&ctx);
+            }
+        }
+    });
+    // The page owns the state; see `SavingTab::new`.
+    review.connect_destroy(move |_| {
+        let _keep_alive = &progress;
+    });
+    review
 }

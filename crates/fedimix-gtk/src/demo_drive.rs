@@ -14,6 +14,9 @@
 //! - `wait <ms>`, `shot <name>` (prints `SHOT <name>`, then waits for a line
 //!   on stdin, or 500 ms when stdin is a terminal or closed).
 //! - `expect-not <text>`: wait up to 3 s until no mapped label contains `<text>`.
+//! - `expect-locked`: the open dialog cannot be closed and its page cannot be
+//!   popped, which is what Escape and Back go through.
+//! - `close-dialog`: close the open dialog, as Escape does.
 //! - `action <name>`: activate an application action such as `app.settings`
 //!   (menu popovers are not in the widget tree until opened).
 //!
@@ -38,6 +41,8 @@ pub enum Step {
     Type { widget: String, text: String },
     Expect(String),
     ExpectNot(String),
+    ExpectLocked,
+    CloseDialog,
     Wait(u64),
     Shot(String),
     Action(String),
@@ -70,6 +75,8 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "click" => Step::Click(need("a label")?),
         "expect" => Step::Expect(need("text")?),
         "expect-not" => Step::ExpectNot(need("text")?),
+        "expect-locked" => Step::ExpectLocked,
+        "close-dialog" => Step::CloseDialog,
         "shot" => Step::Shot(need("a name")?),
         "action" => Step::Action(need("an action name")?),
         "wait" => Step::Wait(
@@ -105,6 +112,8 @@ impl fmt::Display for Step {
             Step::Type { widget, text } => write!(f, "type \"{widget}\" {text}"),
             Step::Expect(t) => write!(f, "expect {t}"),
             Step::ExpectNot(t) => write!(f, "expect-not {t}"),
+            Step::ExpectLocked => write!(f, "expect-locked"),
+            Step::CloseDialog => write!(f, "close-dialog"),
             Step::Wait(ms) => write!(f, "wait {ms}"),
             Step::Shot(n) => write!(f, "shot {n}"),
             Step::Action(a) => write!(f, "action {a}"),
@@ -159,6 +168,18 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             poll(|| (!has_label_containing(env, text)).then_some(()))
                 .await
                 .ok_or_else(|| format!("a visible label still contains '{text}'"))?;
+        }
+        Step::ExpectLocked => {
+            poll(|| locked(env).then_some(()))
+                .await
+                .ok_or("the dialog can still be closed or popped")?;
+        }
+        Step::CloseDialog => {
+            let dialog = env.window.visible_dialog().ok_or("no dialog is open")?;
+            if !dialog.close() {
+                return Err("the dialog refused to close".to_string());
+            }
+            glib::timeout_future(Duration::from_millis(150)).await;
         }
         Step::Wait(ms) => glib::timeout_future(Duration::from_millis(*ms)).await,
         Step::Shot(name) => shot(name).await,
@@ -253,6 +274,18 @@ fn roots(env: &Env) -> Vec<gtk::Widget> {
     roots
 }
 
+fn locked(env: &Env) -> bool {
+    let Some(dialog) = env.window.visible_dialog() else {
+        return false;
+    };
+    let pinned = descendants(dialog.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::NavigationView>().ok())
+        .filter_map(|nav| nav.visible_page())
+        .all(|page| !page.can_pop());
+    pinned && !dialog.can_close()
+}
+
 fn live(w: &gtk::Widget) -> bool {
     w.is_mapped() && w.is_sensitive()
 }
@@ -323,6 +356,7 @@ fn click(env: &Env, label: &str) -> bool {
                 .into_iter()
                 .filter_map(|w| w.downcast::<adw::NavigationView>().ok())
                 .filter(|n| n.is_mapped() && n.navigation_stack().n_items() > 1)
+                .filter(|n| n.visible_page().is_some_and(|p| p.can_pop()))
                 .last();
             if let Some(nav) = pushed {
                 return nav.pop();
@@ -402,6 +436,8 @@ type \"Amount (BTC)\" 0.01
 type Target 0.1 extra words
 expect Fedi Alpha
 expect-not Cover traffic
+expect-locked
+close-dialog
 wait 250
 shot funded-moving
 action app.settings
@@ -420,6 +456,8 @@ action app.settings
                 },
                 Step::Expect("Fedi Alpha".into()),
                 Step::ExpectNot("Cover traffic".into()),
+                Step::ExpectLocked,
+                Step::CloseDialog,
                 Step::Wait(250),
                 Step::Shot("funded-moving".into()),
                 Step::Action("app.settings".into()),

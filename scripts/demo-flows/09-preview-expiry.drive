@@ -1,0 +1,13 @@
+# scenario: preview-expiry
+# A review left open too long: the core refuses it, and the dialog goes back.
+expect 1.2034 BTC
+click Send
+type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
+type "Amount (BTC)" 0.0123
+click Review
+expect Network fee
+wait 1500
+click Confirm on Ledger Nano S+
+expect This review expired
+shot expired
+expect-not Network fee

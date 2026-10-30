@@ -17,9 +17,11 @@ expect 0.4200 BTC
 shot moving
 click Item actions
 click Exit now (lower privacy)
-expect A withdrawal fee applies
+expect Withdrawal fee: 420 sat
 shot exit-dialog
 click Exit now
+expect withdrawing
+expect Moved to Saving
 expect 0.2200 BTC
 expect-not 0.4200 BTC
 shot moving-after-exit

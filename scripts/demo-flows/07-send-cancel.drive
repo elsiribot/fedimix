@@ -1,0 +1,17 @@
+# scenario: funded
+# Cancel a Saving send while it waits for the device: back on the form, nothing sent.
+expect 1.2034 BTC
+click Send
+type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
+type "Amount (BTC)" 0.0123
+click Review
+expect Network fee
+click Confirm on Ledger Nano S+
+expect Waiting for Ledger Nano S+
+click Cancel
+expect Cancelled
+shot cancelled
+expect-not Network fee
+close-dialog
+expect 1.2034 BTC
+expect-not −0.0123

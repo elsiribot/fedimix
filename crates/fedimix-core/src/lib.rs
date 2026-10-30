@@ -10,7 +10,7 @@ pub mod handle;
 
 pub use api::*;
 pub use backend::Backend;
-pub use demo::{DemoBackend, DemoScenario};
+pub use demo::{DemoBackend, DemoScenario, DemoTiming};
 pub use destination::{Destination, DestinationKind, parse_btc, parse_destination};
 pub use error::{FedimixError, Result};
 pub use event::{Event, EventStream, Notice};

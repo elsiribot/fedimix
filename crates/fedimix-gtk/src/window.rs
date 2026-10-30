@@ -6,6 +6,7 @@ use gtk::gio;
 
 use crate::bridge::CoreBridge;
 use crate::cli::StartPage;
+use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::join_page::JoinPage;
 use crate::ui::saving_tab::SavingTab;
@@ -14,7 +15,7 @@ use crate::ui::{
     about, coin_detail, coins_page, moving_page, notes_page, receive_dialog, refill_dialog,
     send_dialog, settings_page, setup_saving,
 };
-use fedimix_core::{Amount, SendAmount, SendRequest, WalletKind};
+use fedimix_core::{Amount, Event, SendAmount, SendRequest, WalletKind};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -234,12 +235,16 @@ impl FedimixWindow {
             }
         });
 
-        // Any backend event invalidates the snapshots.
         let events = ctx.bridge.events();
         let ctx = ctx.clone();
         gtk::glib::spawn_future_local(async move {
-            while events.recv().await.is_ok() {
-                ctx.refresh();
+            while let Ok(event) = events.recv().await {
+                if let Event::Operation { id, state, .. } = &event {
+                    ctx.operation_event(id, state);
+                }
+                if present::event_needs_refresh(&event) {
+                    ctx.refresh();
+                }
             }
         });
     }

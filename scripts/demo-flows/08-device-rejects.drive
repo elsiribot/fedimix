@@ -1,0 +1,12 @@
+# scenario: device-rejects
+# The device refuses: the error shows on the form and nothing moved.
+expect 1.2034 BTC
+click Send
+type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
+type "Amount (BTC)" 0.0123
+click Review
+click Confirm on Ledger Nano S+
+expect The device rejected the transaction
+shot rejected
+click Review
+expect Network fee

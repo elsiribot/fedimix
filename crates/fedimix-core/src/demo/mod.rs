@@ -1,6 +1,6 @@
 //! In-memory demo backend with mockup scenarios.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +23,28 @@ const SMALL_CHANGE_SAT: u64 = 10_000;
 /// Virtual size of a demo Saving transaction; 420 sat at 3 sat/vB.
 const TX_VBYTES: u64 = 140;
 const NOTIFY_DELAY: Duration = Duration::from_secs(2);
+const OPERATION_STEP: Duration = Duration::from_millis(300);
+const PREVIEW_TTL: Duration = Duration::from_secs(600);
+/// Spec section 1: the 1-2-5 series from 1 BTC down to 0.001.
+const EXIT_DENOMINATIONS_SAT: [u64; 10] = [
+    100_000_000,
+    50_000_000,
+    20_000_000,
+    10_000_000,
+    5_000_000,
+    2_000_000,
+    1_000_000,
+    500_000,
+    200_000,
+    100_000,
+];
+/// Operation states before the job takes effect.
+const SIGNED_PLAN: &[OperationState] = &[
+    OperationState::AwaitingDevice,
+    OperationState::Signing,
+    OperationState::Broadcasting,
+];
+const UNSIGNED_PLAN: &[OperationState] = &[OperationState::Broadcasting];
 /// Largest first; used to split a balance into notes.
 const DENOMINATIONS_SAT: [u64; 13] = [
     10_000_000, 5_000_000, 2_000_000, 1_000_000, 500_000, 200_000, 100_000, 50_000, 20_000, 10_000,
@@ -38,6 +60,30 @@ pub enum DemoScenario {
     Offline,
     /// Spending too low for exit fees, every queue deferral and history status.
     ExitDeferred,
+    /// Funded, with previews that expire within a second.
+    PreviewExpiry,
+    /// Funded, with a device that refuses to sign and to set up.
+    DeviceRejects,
+}
+
+/// How fast the demo moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemoTiming {
+    /// Time spent in each operation state.
+    pub step: Duration,
+    pub preview_ttl: Duration,
+}
+
+impl DemoTiming {
+    fn for_scenario(scenario: DemoScenario) -> Self {
+        DemoTiming {
+            step: OPERATION_STEP,
+            preview_ttl: match scenario {
+                DemoScenario::PreviewExpiry => Duration::from_secs(1),
+                _ => PREVIEW_TTL,
+            },
+        }
+    }
 }
 
 impl FromStr for DemoScenario {
@@ -51,8 +97,10 @@ impl FromStr for DemoScenario {
             "first-run" => Ok(Self::FirstRun),
             "offline" => Ok(Self::Offline),
             "exit-deferred" => Ok(Self::ExitDeferred),
+            "preview-expiry" => Ok(Self::PreviewExpiry),
+            "device-rejects" => Ok(Self::DeviceRejects),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, preview-expiry, device-rejects)"
             )),
         }
     }
@@ -80,9 +128,168 @@ struct State {
     queue: Vec<QueueItem>,
     waiting_for_saving: bool,
     settings: Settings,
-    sends: HashMap<String, SendPreview>,
-    refills: HashMap<String, RefillPreview>,
+    sends: Previews<SendPreview>,
+    refills: Previews<RefillPreview>,
+    exits: Previews<ExitPreview>,
+    operations: HashMap<OperationId, RunningOperation>,
+    /// Previews whose operation was cancelled.
+    cancelled: HashSet<String>,
     next_id: u64,
+}
+
+/// Unconfirmed previews with their expiry.
+type Previews<T> = HashMap<String, (Timestamp, T)>;
+
+#[derive(Default)]
+struct RunningOperation {
+    cancel_requested: bool,
+}
+
+/// Remove a preview for confirmation.
+fn take_preview<T>(
+    previews: &mut Previews<T>,
+    cancelled: &HashSet<String>,
+    id: &str,
+) -> Result<(Timestamp, T)> {
+    if cancelled.contains(id) {
+        return Err(FedimixError::Cancelled);
+    }
+    let held = previews
+        .remove(id)
+        .ok_or_else(|| FedimixError::UnknownItem(id.to_string()))?;
+    if held.0 <= now_secs() {
+        return Err(FedimixError::PreviewExpired);
+    }
+    Ok(held)
+}
+
+/// What an operation does once it gets through its states.
+enum Job {
+    Send(SendPreview),
+    Refill(RefillPreview),
+    Exit {
+        preview: ExitPreview,
+        /// Queue status to go back to if the exit fails.
+        restore: QueueItemStatus,
+    },
+}
+
+impl Job {
+    fn kind(&self) -> OperationKind {
+        match self {
+            Job::Send(_) => OperationKind::Send,
+            Job::Refill(_) => OperationKind::Refill,
+            Job::Exit { .. } => OperationKind::Exit,
+        }
+    }
+
+    /// The state change, which happens at the end of the operation.
+    fn apply(&self, st: &mut State) -> Result<Vec<Event>> {
+        match self {
+            Job::Send(p) => st.apply_send(p),
+            Job::Refill(p) => st.apply_refill(p),
+            Job::Exit { preview, .. } => st.apply_exit(preview),
+        }
+    }
+
+    /// Undo what starting the job did; nothing else has happened yet.
+    fn abandon(self, st: &mut State) -> Vec<Event> {
+        let Job::Exit { preview, restore } = self else {
+            return Vec::new();
+        };
+        if let Some(item) = st.queue.iter_mut().find(|i| i.id == preview.item_id) {
+            item.status = restore;
+        }
+        vec![Event::QueueChanged]
+    }
+}
+
+/// One operation's trip through its states, on its own task.
+struct Run {
+    state: Arc<Mutex<State>>,
+    senders: Senders,
+    step: Duration,
+    rejects: bool,
+    id: OperationId,
+    preview_id: String,
+    job: Job,
+    plan: &'static [OperationState],
+}
+
+impl Run {
+    fn emit(&self, state: OperationState) {
+        let event = Event::Operation {
+            id: self.id.clone(),
+            kind: self.job.kind(),
+            state,
+        };
+        broadcast(&self.senders, &event);
+    }
+
+    async fn cancel_requested(&self) -> bool {
+        let st = self.state.lock().await;
+        st.operations
+            .get(&self.id)
+            .is_some_and(|op| op.cancel_requested)
+    }
+
+    /// Walk the plan; `Some` is an early final state.
+    async fn walk(&self) -> Option<OperationState> {
+        for state in self.plan {
+            self.emit(state.clone());
+            tokio::time::sleep(self.step).await;
+            if *state == OperationState::Broadcasting {
+                break;
+            }
+            if self.cancel_requested().await {
+                return Some(OperationState::Cancelled);
+            }
+            if self.rejects && *state == OperationState::Signing {
+                return Some(OperationState::Failed {
+                    error: FedimixError::DeviceRejected,
+                });
+            }
+        }
+        None
+    }
+
+    async fn run(self) {
+        let early = self.walk().await;
+        let mut st = self.state.lock().await;
+        st.operations.remove(&self.id);
+        let (events, last) = match early {
+            None => match self.job.apply(&mut st) {
+                Ok(events) => (events, OperationState::Done),
+                Err(error) => (Vec::new(), OperationState::Failed { error }),
+            },
+            Some(early) => (Vec::new(), early),
+        };
+        if last == OperationState::Cancelled {
+            st.cancelled.insert(self.preview_id.clone());
+        }
+        drop(st);
+        for event in &events {
+            broadcast(&self.senders, event);
+        }
+        if let Job::Send(p) = &self.job
+            && last == OperationState::Done
+        {
+            notify_later(&self.senders, Notice::SendConfirmed { amount: p.amount });
+        }
+        self.finish(last).await;
+    }
+
+    async fn finish(self, last: OperationState) {
+        self.emit(last.clone());
+        if last != OperationState::Done {
+            let mut st = self.state.lock().await;
+            let events = self.job.abandon(&mut st);
+            drop(st);
+            for event in &events {
+                broadcast(&self.senders, event);
+            }
+        }
+    }
 }
 
 impl State {
@@ -104,6 +311,9 @@ impl State {
             settings: Settings::default(),
             sends: HashMap::new(),
             refills: HashMap::new(),
+            exits: HashMap::new(),
+            operations: HashMap::new(),
+            cancelled: HashSet::new(),
             next_id: 1,
         }
     }
@@ -151,6 +361,260 @@ impl State {
         self.next_id += 1;
         100 + n as usize
     }
+
+    fn check_online(&self) -> Result<()> {
+        match &self.federation {
+            Some(f) if !f.online => Err(FedimixError::Offline),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_device(&self) -> Result<()> {
+        match &self.device {
+            None => Err(FedimixError::NotSetUp("Set up Saving first".to_string())),
+            Some(d) if !d.connected => Err(FedimixError::DeviceNotConnected(d.name.clone())),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Whether the preview can still be carried out.
+    fn check_send(&self, p: &SendPreview) -> Result<()> {
+        match p.wallet {
+            WalletKind::Spending => {
+                self.check_online()?;
+                let needed = with_fee(p.amount, p.fee);
+                if needed > self.spending_balance {
+                    return Err(FedimixError::InsufficientFunds {
+                        available: self.spending_balance,
+                        needed,
+                    });
+                }
+                Ok(())
+            }
+            WalletKind::Saving => {
+                self.check_device()?;
+                let inputs = p.inputs.iter().map(|i| i.outpoint_or_note.as_str());
+                self.check_coins(inputs)
+            }
+        }
+    }
+
+    fn check_refill(&self, p: &RefillPreview) -> Result<()> {
+        self.check_device()?;
+        self.check_coins(p.coins.iter().map(|c| c.outpoint.as_str()))
+    }
+
+    fn check_coins<'a>(&self, mut outpoints: impl Iterator<Item = &'a str>) -> Result<()> {
+        match outpoints.find(|o| !self.coins.iter().any(|c| c.outpoint == *o)) {
+            Some(gone) => Err(FedimixError::UnknownItem(gone.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    fn apply_send(&mut self, p: &SendPreview) -> Result<Vec<Event>> {
+        self.check_send(p)?;
+        let mut events = Vec::new();
+        match p.wallet {
+            WalletKind::Spending => {
+                let total = with_fee(p.amount, p.fee);
+                self.spending_balance = self.spending_balance.saturating_sub(total);
+                self.for_spending = self.for_spending.saturating_sub(total);
+                let lightning = parse_destination(&p.destination)
+                    .is_ok_and(|d| d.kind == DestinationKind::Lightning);
+                let kind = if lightning {
+                    HistoryKind::Paid
+                } else {
+                    HistoryKind::Sent { change: None }
+                };
+                let item = self.history_item(kind, p.amount, false);
+                self.spending_history.insert(0, item.clone());
+                events.push(Event::BalanceChanged {
+                    wallet: WalletKind::Spending,
+                    balance: self.spending_balance,
+                });
+                events.push(Event::HistoryItemAdded {
+                    wallet: WalletKind::Spending,
+                    item,
+                });
+            }
+            WalletKind::Saving => {
+                self.coins
+                    .retain(|c| !p.inputs.iter().any(|i| i.outpoint_or_note == c.outpoint));
+                let sent_change = match &p.change {
+                    ChangeDestination::None => None,
+                    ChangeDestination::Spending { amount } => {
+                        self.spending_balance = sum([self.spending_balance, *amount].into_iter());
+                        self.for_spending = sum([self.for_spending, *amount].into_iter());
+                        events.push(Event::BalanceChanged {
+                            wallet: WalletKind::Spending,
+                            balance: self.spending_balance,
+                        });
+                        Some(SentChange {
+                            amount: *amount,
+                            to_spending: true,
+                        })
+                    }
+                    ChangeDestination::SmallChange { amount } => {
+                        let n = self.next_coin_index();
+                        self.coins.push(Coin {
+                            outpoint: fixtures::outpoint_for(n),
+                            amount: *amount,
+                            tag: PrivacyTag::SmallChange,
+                            received_at: BASE_TS,
+                            address: fixtures::address_for(n),
+                            source_federation: None,
+                            frozen: false,
+                        });
+                        Some(SentChange {
+                            amount: *amount,
+                            to_spending: false,
+                        })
+                    }
+                };
+                let item = self.history_item(
+                    HistoryKind::Sent {
+                        change: sent_change,
+                    },
+                    p.amount,
+                    false,
+                );
+                self.saving_history.insert(0, item.clone());
+                events.push(Event::BalanceChanged {
+                    wallet: WalletKind::Saving,
+                    balance: self.saving_balance(),
+                });
+                events.push(Event::HistoryItemAdded {
+                    wallet: WalletKind::Saving,
+                    item,
+                });
+            }
+        }
+        Ok(events)
+    }
+
+    fn apply_refill(&mut self, p: &RefillPreview) -> Result<Vec<Event>> {
+        self.check_refill(p)?;
+        self.coins
+            .retain(|c| !p.coins.iter().any(|r| r.outpoint == c.outpoint));
+        let arrived = p.amount.saturating_sub(p.fee);
+        self.spending_balance = sum([self.spending_balance, arrived].into_iter());
+        // The overshoot leaves again in denominations; what is too small for
+        // one stays in Spending.
+        let denominations = split_denominations(p.overshoot);
+        let queued = sum(denominations.iter().copied());
+        self.for_spending = sum([self.for_spending, arrived.saturating_sub(queued)].into_iter());
+        self.moving = sum([self.moving, queued].into_iter());
+        for denomination in denominations {
+            let item = QueueItem {
+                id: self.fresh_id("queue"),
+                denomination,
+                status: QueueItemStatus::Queued,
+                anonymity_current: 0,
+                anonymity_attainable: self.settings.anonymity_target,
+            };
+            self.queue.push(item);
+        }
+        let out = self.history_item(HistoryKind::Sent { change: None }, p.amount, false);
+        let inc = self.history_item(HistoryKind::Deposit, arrived, true);
+        self.saving_history.insert(0, out.clone());
+        self.spending_history.insert(0, inc.clone());
+        Ok(vec![
+            Event::BalanceChanged {
+                wallet: WalletKind::Saving,
+                balance: self.saving_balance(),
+            },
+            Event::HistoryItemAdded {
+                wallet: WalletKind::Saving,
+                item: out,
+            },
+            Event::BalanceChanged {
+                wallet: WalletKind::Spending,
+                balance: self.spending_balance,
+            },
+            Event::HistoryItemAdded {
+                wallet: WalletKind::Spending,
+                item: inc,
+            },
+            Event::QueueChanged,
+        ])
+    }
+
+    fn apply_exit(&mut self, p: &ExitPreview) -> Result<Vec<Event>> {
+        let pos = self
+            .queue
+            .iter()
+            .position(|i| i.id == p.item_id)
+            .ok_or_else(|| FedimixError::UnknownItem(p.item_id.clone()))?;
+        let item = self.queue.remove(pos);
+        let denom = item.denomination;
+        self.moving = self.moving.saturating_sub(denom);
+        self.spending_balance = self.spending_balance.saturating_sub(with_fee(denom, p.fee));
+        self.for_spending = self.for_spending.saturating_sub(p.fee);
+        self.in_flight = self.in_flight.saturating_sub(denom);
+        let n = self.next_coin_index();
+        let source_federation = self.federation.as_ref().map(|f| f.name.clone());
+        self.coins.push(Coin {
+            outpoint: fixtures::outpoint_for(n),
+            amount: denom,
+            tag: PrivacyTag::EarlyExit {
+                estimate: item.anonymity_current,
+            },
+            received_at: BASE_TS,
+            address: fixtures::address_for(n),
+            source_federation,
+            frozen: false,
+        });
+        let spending_item = self.history_item(
+            HistoryKind::ToSaving {
+                denomination: denom,
+            },
+            denom,
+            false,
+        );
+        let saving_item = self.history_item(
+            HistoryKind::FromSpending {
+                denomination: denom,
+            },
+            denom,
+            true,
+        );
+        self.spending_history.insert(0, spending_item.clone());
+        self.saving_history.insert(0, saving_item.clone());
+        Ok(vec![
+            Event::QueueChanged,
+            Event::BalanceChanged {
+                wallet: WalletKind::Spending,
+                balance: self.spending_balance,
+            },
+            Event::HistoryItemAdded {
+                wallet: WalletKind::Spending,
+                item: spending_item,
+            },
+            Event::BalanceChanged {
+                wallet: WalletKind::Saving,
+                balance: self.saving_balance(),
+            },
+            Event::HistoryItemAdded {
+                wallet: WalletKind::Saving,
+                item: saving_item,
+            },
+            Event::Notification(Notice::ExitLanded { amount: denom }),
+        ])
+    }
+}
+
+/// Greedy split into exit denominations, largest first; the rest is too
+/// small for any of them.
+fn split_denominations(amount: Amount) -> Vec<Amount> {
+    let mut rest = amount.as_sat();
+    let mut out = Vec::new();
+    for denom in EXIT_DENOMINATIONS_SAT {
+        while rest >= denom {
+            rest -= denom;
+            out.push(Amount::from_sat(denom));
+        }
+    }
+    out
 }
 
 fn now_secs() -> Timestamp {
@@ -171,15 +635,23 @@ fn with_fee(amount: Amount, fee: Amount) -> Amount {
 }
 
 pub struct DemoBackend {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     senders: Senders,
+    timing: DemoTiming,
+    rejects: bool,
 }
 
 impl DemoBackend {
     pub fn new(scenario: DemoScenario) -> Arc<Self> {
+        Self::with_timing(scenario, DemoTiming::for_scenario(scenario))
+    }
+
+    pub fn with_timing(scenario: DemoScenario, timing: DemoTiming) -> Arc<Self> {
         Arc::new(DemoBackend {
-            state: Mutex::new(State::new(scenario)),
+            state: Arc::new(Mutex::new(State::new(scenario))),
             senders: Arc::new(StdMutex::new(Vec::new())),
+            timing,
+            rejects: scenario == DemoScenario::DeviceRejects,
         })
     }
 
@@ -187,17 +659,48 @@ impl DemoBackend {
         broadcast(&self.senders, &event);
     }
 
-    /// Emit `notice` after a short delay (no-op without a tokio runtime).
-    fn notify_later(&self, notice: Notice) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let senders = Arc::clone(&self.senders);
-        handle.spawn(async move {
-            tokio::time::sleep(NOTIFY_DELAY).await;
-            broadcast(&senders, &Event::Notification(notice));
-        });
+    fn preview_expiry(&self) -> Timestamp {
+        now_secs() + self.timing.preview_ttl.as_secs()
     }
+
+    /// Start `job` on its own task. Needs a tokio runtime.
+    fn start(
+        &self,
+        st: &mut State,
+        preview_id: String,
+        job: Job,
+        plan: &'static [OperationState],
+    ) -> Result<OperationId> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|e| FedimixError::Internal(e.to_string()))?;
+        let id = st.fresh_id("op");
+        st.operations
+            .insert(id.clone(), RunningOperation::default());
+        let run = Run {
+            state: Arc::clone(&self.state),
+            senders: Arc::clone(&self.senders),
+            step: self.timing.step,
+            rejects: self.rejects,
+            id: id.clone(),
+            preview_id,
+            job,
+            plan,
+        };
+        handle.spawn(run.run());
+        Ok(id)
+    }
+}
+
+/// Emit `notice` after a short delay (no-op without a tokio runtime).
+fn notify_later(senders: &Senders, notice: Notice) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let senders = Arc::clone(senders);
+    handle.spawn(async move {
+        tokio::time::sleep(NOTIFY_DELAY).await;
+        broadcast(&senders, &Event::Notification(notice));
+    });
 }
 
 /// The amount to send, given what the destination carries. `Max` stays
@@ -345,6 +848,9 @@ impl Backend for DemoBackend {
         if device.id != device_id {
             return Err(FedimixError::UnknownItem(device_id));
         }
+        if self.rejects {
+            return Err(FedimixError::DeviceRejected);
+        }
         if !device.connected {
             return Err(FedimixError::DeviceNotConnected(device.name));
         }
@@ -475,101 +981,114 @@ impl Backend for DemoBackend {
             fee,
             inputs,
             change,
+            expires_at: self.preview_expiry(),
         };
-        st.sends.insert(preview.id.clone(), preview.clone());
+        let held = (preview.expires_at, preview.clone());
+        st.sends.insert(preview.id.clone(), held);
         Ok(preview)
     }
 
-    async fn confirm_send(&self, preview_id: String) -> Result<()> {
-        let mut events = Vec::new();
-        let amount;
-        {
-            let mut st = self.state.lock().await;
-            let p = st
-                .sends
-                .remove(&preview_id)
-                .ok_or(FedimixError::UnknownItem(preview_id))?;
-            amount = p.amount;
-            let lightning = p.destination.starts_with("lnbc");
-            match p.wallet {
-                WalletKind::Spending => {
-                    let total = p.amount.checked_add(p.fee).unwrap_or(p.amount);
-                    st.spending_balance = st.spending_balance.saturating_sub(total);
-                    st.for_spending = st.for_spending.saturating_sub(total);
-                    let kind = if lightning {
-                        HistoryKind::Paid
-                    } else {
-                        HistoryKind::Sent { change: None }
-                    };
-                    let item = st.history_item(kind, p.amount, false);
-                    st.spending_history.insert(0, item.clone());
-                    events.push(Event::BalanceChanged {
-                        wallet: WalletKind::Spending,
-                        balance: st.spending_balance,
-                    });
-                    events.push(Event::HistoryItemAdded {
-                        wallet: WalletKind::Spending,
-                        item,
-                    });
-                }
-                WalletKind::Saving => {
-                    st.coins
-                        .retain(|c| !p.inputs.iter().any(|i| i.outpoint_or_note == c.outpoint));
-                    let sent_change = match &p.change {
-                        ChangeDestination::None => None,
-                        ChangeDestination::Spending { amount } => {
-                            st.spending_balance = sum([st.spending_balance, *amount].into_iter());
-                            st.for_spending = sum([st.for_spending, *amount].into_iter());
-                            events.push(Event::BalanceChanged {
-                                wallet: WalletKind::Spending,
-                                balance: st.spending_balance,
-                            });
-                            Some(SentChange {
-                                amount: *amount,
-                                to_spending: true,
-                            })
-                        }
-                        ChangeDestination::SmallChange { amount } => {
-                            let n = st.next_coin_index();
-                            st.coins.push(Coin {
-                                outpoint: fixtures::outpoint_for(n),
-                                amount: *amount,
-                                tag: PrivacyTag::SmallChange,
-                                received_at: BASE_TS,
-                                address: fixtures::address_for(n),
-                                source_federation: None,
-                                frozen: false,
-                            });
-                            Some(SentChange {
-                                amount: *amount,
-                                to_spending: false,
-                            })
-                        }
-                    };
-                    let item = st.history_item(
-                        HistoryKind::Sent {
-                            change: sent_change,
-                        },
-                        p.amount,
-                        false,
-                    );
-                    st.saving_history.insert(0, item.clone());
-                    events.push(Event::BalanceChanged {
-                        wallet: WalletKind::Saving,
-                        balance: st.saving_balance(),
-                    });
-                    events.push(Event::HistoryItemAdded {
-                        wallet: WalletKind::Saving,
-                        item,
-                    });
-                }
-            }
+    async fn confirm_send(&self, preview_id: String) -> Result<OperationId> {
+        let mut guard = self.state.lock().await;
+        let st = &mut *guard;
+        let held = take_preview(&mut st.sends, &st.cancelled, &preview_id)?;
+        if let Err(e) = st.check_send(&held.1) {
+            st.sends.insert(preview_id, held);
+            return Err(e);
         }
-        for e in events {
-            self.emit(e);
+        let (_, preview) = held;
+        let plan = if preview.wallet == WalletKind::Saving {
+            SIGNED_PLAN
+        } else {
+            UNSIGNED_PLAN
+        };
+        self.start(st, preview_id, Job::Send(preview), plan)
+    }
+
+    async fn prepare_exit(&self, item_id: String) -> Result<ExitPreview> {
+        let mut st = self.state.lock().await;
+        let item = st
+            .queue
+            .iter()
+            .find(|i| i.id == item_id)
+            .ok_or_else(|| FedimixError::UnknownItem(item_id.clone()))?;
+        if matches!(
+            item.status,
+            QueueItemStatus::Withdrawing { .. } | QueueItemStatus::Landed
+        ) {
+            return Err(FedimixError::UnknownItem(item_id));
         }
-        self.notify_later(Notice::SendConfirmed { amount });
+        if st.device.is_none() {
+            return Err(FedimixError::NotSetUp("Set up Saving first".to_string()));
+        }
+        st.check_online()?;
+        let fee = Amount::from_sat(ONCHAIN_FEE_SAT);
+        if st.for_spending < fee {
+            return Err(FedimixError::InsufficientFunds {
+                available: st.for_spending,
+                needed: fee,
+            });
+        }
+        let preview = ExitPreview {
+            id: st.fresh_id("exit"),
+            item_id,
+            fee,
+            expires_at: self.preview_expiry(),
+        };
+        let held = (preview.expires_at, preview.clone());
+        st.exits.insert(preview.id.clone(), held);
+        Ok(preview)
+    }
+
+    async fn exit_now(&self, preview_id: String) -> Result<OperationId> {
+        let mut guard = self.state.lock().await;
+        let st = &mut *guard;
+        let (_, preview) = take_preview(&mut st.exits, &st.cancelled, &preview_id)?;
+        st.check_online()?;
+        let txid = fixtures::outpoint_for(st.next_coin_index());
+        let item = st
+            .queue
+            .iter_mut()
+            .find(|i| i.id == preview.item_id)
+            .filter(|i| !matches!(i.status, QueueItemStatus::Withdrawing { .. }))
+            .ok_or_else(|| FedimixError::UnknownItem(preview.item_id.clone()))?;
+        let restore = std::mem::replace(&mut item.status, QueueItemStatus::Withdrawing { txid });
+        let id = self.start(
+            st,
+            preview_id,
+            Job::Exit { preview, restore },
+            UNSIGNED_PLAN,
+        )?;
+        self.emit(Event::QueueChanged);
+        Ok(id)
+    }
+
+    async fn discard_preview(&self, preview_id: String) -> Result<()> {
+        let mut st = self.state.lock().await;
+        st.sends.remove(&preview_id);
+        st.refills.remove(&preview_id);
+        st.exits.remove(&preview_id);
         Ok(())
+    }
+
+    async fn cancel_operation(&self, id: OperationId) -> Result<()> {
+        let mut st = self.state.lock().await;
+        st.operations
+            .get_mut(&id)
+            .ok_or(FedimixError::UnknownItem(id))?
+            .cancel_requested = true;
+        Ok(())
+    }
+
+    async fn confirm_refill(&self, preview_id: String) -> Result<OperationId> {
+        let mut guard = self.state.lock().await;
+        let st = &mut *guard;
+        let held = take_preview(&mut st.refills, &st.cancelled, &preview_id)?;
+        if let Err(e) = st.check_refill(&held.1) {
+            st.refills.insert(preview_id, held);
+            return Err(e);
+        }
+        self.start(st, preview_id, Job::Refill(held.1), SIGNED_PLAN)
     }
 
     async fn prepare_refill(&self) -> Result<RefillPreview> {
@@ -585,145 +1104,37 @@ impl Backend for DemoBackend {
             ));
         }
         let gap = target.saturating_sub(st.for_spending);
+        let fee = Amount::from_sat(ONCHAIN_FEE_SAT);
         let mut candidates: Vec<&Coin> = st.coins.iter().filter(|c| !c.frozen).collect();
         candidates.sort_by_key(|c| c.amount);
         let mut coins = Vec::new();
         let mut total = Amount::ZERO;
         for c in candidates {
-            if total >= gap {
+            if total.saturating_sub(fee) >= gap {
                 break;
             }
             total = sum([total, c.amount].into_iter());
             coins.push(c.clone());
         }
-        if total < gap {
+        let arrives = total.saturating_sub(fee);
+        if arrives < gap {
             return Err(FedimixError::InsufficientFunds {
                 available: total,
-                needed: gap,
+                needed: with_fee(gap, fee),
             });
         }
         let preview = RefillPreview {
             id: st.fresh_id("refill"),
             amount: total,
-            fee: Amount::from_sat(ONCHAIN_FEE_SAT),
+            fee,
             coins,
-            overshoot: total.saturating_sub(gap),
+            overshoot: arrives.saturating_sub(gap),
             device_name: device.name,
+            expires_at: self.preview_expiry(),
         };
-        st.refills.insert(preview.id.clone(), preview.clone());
+        let held = (preview.expires_at, preview.clone());
+        st.refills.insert(preview.id.clone(), held);
         Ok(preview)
-    }
-
-    async fn confirm_refill(&self, preview_id: String) -> Result<()> {
-        let mut events = Vec::new();
-        {
-            let mut st = self.state.lock().await;
-            let p = st
-                .refills
-                .remove(&preview_id)
-                .ok_or(FedimixError::UnknownItem(preview_id))?;
-            st.coins
-                .retain(|c| !p.coins.iter().any(|r| r.outpoint == c.outpoint));
-            let arrived = p.amount.saturating_sub(p.fee);
-            st.spending_balance = sum([st.spending_balance, arrived].into_iter());
-            st.for_spending = sum([st.for_spending, arrived].into_iter());
-            let out = st.history_item(HistoryKind::Sent { change: None }, p.amount, false);
-            let inc = st.history_item(HistoryKind::Deposit, arrived, true);
-            st.saving_history.insert(0, out.clone());
-            st.spending_history.insert(0, inc.clone());
-            events.push(Event::BalanceChanged {
-                wallet: WalletKind::Saving,
-                balance: st.saving_balance(),
-            });
-            events.push(Event::HistoryItemAdded {
-                wallet: WalletKind::Saving,
-                item: out,
-            });
-            events.push(Event::BalanceChanged {
-                wallet: WalletKind::Spending,
-                balance: st.spending_balance,
-            });
-            events.push(Event::HistoryItemAdded {
-                wallet: WalletKind::Spending,
-                item: inc,
-            });
-        }
-        for e in events {
-            self.emit(e);
-        }
-        Ok(())
-    }
-
-    async fn exit_now(&self, item_id: String) -> Result<()> {
-        let mut events = Vec::new();
-        let denom;
-        {
-            let mut st = self.state.lock().await;
-            let pos = st
-                .queue
-                .iter()
-                .position(|i| i.id == item_id)
-                .ok_or_else(|| FedimixError::UnknownItem(item_id.clone()))?;
-            if st.device.is_none() {
-                return Err(FedimixError::NotSetUp("Set up Saving first".to_string()));
-            }
-            let item = st.queue.remove(pos);
-            denom = item.denomination;
-            st.moving = st.moving.saturating_sub(denom);
-            st.spending_balance = st.spending_balance.saturating_sub(denom);
-            st.in_flight = st.in_flight.saturating_sub(denom);
-            let n = st.next_coin_index();
-            let source_federation = st.federation.as_ref().map(|f| f.name.clone());
-            st.coins.push(Coin {
-                outpoint: fixtures::outpoint_for(n),
-                amount: denom,
-                tag: PrivacyTag::EarlyExit {
-                    estimate: item.anonymity_current,
-                },
-                received_at: BASE_TS,
-                address: fixtures::address_for(n),
-                source_federation,
-                frozen: false,
-            });
-            let spending_item = st.history_item(
-                HistoryKind::ToSaving {
-                    denomination: denom,
-                },
-                denom,
-                false,
-            );
-            let saving_item = st.history_item(
-                HistoryKind::FromSpending {
-                    denomination: denom,
-                },
-                denom,
-                true,
-            );
-            st.spending_history.insert(0, spending_item.clone());
-            st.saving_history.insert(0, saving_item.clone());
-            events.push(Event::QueueChanged);
-            events.push(Event::BalanceChanged {
-                wallet: WalletKind::Spending,
-                balance: st.spending_balance,
-            });
-            events.push(Event::HistoryItemAdded {
-                wallet: WalletKind::Spending,
-                item: spending_item,
-            });
-            events.push(Event::BalanceChanged {
-                wallet: WalletKind::Saving,
-                balance: st.saving_balance(),
-            });
-            events.push(Event::HistoryItemAdded {
-                wallet: WalletKind::Saving,
-                item: saving_item,
-            });
-            events.push(Event::Notification(Notice::ExitLanded { amount: denom }));
-        }
-        for e in events {
-            self.emit(e);
-        }
-        Ok(())
     }
 
     async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()> {
@@ -751,13 +1162,15 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 6] = [
+    const ALL: [DemoScenario; 8] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
         DemoScenario::FirstRun,
         DemoScenario::Offline,
         DemoScenario::ExitDeferred,
+        DemoScenario::PreviewExpiry,
+        DemoScenario::DeviceRejects,
     ];
 
     fn btc(v: f64) -> Amount {
@@ -822,16 +1235,51 @@ mod tests {
         }
     }
 
+    const FAST: DemoTiming = DemoTiming {
+        step: Duration::from_millis(1),
+        preview_ttl: Duration::from_secs(600),
+    };
+
+    fn fast(scenario: DemoScenario) -> Arc<DemoBackend> {
+        DemoBackend::with_timing(scenario, FAST)
+    }
+
+    /// Wait for the final state of `op`.
+    async fn settled(events: &EventStream, op: Result<OperationId>) -> OperationState {
+        let op = op.unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .expect("timed out")
+                .expect("stream ended");
+            if let Event::Operation { id, state, .. } = event
+                && id == op
+                && state.is_final()
+            {
+                return state;
+            }
+        }
+    }
+
+    async fn exit(b: &Arc<DemoBackend>, item: &str) {
+        let events = b.subscribe();
+        let preview = b.prepare_exit(item.to_string()).await.unwrap();
+        let op = b.exit_now(preview.id).await;
+        assert_eq!(settled(&events, op).await, OperationState::Done);
+    }
+
     #[tokio::test]
     async fn refill_below_target_matches_mockup() {
-        let b = DemoBackend::new(DemoScenario::BelowTarget);
+        let b = fast(DemoScenario::BelowTarget);
+        let events = b.subscribe();
         let p = b.prepare_refill().await.unwrap();
         assert_eq!(p.amount, btc(0.06));
         assert_eq!(p.fee, Amount::from_sat(420));
-        assert_eq!(p.overshoot, btc(0.0212));
+        assert_eq!(p.overshoot, btc(0.0212).saturating_sub(p.fee));
         let amounts: Vec<_> = p.coins.iter().map(|c| c.amount).collect();
         assert_eq!(amounts, vec![btc(0.01), btc(0.05)]);
-        b.confirm_refill(p.id.clone()).await.unwrap();
+        let op = b.confirm_refill(p.id.clone()).await;
+        settled(&events, op).await;
         assert!(b.confirm_refill(p.id).await.is_err());
     }
 
@@ -851,11 +1299,11 @@ mod tests {
 
     #[tokio::test]
     async fn exit_now_moves_item_and_emits() {
-        let b = DemoBackend::new(DemoScenario::Funded);
+        let b = fast(DemoScenario::Funded);
         let events = b.subscribe();
         let q = b.queue_state().await.unwrap();
         let item = q.items[0].clone();
-        b.exit_now(item.id.clone()).await.unwrap();
+        exit(&b, &item.id).await;
 
         let q2 = b.queue_state().await.unwrap();
         assert_eq!(q2.items.len(), q.items.len() - 1);
@@ -890,7 +1338,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_now_unknown_item_errors() {
-        let b = DemoBackend::new(DemoScenario::Funded);
+        let b = fast(DemoScenario::Funded);
         assert!(matches!(
             b.exit_now("nope".into()).await,
             Err(FedimixError::UnknownItem(_))
@@ -1061,18 +1509,19 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_send_twice_errors() {
-        let b = DemoBackend::new(DemoScenario::Funded);
+        let b = fast(DemoScenario::Funded);
         let events = b.subscribe();
         let before = b.saving_state().await.unwrap();
         let p = b
             .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(0.25)))
             .await
             .unwrap();
-        b.confirm_send(p.id.clone()).await.unwrap();
+        let op = b.confirm_send(p.id.clone()).await;
         assert!(matches!(
             b.confirm_send(p.id).await,
             Err(FedimixError::UnknownItem(_))
         ));
+        settled(&events, op).await;
         let after = b.saving_state().await.unwrap();
         assert!(after.balance < before.balance);
         assert_eq!(after.history.len(), before.history.len() + 1);
@@ -1100,40 +1549,43 @@ mod tests {
 
     #[tokio::test]
     async fn notes_sum_to_balance_after_balance_changes() {
-        let b = DemoBackend::new(DemoScenario::BelowTarget);
+        let b = fast(DemoScenario::BelowTarget);
+        let events = b.subscribe();
         let p = b.prepare_refill().await.unwrap();
-        b.confirm_refill(p.id).await.unwrap();
+        settled(&events, b.confirm_refill(p.id).await).await;
         let (n, bal) = notes_sum(&b).await;
         assert_eq!(n, bal);
         let p = b
             .prepare_send(send(WalletKind::Spending, "bc1qabc", exact(0.01)))
             .await
             .unwrap();
-        b.confirm_send(p.id).await.unwrap();
+        settled(&events, b.confirm_send(p.id).await).await;
         let (n, bal) = notes_sum(&b).await;
         assert_eq!(n, bal);
-        let f = DemoBackend::new(DemoScenario::Funded);
+        let f = fast(DemoScenario::Funded);
+        let events = f.subscribe();
         let p = f
             .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(0.25)))
             .await
             .unwrap();
-        f.confirm_send(p.id).await.unwrap();
+        settled(&events, f.confirm_send(p.id).await).await;
         let (n, bal) = notes_sum(&f).await;
         assert_eq!(n, bal);
     }
 
     #[tokio::test]
     async fn outpoints_unique_after_multi_input_send_and_exit() {
-        let b = DemoBackend::new(DemoScenario::Funded);
-        b.exit_now("queue-1".into()).await.unwrap();
-        b.exit_now("queue-2".into()).await.unwrap();
+        let b = fast(DemoScenario::Funded);
+        let events = b.subscribe();
+        exit(&b, "queue-1").await;
+        exit(&b, "queue-2").await;
         let p = b
             .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(1.2)))
             .await
             .unwrap();
         assert!(p.inputs.len() > 1);
-        b.confirm_send(p.id).await.unwrap();
-        b.exit_now("queue-3".into()).await.unwrap();
+        settled(&events, b.confirm_send(p.id).await).await;
+        exit(&b, "queue-3").await;
         let coins = b.saving_state().await.unwrap().coins;
         let mut ops: Vec<_> = coins.iter().map(|c| c.outpoint.clone()).collect();
         ops.sort();

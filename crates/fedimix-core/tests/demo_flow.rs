@@ -2,8 +2,27 @@
 
 use fedimix_core::*;
 
+const FAST: DemoTiming = DemoTiming {
+    step: std::time::Duration::from_millis(1),
+    preview_ttl: std::time::Duration::from_secs(600),
+};
+
 fn core(scenario: DemoScenario) -> Fedimix {
-    Fedimix::new(DemoBackend::new(scenario))
+    Fedimix::new(DemoBackend::with_timing(scenario, FAST))
+}
+
+/// Wait until operation `id` reaches a final state, which must be `Done`.
+async fn done(events: &EventStream, id: OperationId) {
+    loop {
+        match events.next().await {
+            Some(Event::Operation { id: got, state, .. }) if got == id && state.is_final() => {
+                assert_eq!(state, OperationState::Done);
+                return;
+            }
+            Some(_) => {}
+            None => panic!("stream ended"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -44,7 +63,8 @@ async fn funded_send_and_exit_update_state_and_emit() {
         })
         .await
         .unwrap();
-    core.confirm_send(preview.id).await.unwrap();
+    let op = core.confirm_send(preview.id).await.unwrap();
+    done(&events, op).await;
     let after = core.saving_state().await.unwrap();
     assert_eq!(after.history.len(), before.history.len() + 1);
     assert!(after.balance < before.balance);
@@ -53,7 +73,9 @@ async fn funded_send_and_exit_update_state_and_emit() {
     // Exit now: the queue shrinks and a coin appears in Saving.
     let queue = core.queue_state().await.unwrap();
     let first = queue.items[0].clone();
-    core.exit_now(first.id.clone()).await.unwrap();
+    let exit = core.prepare_exit(first.id.clone()).await.unwrap();
+    let op = core.exit_now(exit.id).await.unwrap();
+    done(&events, op).await;
     let queue_after = core.queue_state().await.unwrap();
     assert_eq!(queue_after.items.len(), queue.items.len() - 1);
     assert!(queue_after.items.iter().all(|i| i.id != first.id));
@@ -62,8 +84,17 @@ async fn funded_send_and_exit_update_state_and_emit() {
         after.coins.len() + 1,
         "exited note becomes a coin"
     );
-    assert!(core.exit_now(first.id).await.is_err());
+    assert!(core.prepare_exit(first.id).await.is_err());
+}
 
+#[tokio::test]
+async fn balance_and_queue_events_reach_a_subscriber() {
+    let core = core(DemoScenario::Funded);
+    let progress = core.subscribe();
+    let events = core.subscribe();
+    let exit = core.prepare_exit("queue-1".into()).await.unwrap();
+    let op = core.exit_now(exit.id).await.unwrap();
+    done(&progress, op).await;
     let mut saw_balance = false;
     let mut saw_queue = false;
     while let Ok(Some(event)) =
@@ -78,12 +109,14 @@ async fn funded_send_and_exit_update_state_and_emit() {
 #[tokio::test]
 async fn below_target_refill_raises_spending() {
     let core = core(DemoScenario::BelowTarget);
+    let events = core.subscribe();
     let before = core.spending_state().await.unwrap();
     assert!(before.for_spending < before.target);
 
     let preview = core.prepare_refill().await.unwrap();
     assert!(preview.amount >= before.target.saturating_sub(before.for_spending));
-    core.confirm_refill(preview.id.clone()).await.unwrap();
+    let op = core.confirm_refill(preview.id.clone()).await.unwrap();
+    done(&events, op).await;
 
     let after = core.spending_state().await.unwrap();
     assert!(after.for_spending >= after.target);
