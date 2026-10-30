@@ -13,10 +13,15 @@ use crate::ui::app_state::AppContext;
 /// is a toast and no dialog. `expanded` starts with the coin list revealed.
 pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
     let core = ctx.bridge.core();
-    ctx.run(async move { core.prepare_refill().await }, {
-        let ctx = ctx.clone();
-        move |preview| show(&ctx, preview, expanded)
-    });
+    let ctx = ctx.clone();
+    ctx.bridge
+        .call(async move { core.prepare_refill().await }, {
+            let ctx = ctx.clone();
+            move |res| match res {
+                Ok(preview) => show(&ctx, preview, expanded),
+                Err(e) => ctx.toast(&crate::present::refill_error_message(&e)),
+            }
+        });
 }
 
 fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {

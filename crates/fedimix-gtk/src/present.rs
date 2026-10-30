@@ -272,6 +272,14 @@ pub fn confirm_button(
     }
 }
 
+/// Toast text for a failed `prepare_refill`.
+pub fn refill_error_message(e: &fedimix_core::FedimixError) -> String {
+    match e {
+        fedimix_core::FedimixError::InvalidAmount(why) => why.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Refill dialog note about the overshoot; empty when there is none.
 pub fn refill_overshoot_note(overshoot: Amount) -> String {
     if overshoot == Amount::ZERO {
@@ -655,6 +663,16 @@ mod tests {
         assert!(send_validation("bc1qxyz", "0", true).is_err());
         assert!(send_validation("bc1qxyz", "", false).is_ok());
         assert!(send_validation("bc1qxyz", "0.1", true).is_ok());
+    }
+
+    #[test]
+    fn refill_error_message_drops_prefix() {
+        use fedimix_core::FedimixError as E;
+        assert_eq!(
+            refill_error_message(&E::InvalidAmount("Spending is at target".into())),
+            "Spending is at target"
+        );
+        assert_eq!(refill_error_message(&E::Offline), E::Offline.to_string());
     }
 
     #[test]
