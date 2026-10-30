@@ -1,6 +1,6 @@
 # Status
 
-Phase 1, Tasks 1-7 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic; app shell with CLI, CoreBridge, AppContext and window; Saving tab with shared widgets and history list; Spending tab, Coins/coin detail/Notes pages).
+Phase 1, Tasks 1-8 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic; app shell with CLI, CoreBridge, AppContext and window; Saving tab with shared widgets and history list; Spending tab, Coins/coin detail/Notes pages; Moving to Saving page).
 
 ## What works
 - `nix develop -c just build|test|clippy|fmt` on the `fedimix-core` + `fedimix-gtk` workspace.
@@ -16,10 +16,10 @@ Phase 1, Tasks 1-7 done (workspace split/dev shell/screenshot harness; core API 
 
 - The Saving tab shows device, balance, depositing link, Send/Receive (toast "Not available yet"), and history with `--demo`; with `--demo-scenario no-saving` its empty state offers "Set up" (toast). Its balance opens the Coins page (rows open coin detail with a Freeze switch).
 
-- The Spending tab shows Offline and "Set up Saving" banners, balance (opens Notes page), bar and caption, "Refill from Saving", Send/Receive and history with a "Show cover traffic" toggle. Moving queue link, Refill, Set up, Send/Receive toast "Not available yet". `--demo-page saving|spending|coins|coin-detail|notes` works; other pages are ignored until their tasks.
+- The Spending tab shows Offline and "Set up Saving" banners, balance (opens Notes page), bar and caption, "Refill from Saving", Send/Receive and history with a "Show cover traffic" toggle. Refill, Set up, Send/Receive toast "Not available yet". The Moving queue link opens the Moving to Saving page (live rows, level bars, row menu "Exit now (lower privacy)" with confirm dialog; insensitive while waiting for Saving). `--demo-page saving|spending|coins|coin-detail|notes|moving` works; other pages are ignored until their tasks.
 
 ## Next
-Task 8.
+Task 9.
 
 ## Needs user
 Nothing.

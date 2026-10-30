@@ -9,7 +9,7 @@ use fedimix_core::{SpendingState, WalletKind};
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::{notes_page, widgets};
+use crate::ui::{moving_page, notes_page, widgets};
 
 struct Inner {
     offline: adw::Banner,
@@ -77,8 +77,7 @@ impl SpendingTab {
         caption_link.add_css_class("link");
         caption_link.connect_clicked({
             let ctx = ctx.clone();
-            // Task 8 provides ui::moving_page::push(ctx).
-            move |_| ctx.toast("Not available yet")
+            move |_| moving_page::push(&ctx)
         });
 
         let refill = gtk::Button::with_label("Refill from Saving");

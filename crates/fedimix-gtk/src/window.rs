@@ -9,7 +9,7 @@ use crate::cli::StartPage;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::saving_tab::SavingTab;
 use crate::ui::spending_tab::SpendingTab;
-use crate::ui::{coin_detail, coins_page, notes_page};
+use crate::ui::{coin_detail, coins_page, moving_page, notes_page};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -157,6 +157,7 @@ impl FedimixWindow {
                 }
             }
             Some(StartPage::Notes) => notes_page::push(ctx),
+            Some(StartPage::Moving) => moving_page::push(ctx),
             _ => {}
         }
     }

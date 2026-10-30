@@ -201,6 +201,14 @@ pub fn queue_summary(q: &QueueState) -> String {
     )
 }
 
+/// Toast text for a failed "Exit now".
+pub fn exit_error_message(e: &fedimix_core::FedimixError) -> String {
+    match e {
+        fedimix_core::FedimixError::UnknownItem(_) => "This item has already left".to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub fn visible_history(items: &[HistoryItem], show_cover: bool) -> Vec<HistoryItem> {
     items
         .iter()
@@ -361,6 +369,18 @@ mod tests {
         assert_eq!(
             queue_row(&qitem(QueueItemStatus::Queued, 5, 5), 0).fraction,
             1.0
+        );
+    }
+
+    #[test]
+    fn exit_error_message_for_gone_item() {
+        assert_eq!(
+            exit_error_message(&fedimix_core::FedimixError::UnknownItem("x".into())),
+            "This item has already left"
+        );
+        assert_eq!(
+            exit_error_message(&fedimix_core::FedimixError::Offline),
+            "offline"
         );
     }
 
