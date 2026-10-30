@@ -42,6 +42,7 @@
 
         buildInputs = with pkgs; [
           glib
+          pango
           gtk4
           libadwaita
         ];

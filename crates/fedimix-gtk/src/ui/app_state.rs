@@ -15,7 +15,7 @@ pub struct Snapshots {
     pub queue: QueueState,
 }
 
-type Subscriber = Rc<dyn Fn(&Snapshots)>;
+type Subscriber = Rc<dyn Fn(&Snapshots) -> bool>;
 
 #[derive(Default)]
 struct Shared {
@@ -59,15 +59,18 @@ impl AppContext {
     /// Register `f` to run on every new snapshot set, and once immediately if
     /// a snapshot is already available.
     ///
-    /// There is no unsubscribe: views are pushed and popped, so callers must
-    /// capture only weak references (`glib::clone!(#[weak] ...)` or
-    /// `Weak<T>`) and let the closure no-op once the view is gone.
-    pub fn on_snapshots(&self, f: impl Fn(&Snapshots) + 'static) {
+    /// `f` returns whether it wants to stay subscribed; returning `false`
+    /// removes it. Views are pushed and popped, so callers must capture only
+    /// weak references (`glib::clone!(#[weak] ...)` or `Weak<T>`) and return
+    /// `false` once the view is gone.
+    pub fn on_snapshots(&self, f: impl Fn(&Snapshots) -> bool + 'static) {
         let f: Subscriber = Rc::new(f);
-        self.shared.subscribers.borrow_mut().push(f.clone());
-        if let Some(latest) = self.latest() {
-            f(&latest);
+        if let Some(latest) = self.latest()
+            && !f(&latest)
+        {
+            return;
         }
+        self.shared.subscribers.borrow_mut().push(f);
     }
 
     pub fn latest(&self) -> Option<Snapshots> {
@@ -109,8 +112,17 @@ impl AppContext {
         *self.shared.latest.borrow_mut() = Some(snapshots.clone());
         // Clone the list so subscribers may register more subscribers.
         let subscribers: Vec<Subscriber> = self.shared.subscribers.borrow().clone();
+        let mut dead: Vec<Subscriber> = Vec::new();
         for f in subscribers {
-            f(&snapshots);
+            if !f(&snapshots) {
+                dead.push(f);
+            }
+        }
+        if !dead.is_empty() {
+            self.shared
+                .subscribers
+                .borrow_mut()
+                .retain(|f| !dead.iter().any(|d| Rc::ptr_eq(f, d)));
         }
     }
 

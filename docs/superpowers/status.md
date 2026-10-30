@@ -1,6 +1,6 @@
 # Status
 
-Phase 1, Tasks 1-5 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic; app shell with CLI, CoreBridge, AppContext and window).
+Phase 1, Tasks 1-6 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic; app shell with CLI, CoreBridge, AppContext and window; Saving tab with shared widgets and history list).
 
 ## What works
 - `nix develop -c just build|test|clippy|fmt` on the `fedimix-core` + `fedimix-gtk` workspace.
@@ -14,8 +14,10 @@ Phase 1, Tasks 1-5 done (workspace split/dev shell/screenshot harness; core API 
 
 - `nix develop -c just demo` (or `scripts/screenshot.sh out.png [--width 400] -- --demo [--demo-scenario <name>]`) shows the shell: Wide header switcher, bottom switcher bar below 500sp, placeholder tabs; `--demo-page` is parsed only. Without `--demo` the app exits 2.
 
+- The Saving tab shows device, balance, depositing link, Send/Receive (toast "Not available yet"), and history with `--demo`; with `--demo-scenario no-saving` its empty state offers "Set up" (toast). Balance click toasts until Task 7.
+
 ## Next
-Task 6.
+Task 7.
 
 ## Needs user
 Nothing.

@@ -6,6 +6,7 @@ use gtk::gio;
 
 use crate::bridge::CoreBridge;
 use crate::ui::app_state::AppContext;
+use crate::ui::saving_tab::SavingTab;
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -40,8 +41,9 @@ impl FedimixWindow {
         load_css();
 
         let stack = adw::ViewStack::new();
+        let saving_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         stack.add_titled_with_icon(
-            &placeholder("Saving", "security-high-symbolic"),
+            &saving_slot,
             Some("saving"),
             "Saving",
             "security-high-symbolic",
@@ -103,6 +105,9 @@ impl FedimixWindow {
         window.add_breakpoint(breakpoint);
 
         let ctx = AppContext::new(bridge, toasts, nav, stack);
+        let saving_tab = SavingTab::new(Rc::new(ctx.clone()));
+        saving_tab.widget().set_vexpand(true);
+        saving_slot.append(saving_tab.widget());
         Self::install_actions(app, &ctx);
         Self::wire_state(&ctx);
         ctx.refresh();
@@ -137,7 +142,7 @@ impl FedimixWindow {
         let stack = ctx.stack.downgrade();
         ctx.on_snapshots(move |s| {
             if picked.replace(true) {
-                return;
+                return false;
             }
             if let Some(stack) = stack.upgrade() {
                 let name = if s.saving.device.is_some() {
@@ -147,6 +152,7 @@ impl FedimixWindow {
                 };
                 stack.set_visible_child_name(name);
             }
+            false
         });
 
         // Any backend event invalidates the snapshots.
