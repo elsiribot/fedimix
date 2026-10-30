@@ -223,7 +223,8 @@ impl FedimixWindow {
                 if !picked.replace(true) {
                     Self::apply_start_page(&ctx, start_page, s);
                 }
-                false
+                // Stay subscribed: Join and tabs swap on every federation change.
+                true
             }
         });
 

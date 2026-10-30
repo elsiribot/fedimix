@@ -21,7 +21,8 @@ struct Inner {
     ctx: Rc<AppContext>,
     federations: adw::PreferencesGroup,
     fed_rows: RefCell<Vec<adw::ActionRow>>,
-    fed_ids: RefCell<Option<Vec<(String, bool)>>>,
+    /// Federations and active id as last rendered.
+    fed_shown: RefCell<Option<(Vec<FederationInfo>, Option<String>)>>,
     hw_name: adw::ActionRow,
     hw_status: adw::ActionRow,
     target: adw::EntryRow,
@@ -82,7 +83,7 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
             .title("Federations")
             .build(),
         fed_rows: RefCell::default(),
-        fed_ids: RefCell::default(),
+        fed_shown: RefCell::default(),
         hw_name: adw::ActionRow::builder().title("Device").build(),
         hw_status: adw::ActionRow::builder().title("Status").build(),
         target: entry(
@@ -215,6 +216,11 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
             None => false,
         }
     });
+    // Popping within the debounce window must not lose the edit.
+    nav_page.connect_hidden({
+        let weak = weak.clone();
+        move |_| flush(&weak)
+    });
     // The page owns the state; snapshot subscribers hold it weakly.
     nav_page.connect_destroy(move |_| {
         let _keep_alive = &inner;
@@ -238,8 +244,17 @@ fn schedule(weak: &Weak<Inner>) {
     *inner.timer.borrow_mut() = Some(id);
 }
 
+/// Write a pending debounced edit now.
+fn flush(weak: &Weak<Inner>) {
+    let Some(inner) = weak.upgrade() else { return };
+    if let Some(id) = inner.timer.borrow_mut().take() {
+        id.remove();
+        inner.apply();
+    }
+}
+
 impl Inner {
-    fn apply(&self) {
+    fn apply(self: &Rc<Self>) {
         let target = self.target.text();
         let url = self.url.text();
         let proxy = self.proxy.text();
@@ -254,7 +269,7 @@ impl Inner {
             url: &url,
             proxy: &proxy,
         };
-        let result = present::settings_from_form(&form, &self.current.borrow());
+        let result = present::settings_from_form(&form);
         let target_bad = format::parse_btc(&target).is_err();
         let url_bad = url.trim().is_empty();
         set_error(&self.target, target_bad);
@@ -264,10 +279,19 @@ impl Inner {
                 if *self.current.borrow() == settings {
                     return;
                 }
-                *self.current.borrow_mut() = settings.clone();
                 let core = self.ctx.bridge.core();
-                self.ctx
-                    .run(async move { core.set_settings(settings).await }, |()| {});
+                let weak = Rc::downgrade(self);
+                let saved = settings.clone();
+                // `current` only advances once the write succeeded, so a
+                // failed write is retried by the next edit.
+                self.ctx.run(
+                    async move { core.set_settings(settings).await },
+                    move |()| {
+                        if let Some(inner) = weak.upgrade() {
+                            *inner.current.borrow_mut() = saved;
+                        }
+                    },
+                );
             }
             Err(msg) => {
                 self.target.set_tooltip_text(Some(if target_bad {
@@ -294,16 +318,8 @@ impl Inner {
                 self.hw_status.set_subtitle("Not set up");
             }
         }
-        // Refetch the list when the active federation changed.
-        let active = s.spending.federation.as_ref().map(|f| f.id.clone());
-        let known_active = self
-            .fed_ids
-            .borrow()
-            .as_ref()
-            .and_then(|l| l.iter().find(|(_, a)| *a).map(|(id, _)| id.clone()));
-        if self.fed_ids.borrow().is_some() && active == known_active {
-            return;
-        }
+        // Refetch on every snapshot: a joined or changed federation may not
+        // be the active one. `render_federations` skips an unchanged list.
         let core = self.ctx.bridge.core();
         let weak = Rc::downgrade(self);
         let snapshots = s.clone();
@@ -316,12 +332,17 @@ impl Inner {
     }
 
     fn render_federations(self: &Rc<Self>, feds: &[FederationInfo], s: Option<&Snapshots>) {
+        let active = s
+            .and_then(|s| s.spending.federation.as_ref())
+            .map(|f| f.id.clone());
+        let shown = (feds.to_vec(), active);
+        if self.fed_shown.borrow().as_ref() == Some(&shown) {
+            return;
+        }
+        let active = shown.1.as_deref();
         for row in self.fed_rows.borrow_mut().drain(..) {
             self.federations.remove(&row);
         }
-        let active = s
-            .and_then(|s| s.spending.federation.as_ref())
-            .map(|f| f.id.as_str());
         let mut group: Option<gtk::CheckButton> = None;
         let mut rows = Vec::new();
         for fed in feds {
@@ -364,11 +385,7 @@ impl Inner {
         self.federations.add(&add);
         rows.push(add);
         *self.fed_rows.borrow_mut() = rows;
-        *self.fed_ids.borrow_mut() = Some(
-            feds.iter()
-                .map(|f| (f.id.clone(), Some(f.id.as_str()) == active))
-                .collect(),
-        );
+        *self.fed_shown.borrow_mut() = Some(shown);
     }
 }
 

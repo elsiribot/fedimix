@@ -323,10 +323,8 @@ fn in_range(name: &str, v: f64, min: f64, max: f64) -> Result<u64, String> {
     }
 }
 
-/// Validate the Settings form and build the new [`Settings`] from it. The form
-/// edits every field today; `_current` is where fields it does not edit would
-/// be carried over from.
-pub fn settings_from_form(form: &SettingsForm, _current: &Settings) -> Result<Settings, String> {
+/// Validate the Settings form and build the new [`Settings`] from it.
+pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
     let url = form.url.trim();
     if url.is_empty() {
         return Err("Enter a server URL".to_string());
@@ -689,7 +687,7 @@ mod settings_form_tests {
 
     #[test]
     fn accepts_valid_form() {
-        let s = settings_from_form(&form(), &Settings::default()).unwrap();
+        let s = settings_from_form(&form()).unwrap();
         assert_eq!(s.spending_target, Amount::from_sat(5_000_000));
         assert_eq!(s.anonymity_target, 100);
         assert_eq!(s.min_time_in_pool_secs, 12 * 3600);
@@ -709,7 +707,7 @@ mod settings_form_tests {
     fn proxy_is_trimmed_and_kept() {
         let mut f = form();
         f.proxy = " 127.0.0.1:9050 ";
-        let s = settings_from_form(&f, &Settings::default()).unwrap();
+        let s = settings_from_form(&f).unwrap();
         assert_eq!(s.socks5_proxy.as_deref(), Some("127.0.0.1:9050"));
     }
 
@@ -718,22 +716,21 @@ mod settings_form_tests {
         for bad in ["", "abc", "-1", "21000001"] {
             let mut f = form();
             f.target_btc = bad;
-            let err = settings_from_form(&f, &Settings::default()).unwrap_err();
+            let err = settings_from_form(&f).unwrap_err();
             assert!(!err.is_empty(), "{bad:?}");
         }
     }
 
     #[test]
     fn rejects_out_of_range_numbers_and_empty_url() {
-        let cur = Settings::default();
         let mut f = form();
         f.anonymity_target = 0.0;
-        assert!(settings_from_form(&f, &cur).is_err());
+        assert!(settings_from_form(&f).is_err());
         let mut f = form();
         f.fee_guard_percent = 101.0;
-        assert!(settings_from_form(&f, &cur).is_err());
+        assert!(settings_from_form(&f).is_err());
         let mut f = form();
         f.url = "  ";
-        assert!(settings_from_form(&f, &cur).is_err());
+        assert!(settings_from_form(&f).is_err());
     }
 }
