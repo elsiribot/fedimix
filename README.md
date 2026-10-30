@@ -21,7 +21,8 @@ just clippy   # lint with warnings denied
 just fmt      # format the code
 ```
 
-`nix build` produces a wrapped release binary at `result/bin/fedimix`.
+`nix build` produces a wrapped release binary at `result/bin/fedimix`;
+`just build-nix` does that and runs the flake checks (clippy, fmt, tests).
 
 ## Demo mode
 

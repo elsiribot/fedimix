@@ -1,0 +1,26 @@
+# scenario: funded
+# What the Send form accepts: Max, a BIP21 amount, an uppercase invoice; Saving refuses Lightning.
+click Send
+type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
+click Max
+click Review
+expect 1.20339580 BTC
+close-dialog
+click Send
+type "Bitcoin address" lnbc1200u1demo
+expect Saving can only send to a bitcoin address
+close-dialog
+click Send
+type "Bitcoin address" bitcoin:BC1QDEMO0FLOW?amount=0.0123
+click Review
+expect 0.01230000 BTC
+expect bc1qdemo0flow
+close-dialog
+click Spending
+click Send
+type "Lightning invoice or on-chain address" LIGHTNING:LNBC1200U1DEMO
+click Review
+expect 0.00120000 BTC
+expect lnbc1200u1demo
+expect 12 sat
+shot lightning-review

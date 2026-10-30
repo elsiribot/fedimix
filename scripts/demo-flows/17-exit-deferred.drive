@@ -13,3 +13,10 @@ expect waiting after reconnect
 expect waiting to reconnect
 expect withdrawing
 shot moving
+# Withdrawing and unaffordable rows are locked; the fee guard can be overridden,
+# and the core then says, in words, that the fee cannot be paid.
+click Item actions
+click Exit now (lower privacy)
+expect Not enough funds: 200 sat available, 420 sat needed
+expect-not msat
+shot refused
