@@ -1,0 +1,15 @@
+[package]
+name = "fedimix-gtk"
+description = "A Fedimint-based bitcoin mixer (GTK4 desktop app)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fedimix"
+path = "src/main.rs"
+
+[dependencies]
+adw.workspace = true
+gtk.workspace = true
+fedimix-core = { path = "../fedimix-core" }

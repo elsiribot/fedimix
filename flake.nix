@@ -82,7 +82,13 @@
           packages = [
             toolchain
             pkgs.just
+            pkgs.sway
+            pkgs.grim
+            pkgs.jq
+            pkgs.dbus
           ];
+          # The built binary needs the GTK/libadwaita libraries at runtime.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
           # Lets GTK find schemas/icons when running via `cargo run`.
           shellHook = ''
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.adwaita-icon-theme}/share:$XDG_DATA_DIRS"
