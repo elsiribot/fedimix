@@ -20,7 +20,8 @@ Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. The wh
 - `parse_destination` does not verify checksums and has no base58 addresses; real validation is Phase 2.
 
 ## Next
-Phase 2: real Fedimint backend. Its plan owns bootstrap (open/shutdown/seed), paged history and the network setting; the FFI crate comes later.
+Phase 2: real Fedimint backend. A build and devimint spike is running; the plan follows from it. The plan owns bootstrap (open/shutdown/seed), paged history and the network setting.
+The final re-review left 3 Important and 7 Minor findings, none Critical; Phase 2 Task 1 fixes them first. Until then Exit now wrongly works during the grace period, and a Send stuck in Broadcasting cannot be closed.
 
 ## Needs user
 Nothing.
