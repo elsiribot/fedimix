@@ -13,9 +13,11 @@ pub struct CoreBridge {
 }
 
 impl CoreBridge {
-    /// Start the runtime on its own thread named "fedimix-core".
+    /// Start the multi-thread runtime, parked on its own thread named
+    /// "fedimix-core". The real backend needs worker threads: fedimint uses
+    /// `block_in_place`, which panics on a current-thread runtime.
     pub fn start(backend: Arc<dyn Backend>) -> Self {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("failed to build tokio runtime");

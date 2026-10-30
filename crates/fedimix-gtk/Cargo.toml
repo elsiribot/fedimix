@@ -15,4 +15,4 @@ gtk.workspace = true
 fedimix-core = { path = "../fedimix-core" }
 async-channel.workspace = true
 qrcode.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
