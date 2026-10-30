@@ -359,9 +359,10 @@ fn funded() -> Fixture {
 
 pub fn fixture(scenario: DemoScenario) -> Fixture {
     match scenario {
-        DemoScenario::Funded | DemoScenario::PreviewExpiry | DemoScenario::DeviceRejects => {
-            funded()
-        }
+        DemoScenario::Funded
+        | DemoScenario::PreviewExpiry
+        | DemoScenario::DeviceRejects
+        | DemoScenario::SendStuck => funded(),
         DemoScenario::BelowTarget => {
             let history = funded_saving_history();
             Fixture {

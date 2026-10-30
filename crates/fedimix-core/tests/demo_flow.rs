@@ -5,6 +5,8 @@ use fedimix_core::*;
 const FAST: DemoTiming = DemoTiming {
     step: std::time::Duration::from_millis(1),
     preview_ttl: std::time::Duration::from_secs(600),
+    broadcast_hold: std::time::Duration::ZERO,
+    send_lock_timeout: None,
 };
 
 fn core(scenario: DemoScenario) -> Fedimix {

@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use fedimix_core::{Backend, Event, Fedimix};
+use fedimix_core::{Backend, Event, Fedimix, FedimixError};
 
 #[derive(Clone)]
 pub struct CoreBridge {
@@ -50,20 +50,25 @@ impl CoreBridge {
 
     /// Run `fut` on the core runtime and deliver its result to `on_done` on
     /// the GTK main loop. Must be called from the main thread.
+    ///
+    /// `on_done` always runs: a future that panics (or is cancelled) yields
+    /// `Err(FedimixError::Internal(..))`, so state guarded by a call, such as
+    /// a refresh gate or a locked dialog, cannot be left held.
     pub fn call<T, Fut, Cb>(&self, fut: Fut, on_done: Cb)
     where
         T: Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-        Cb: FnOnce(T) + 'static,
+        Fut: Future<Output = Result<T, FedimixError>> + Send + 'static,
+        Cb: FnOnce(Result<T, FedimixError>) + 'static,
     {
-        let (tx, rx) = async_channel::bounded(1);
-        self.handle.spawn(async move {
-            let _ = tx.send(fut.await).await;
-        });
+        let task = self.handle.spawn(fut);
         gtk::glib::spawn_future_local(async move {
-            if let Ok(value) = rx.recv().await {
-                on_done(value);
-            }
+            let res = match task.await {
+                Ok(res) => res,
+                Err(_) => Err(FedimixError::Internal(
+                    "Something went wrong inside Fedimix.".to_string(),
+                )),
+            };
+            on_done(res);
         });
     }
 
@@ -78,25 +83,69 @@ impl CoreBridge {
 mod tests {
     use super::*;
     use fedimix_core::{DemoBackend, DemoScenario};
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    /// Run `body` with a private glib context as this thread's default (the
+    /// shared default context can be held by only one test thread), then
+    /// iterate it until `done`.
+    fn on_private_context(body: impl FnOnce(), done: impl Fn() -> bool) {
+        let ctx = gtk::glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            body();
+            let start = std::time::Instant::now();
+            while !done() {
+                assert!(start.elapsed().as_secs() < 5, "callback never fired");
+                ctx.iteration(false);
+            }
+        })
+        .unwrap();
+    }
 
     #[test]
     fn call_delivers_on_main_context() {
         let bridge = CoreBridge::start(DemoBackend::new(DemoScenario::Funded));
-        let ctx = gtk::glib::MainContext::default();
-        let _guard = ctx.acquire().unwrap();
         let got = Rc::new(Cell::new(None));
-        let g = got.clone();
         let main_thread = std::thread::current().id();
-        bridge.call(async { 7u32 }, move |v| {
-            assert_eq!(std::thread::current().id(), main_thread);
-            g.set(Some(v));
-        });
-        let start = std::time::Instant::now();
-        while got.get().is_none() {
-            assert!(start.elapsed().as_secs() < 5, "callback never fired");
-            ctx.iteration(false);
-        }
+        on_private_context(
+            || {
+                let g = got.clone();
+                bridge.call(async { Ok::<_, FedimixError>(7u32) }, move |v| {
+                    assert_eq!(std::thread::current().id(), main_thread);
+                    g.set(Some(v.unwrap()));
+                });
+            },
+            || got.get().is_some(),
+        );
         assert_eq!(got.get(), Some(7));
+    }
+
+    #[test]
+    fn panicking_future_reports_internal() {
+        let bridge = CoreBridge::start(DemoBackend::new(DemoScenario::Funded));
+        let got = Rc::new(RefCell::new(None));
+        on_private_context(
+            || {
+                let g = got.clone();
+                bridge.call(
+                    async {
+                        if true {
+                            panic!("boom");
+                        }
+                        Ok::<u32, FedimixError>(1)
+                    },
+                    move |v| *g.borrow_mut() = Some(v),
+                );
+            },
+            || got.borrow().is_some(),
+        );
+        assert_eq!(
+            got.borrow().clone(),
+            Some(Err(FedimixError::Internal(
+                "Something went wrong inside Fedimix.".to_string()
+            )))
+        );
     }
 }

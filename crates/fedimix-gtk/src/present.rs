@@ -232,15 +232,18 @@ pub fn queue_row(item: &QueueItem, anonymity_target: u32) -> QueueRowView {
     }
 }
 
-/// Whether "Exit now" can run. The fee guard and the grace period are
-/// deferrals of automatic exits only; a manual exit overrides them.
+/// Whether "Exit now" can run. The fee guard is a deferral of automatic exits
+/// only, so a manual exit overrides it. The online grace period is not: no
+/// exit happens within it (spec section 1), and the core refuses one too.
 pub fn exit_allowed(status: &QueueItemStatus) -> bool {
     !matches!(
         status,
         QueueItemStatus::Withdrawing { .. }
             | QueueItemStatus::Landed
             | QueueItemStatus::Deferred {
-                reason: DeferReason::Offline | DeferReason::FeeUnaffordable,
+                reason: DeferReason::Offline
+                    | DeferReason::FeeUnaffordable
+                    | DeferReason::GracePeriod,
             }
     )
 }
@@ -287,6 +290,7 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::PreviewExpired => "This review expired. Check the details and try again".to_string(),
         E::DeviceRejected => "The device rejected the transaction".to_string(),
         E::Cancelled => "Cancelled".to_string(),
+        E::GracePeriod => "Exits wait until the app has been online for a while.".to_string(),
         E::Internal(why) => format!("Something went wrong: {why}"),
     }
 }
@@ -300,6 +304,13 @@ pub fn event_needs_refresh(event: &Event) -> bool {
         _ => true,
     }
 }
+
+/// How long a Send may sit in Broadcasting before its dialog can be closed.
+pub const SEND_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Replaces the Broadcasting caption once the dialog can be closed.
+pub const SEND_UNLOCKED_CAPTION: &str =
+    "You can close this; the result will appear when it arrives";
 
 /// What the Send review says while an operation runs. `device` is the name
 /// of the signing device.
@@ -747,6 +758,14 @@ mod tests {
     }
 
     #[test]
+    fn exit_refused_during_grace_period() {
+        let grace = QueueItemStatus::Deferred {
+            reason: DeferReason::GracePeriod,
+        };
+        assert!(!exit_allowed(&grace));
+    }
+
+    #[test]
     fn exit_allowed_by_status() {
         use DeferReason::*;
         let deferred = |reason| QueueItemStatus::Deferred { reason };
@@ -755,7 +774,6 @@ mod tests {
             QueueItemStatus::Eligible,
             QueueItemStatus::Scheduled { at: 0 },
             deferred(FeeGuard),
-            deferred(GracePeriod),
         ] {
             assert!(exit_allowed(&allowed), "{allowed:?}");
         }
@@ -764,6 +782,7 @@ mod tests {
             QueueItemStatus::Landed,
             deferred(Offline),
             deferred(FeeUnaffordable),
+            deferred(GracePeriod),
         ] {
             assert!(!exit_allowed(&refused), "{refused:?}");
         }
@@ -1067,6 +1086,8 @@ mod tests {
         const FAST: DemoTiming = DemoTiming {
             step: Duration::from_millis(1),
             preview_ttl: Duration::from_secs(600),
+            broadcast_hold: Duration::ZERO,
+            send_lock_timeout: None,
         };
         let demo = |scenario| Fedimix::new(DemoBackend::with_timing(scenario, FAST));
         async fn done(events: &EventStream, id: OperationId) {

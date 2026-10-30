@@ -27,6 +27,9 @@ pub enum FedimixError {
     DeviceRejected,
     #[error("cancelled")]
     Cancelled,
+    /// Exits wait out the online grace period (spec section 1).
+    #[error("exits wait until the app has been online for a while")]
+    GracePeriod,
     #[error("internal error: {0}")]
     Internal(String),
 }

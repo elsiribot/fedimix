@@ -11,6 +11,8 @@ use fedimix_core::*;
 const FAST: DemoTiming = DemoTiming {
     step: Duration::from_millis(5),
     preview_ttl: Duration::from_secs(600),
+    broadcast_hold: Duration::ZERO,
+    send_lock_timeout: None,
 };
 const EXPIRED: DemoTiming = DemoTiming {
     preview_ttl: Duration::ZERO,
@@ -229,6 +231,16 @@ async fn exit_preview_refusals() {
         core.prepare_exit("queue-1".into()).await,
         Err(FedimixError::InsufficientFunds { .. })
     ));
+}
+
+#[tokio::test]
+async fn prepare_exit_refuses_grace_period() {
+    // queue-3 is deferred for the online grace period; no manual override.
+    let (core, _) = fast(DemoScenario::ExitDeferred);
+    assert_eq!(
+        core.prepare_exit("queue-3".into()).await,
+        Err(FedimixError::GracePeriod)
+    );
 }
 
 #[tokio::test]

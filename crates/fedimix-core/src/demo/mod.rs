@@ -38,6 +38,9 @@ const EXIT_DENOMINATIONS_SAT: [u64; 10] = [
     200_000,
     100_000,
 ];
+/// `send-stuck`: a send held in Broadcasting, and the shortened wait.
+const STUCK_BROADCAST_HOLD: Duration = Duration::from_secs(4);
+const STUCK_SEND_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Operation states before the job takes effect.
 const SIGNED_PLAN: &[OperationState] = &[
     OperationState::AwaitingDevice,
@@ -68,6 +71,8 @@ pub enum DemoScenario {
     PreviewExpiry,
     /// Funded, with a device that refuses to sign and to set up.
     DeviceRejects,
+    /// Funded, with sends held in Broadcasting for a while.
+    SendStuck,
 }
 
 /// How fast the demo moves.
@@ -76,16 +81,30 @@ pub struct DemoTiming {
     /// Time spent in each operation state.
     pub step: Duration,
     pub preview_ttl: Duration,
+    /// Extra time an operation stays in Broadcasting, before it takes effect.
+    pub broadcast_hold: Duration,
+    /// How long a front end should let a Send sit in Broadcasting before it
+    /// lets the user leave, instead of its own default. The demo carries it
+    /// so a flow does not have to wait out the real one.
+    pub send_lock_timeout: Option<Duration>,
 }
 
 impl DemoTiming {
-    fn for_scenario(scenario: DemoScenario) -> Self {
+    /// What `DemoBackend::new` uses for `scenario`.
+    pub fn for_scenario(scenario: DemoScenario) -> Self {
+        let stuck = scenario == DemoScenario::SendStuck;
         DemoTiming {
             step: OPERATION_STEP,
             preview_ttl: match scenario {
                 DemoScenario::PreviewExpiry => Duration::from_secs(1),
                 _ => PREVIEW_TTL,
             },
+            broadcast_hold: if stuck {
+                STUCK_BROADCAST_HOLD
+            } else {
+                Duration::ZERO
+            },
+            send_lock_timeout: stuck.then_some(STUCK_SEND_LOCK_TIMEOUT),
         }
     }
 }
@@ -101,6 +120,7 @@ impl FromStr for DemoScenario {
             "first-run" => Ok(Self::FirstRun),
             "offline" => Ok(Self::Offline),
             "exit-deferred" => Ok(Self::ExitDeferred),
+            "send-stuck" => Ok(Self::SendStuck),
             "long-names" => Ok(Self::LongNames),
             "device-disconnected" => Ok(Self::DeviceDisconnected),
             "preview-expiry" => Ok(Self::PreviewExpiry),
@@ -217,6 +237,7 @@ struct Run {
     state: Arc<Mutex<State>>,
     senders: Senders,
     step: Duration,
+    broadcast_hold: Duration,
     rejects: bool,
     id: OperationId,
     preview_id: String,
@@ -247,6 +268,7 @@ impl Run {
             self.emit(state.clone());
             tokio::time::sleep(self.step).await;
             if *state == OperationState::Broadcasting {
+                tokio::time::sleep(self.broadcast_hold).await;
                 break;
             }
             if self.cancel_requested().await {
@@ -690,6 +712,7 @@ impl DemoBackend {
             state: Arc::clone(&self.state),
             senders: Arc::clone(&self.senders),
             step: self.timing.step,
+            broadcast_hold: self.timing.broadcast_hold,
             rejects: self.rejects,
             id: id.clone(),
             preview_id,
@@ -1035,6 +1058,14 @@ impl Backend for DemoBackend {
         ) {
             return Err(FedimixError::UnknownItem(item_id));
         }
+        // No exit within the grace period, even by hand (spec section 1).
+        if item.status
+            == (QueueItemStatus::Deferred {
+                reason: DeferReason::GracePeriod,
+            })
+        {
+            return Err(FedimixError::GracePeriod);
+        }
         if st.device.is_none() {
             return Err(FedimixError::NotSetUp("Set up Saving first".to_string()));
         }
@@ -1179,7 +1210,7 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 10] = [
+    const ALL: [DemoScenario; 11] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
@@ -1190,6 +1221,7 @@ mod tests {
         DemoScenario::DeviceDisconnected,
         DemoScenario::PreviewExpiry,
         DemoScenario::DeviceRejects,
+        DemoScenario::SendStuck,
     ];
 
     fn btc(v: f64) -> Amount {
@@ -1257,6 +1289,8 @@ mod tests {
     const FAST: DemoTiming = DemoTiming {
         step: Duration::from_millis(1),
         preview_ttl: Duration::from_secs(600),
+        broadcast_hold: Duration::ZERO,
+        send_lock_timeout: None,
     };
 
     fn fast(scenario: DemoScenario) -> Arc<DemoBackend> {

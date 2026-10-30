@@ -29,7 +29,51 @@ struct PayloadView {
     content: gtk::Box,
 }
 
+/// Weak handles to a `PayloadView`'s widgets, for closures the view's own
+/// widgets hold (a strong clone there is a reference cycle).
+struct WeakPayloadView {
+    root: glib::WeakRef<gtk::Box>,
+    picture: glib::WeakRef<gtk::Picture>,
+    text: glib::WeakRef<gtk::Label>,
+    copy: glib::WeakRef<gtk::Button>,
+    expiry: glib::WeakRef<gtk::Label>,
+    status: glib::WeakRef<gtk::Label>,
+    spinner: glib::WeakRef<gtk::Spinner>,
+    retry: glib::WeakRef<gtk::Button>,
+    content: glib::WeakRef<gtk::Box>,
+}
+
+impl WeakPayloadView {
+    fn upgrade(&self) -> Option<PayloadView> {
+        Some(PayloadView {
+            root: self.root.upgrade()?,
+            picture: self.picture.upgrade()?,
+            text: self.text.upgrade()?,
+            copy: self.copy.upgrade()?,
+            expiry: self.expiry.upgrade()?,
+            status: self.status.upgrade()?,
+            spinner: self.spinner.upgrade()?,
+            retry: self.retry.upgrade()?,
+            content: self.content.upgrade()?,
+        })
+    }
+}
+
 impl PayloadView {
+    fn downgrade(&self) -> WeakPayloadView {
+        WeakPayloadView {
+            root: self.root.downgrade(),
+            picture: self.picture.downgrade(),
+            text: self.text.downgrade(),
+            copy: self.copy.downgrade(),
+            expiry: self.expiry.downgrade(),
+            status: self.status.downgrade(),
+            spinner: self.spinner.downgrade(),
+            retry: self.retry.downgrade(),
+            content: self.content.downgrade(),
+        }
+    }
+
     fn new(toasts: &adw::ToastOverlay) -> Self {
         let picture = gtk::Picture::builder()
             .halign(gtk::Align::Center)
@@ -199,12 +243,16 @@ fn load_address(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
 
 /// Retry reloads the address after a failure.
 fn connect_retry(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
+    // The retry button is part of `view`: hold the view weakly.
+    let weak = view.downgrade();
     view.retry.connect_clicked(glib::clone!(
         #[strong]
         ctx,
-        #[strong]
-        view,
-        move |_| load_address(&ctx, wallet, &view)
+        move |_| {
+            if let Some(view) = weak.upgrade() {
+                load_address(&ctx, wallet, &view);
+            }
+        }
     ));
 }
 
@@ -233,24 +281,28 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
 
     // Bumped by each request and edit; a reply for an older one is dropped.
     let generation = Rc::new(Cell::new(0u64));
-    amount.connect_changed(glib::clone!(
+    // An edited amount or description makes the shown invoice stale.
+    let stale = glib::clone!(
         #[weak]
         create,
+        #[weak]
+        amount,
         #[strong]
         view,
         #[strong]
         generation,
-        move |row| {
-            // An edited amount makes the shown invoice stale.
+        move |_: &adw::EntryRow| {
             generation.set(generation.get() + 1);
             view.clear();
             view.set_loading(false);
             create.set_sensitive(matches!(
-                parse_btc(&row.text()),
+                parse_btc(&amount.text()),
                 Ok(a) if a != Amount::ZERO
             ));
         }
-    ));
+    );
+    amount.connect_changed(stale.clone());
+    description.connect_changed(stale);
     create.connect_clicked(glib::clone!(
         #[strong]
         ctx,

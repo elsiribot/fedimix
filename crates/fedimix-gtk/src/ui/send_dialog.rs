@@ -14,6 +14,9 @@ use crate::present;
 use crate::ui::app_state::AppContext;
 use crate::ui::widgets;
 
+/// Shows the signing device's state on the Confirm button.
+type ApplyDevice = dyn Fn(Option<&fedimix_core::DeviceInfo>);
+
 /// Open the Send dialog for `wallet`.
 pub fn open(ctx: &Rc<AppContext>, wallet: WalletKind) {
     let (dialog, _) = build(ctx, wallet, None);
@@ -269,46 +272,77 @@ fn detail_lines(preview: &SendPreview) -> gtk::Box {
 
 /// The running part of a review: what confirming locks, and how it ends.
 ///
-/// Closures hold this strongly only through the operation watcher, which the
-/// context drops at the final state; the dialog cannot close before that, so
-/// the outcome always finds its way here.
+/// The widgets are held weakly: the review page owns this state (see
+/// `SavingTab::new`), so a strong reference back would keep the page, the
+/// dialog and the snapshot subscription alive for good. The operation watcher
+/// outlives the dialog and holds this strongly until the final state, and the
+/// outcome is reported by toast when the dialog is gone.
 struct Progress {
-    dialog: adw::Dialog,
-    nav: adw::NavigationView,
-    page: adw::NavigationPage,
-    form_error: gtk::Label,
-    error: gtk::Label,
-    caption: gtk::Label,
-    spinner: gtk::Spinner,
-    confirm: gtk::Button,
-    cancel: gtk::Button,
+    ctx: Rc<AppContext>,
+    dialog: glib::WeakRef<adw::Dialog>,
+    nav: glib::WeakRef<adw::NavigationView>,
+    page: glib::WeakRef<adw::NavigationPage>,
+    form_error: glib::WeakRef<gtk::Label>,
+    error: glib::WeakRef<gtk::Label>,
+    caption: glib::WeakRef<gtk::Label>,
+    spinner: glib::WeakRef<gtk::Spinner>,
+    confirm: glib::WeakRef<gtk::Button>,
+    cancel: glib::WeakRef<gtk::Button>,
     device: String,
     /// Set while confirming, so a second activation does nothing.
     sending: Rc<Cell<bool>>,
+    /// The dialog has been closed; an outcome can only be a toast.
+    closed: Cell<bool>,
     /// The preview, until it is confirmed.
     preview_id: RefCell<Option<String>>,
     operation: RefCell<Option<OperationId>>,
+    /// Ends the lock if Broadcasting does not end (see `SEND_LOCK_TIMEOUT`).
+    unlock_timer: RefCell<Option<glib::SourceId>>,
+    /// Puts Confirm's label and sensitivity back to what the device says.
+    show_device: Box<dyn Fn()>,
 }
 
 impl Progress {
     /// Back and Escape would drop the outcome, so both are off while sending.
     fn set_busy(&self, busy: bool) {
-        self.dialog.set_can_close(!busy);
-        self.page.set_can_pop(!busy);
+        self.set_closable(!busy);
         self.sending.set(busy);
-        self.spinner.set_visible(busy);
-        self.spinner.set_spinning(busy);
-        self.confirm.set_sensitive(!busy);
+        if let Some(spinner) = self.spinner.upgrade() {
+            spinner.set_visible(busy);
+            spinner.set_spinning(busy);
+        }
+        if let Some(confirm) = self.confirm.upgrade() {
+            confirm.set_sensitive(!busy);
+        }
         if !busy {
-            self.caption.set_visible(false);
-            self.cancel.set_visible(false);
+            if let Some(caption) = self.caption.upgrade() {
+                caption.set_visible(false);
+            }
+            if let Some(cancel) = self.cancel.upgrade() {
+                cancel.set_visible(false);
+            }
+            // After an error the device may have changed meanwhile.
+            (self.show_device)();
+        }
+    }
+
+    fn set_closable(&self, closable: bool) {
+        if let Some(dialog) = self.dialog.upgrade() {
+            dialog.set_can_close(closable);
+        }
+        if let Some(page) = self.page.upgrade() {
+            page.set_can_pop(closable);
         }
     }
 
     fn back_to_form(&self, message: &str) {
         self.set_busy(false);
-        self.nav.pop();
-        set_error(&self.form_error, Some(message));
+        if let Some(nav) = self.nav.upgrade() {
+            nav.pop();
+        }
+        if let Some(label) = self.form_error.upgrade() {
+            set_error(&label, Some(message));
+        }
     }
 
     fn on_confirm_reply(
@@ -320,8 +354,7 @@ impl Progress {
         match res {
             Ok(id) => {
                 *self.operation.borrow_mut() = Some(id.clone());
-                let ctx2 = ctx.clone();
-                ctx.watch_operation(id, move |state| self.on_state(&ctx2, state));
+                ctx.watch_operation(id, move |state| self.on_state(state));
             }
             Err(e @ FedimixError::PreviewExpired) => {
                 self.back_to_form(&present::user_message(&e));
@@ -329,28 +362,62 @@ impl Progress {
             Err(e) => {
                 *self.preview_id.borrow_mut() = Some(preview_id);
                 self.set_busy(false);
-                set_error(&self.error, Some(&present::user_message(&e)));
+                if let Some(label) = self.error.upgrade() {
+                    set_error(&label, Some(&present::user_message(&e)));
+                }
             }
         }
     }
 
-    fn on_state(&self, ctx: &Rc<AppContext>, state: &OperationState) {
-        self.caption
-            .set_label(&present::operation_caption(state, &self.device));
-        self.caption.set_visible(true);
-        self.cancel
-            .set_visible(present::operation_cancellable(state));
+    fn on_state(self: &Rc<Self>, state: &OperationState) {
+        let text = present::operation_caption(state, &self.device);
+        if let Some(caption) = self.caption.upgrade() {
+            caption.set_label(&text);
+            caption.set_visible(true);
+        }
+        if let Some(cancel) = self.cancel.upgrade() {
+            cancel.set_visible(present::operation_cancellable(state));
+        }
+        if *state == OperationState::Broadcasting {
+            self.arm_unlock();
+        }
+        if !state.is_final() {
+            return;
+        }
+        if let Some(id) = self.unlock_timer.borrow_mut().take() {
+            id.remove();
+        }
         match state {
             OperationState::Done => {
                 self.set_busy(false);
-                self.dialog.close();
-                ctx.toast_now("Payment sent");
+                if let Some(dialog) = self.dialog.upgrade() {
+                    dialog.close();
+                }
+                self.ctx.toast_now("Payment sent");
             }
-            OperationState::Failed { .. } | OperationState::Cancelled => {
-                self.back_to_form(&present::operation_caption(state, &self.device));
-            }
-            _ => {}
+            _ if self.closed.get() => self.ctx.toast_now(&text),
+            _ => self.back_to_form(&text),
         }
+    }
+
+    /// An operation that never ends must not lock the app: after
+    /// `SEND_LOCK_TIMEOUT` in Broadcasting the dialog may be closed. It stays
+    /// open until the user does, and the watcher reports the outcome either
+    /// way.
+    fn arm_unlock(self: &Rc<Self>) {
+        if self.unlock_timer.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(self.ctx.send_lock_timeout(), move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.unlock_timer.borrow_mut().take();
+            this.set_closable(true);
+            if let Some(caption) = this.caption.upgrade() {
+                caption.set_label(present::SEND_UNLOCKED_CAPTION);
+            }
+        });
+        *self.unlock_timer.borrow_mut() = Some(id);
     }
 
     /// Tell the core a preview the user walked away from is not needed.
@@ -420,7 +487,7 @@ fn review_page(
     state.add_css_class("dim-label");
 
     let sending = Rc::new(Cell::new(false));
-    let apply_device = {
+    let apply_device: Rc<ApplyDevice> = Rc::new({
         let label = label.downgrade();
         let confirm = confirm.downgrade();
         let sending = sending.clone();
@@ -435,11 +502,12 @@ fn review_page(
             label.set_label(&text);
             confirm.set_sensitive(enabled);
         }
-    };
+    });
     let device = ctx.latest().and_then(|s| s.saving.device);
     apply_device(device.as_ref());
     ctx.on_snapshots({
         let alive = confirm.downgrade();
+        let apply_device = apply_device.clone();
         move |s| {
             if alive.upgrade().is_none() {
                 return false;
@@ -456,19 +524,26 @@ fn review_page(
     let review = page("Review", &body);
 
     let progress = Rc::new(Progress {
-        dialog: dialog.clone(),
-        nav: nav.clone(),
-        page: review.clone(),
-        form_error: form_error.clone(),
-        error: error.clone(),
-        caption: state,
-        spinner,
-        confirm: confirm.clone(),
-        cancel: cancel.clone(),
+        ctx: ctx.clone(),
+        dialog: dialog.downgrade(),
+        nav: nav.downgrade(),
+        page: review.downgrade(),
+        form_error: form_error.downgrade(),
+        error: error.downgrade(),
+        caption: state.downgrade(),
+        spinner: spinner.downgrade(),
+        confirm: confirm.downgrade(),
+        cancel: cancel.downgrade(),
         device: device.map_or("your device".to_string(), |d| d.name),
         sending,
+        closed: Cell::new(false),
         preview_id: RefCell::new(Some(preview.id.clone())),
         operation: RefCell::new(None),
+        unlock_timer: RefCell::new(None),
+        show_device: Box::new({
+            let ctx = ctx.clone();
+            move || apply_device(ctx.latest().and_then(|s| s.saving.device).as_ref())
+        }),
     });
     let weak = Rc::downgrade(&progress);
 
@@ -483,7 +558,9 @@ fn review_page(
                 return;
             };
             progress.set_busy(true);
-            set_error(&progress.error, None);
+            if let Some(label) = progress.error.upgrade() {
+                set_error(&label, None);
+            }
             let core = ctx.bridge.core();
             let ctx2 = ctx.clone();
             let id2 = id.clone();
@@ -521,6 +598,7 @@ fn review_page(
         let ctx = ctx.clone();
         move |_| {
             if let Some(progress) = weak.upgrade() {
+                progress.closed.set(true);
                 progress.discard(&ctx);
             }
         }

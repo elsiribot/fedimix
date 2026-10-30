@@ -1,0 +1,9 @@
+# scenario: exit-deferred
+# An exit waits out the online grace period: Exit now is off for that item, and
+# stays available for an item that only waits for lower fees.
+click Spending
+click 0.1 moving to Saving ›
+expect waiting after reconnect
+expect-disabled waiting after reconnect
+expect-enabled waiting for lower fees
+shot grace

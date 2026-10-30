@@ -1,0 +1,18 @@
+# scenario: send-stuck
+# A send that sits in Broadcasting: the dialog is locked at first, then may be
+# closed (2 s here, 30 s normally), and the outcome still arrives as a toast.
+click Spending
+click Send
+type "Lightning invoice or on-chain address" lnbc1200u1demo
+click Review
+expect Network fee
+click Send
+expect Broadcasting
+expect-locked
+shot locked
+expect You can close this; the result will appear when it arrives
+shot unlocked
+close-dialog
+expect-not Network fee
+expect Payment sent
+shot toast

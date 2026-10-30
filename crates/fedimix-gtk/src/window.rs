@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::gio;
@@ -59,7 +60,12 @@ fn load_css() {
 }
 
 impl FedimixWindow {
-    pub fn new(app: &adw::Application, bridge: CoreBridge, start_page: Option<StartPage>) -> Self {
+    pub fn new(
+        app: &adw::Application,
+        bridge: CoreBridge,
+        start_page: Option<StartPage>,
+        send_lock_timeout: Duration,
+    ) -> Self {
         load_css();
 
         let stack = adw::ViewStack::new();
@@ -131,7 +137,13 @@ impl FedimixWindow {
         window.add_breakpoint(breakpoint);
 
         let tabs = stack.clone();
-        let ctx = Rc::new(AppContext::new(bridge, toasts, nav, stack));
+        let ctx = Rc::new(AppContext::new(
+            bridge,
+            toasts,
+            nav,
+            stack,
+            send_lock_timeout,
+        ));
         let saving_tab = SavingTab::new(ctx.clone());
         saving_tab.widget().set_vexpand(true);
         saving_slot.append(saving_tab.widget());
@@ -148,6 +160,37 @@ impl FedimixWindow {
             .height_request(32)
             .build();
         content.add_named(&spinner, Some("loading"));
+        // A first snapshot that cannot be had: say so, and offer to retry.
+        let retry = gtk::Button::with_label("Retry");
+        retry.add_css_class("pill");
+        retry.add_css_class("suggested-action");
+        retry.set_halign(gtk::Align::Center);
+        let failed = adw::StatusPage::builder()
+            .icon_name("dialog-error-symbolic")
+            .title("Could not load your wallet")
+            .child(&retry)
+            .build();
+        content.add_named(&failed, Some("error"));
+        retry.connect_clicked({
+            let ctx = ctx.clone();
+            let content = content.downgrade();
+            move |_| {
+                if let Some(content) = content.upgrade() {
+                    content.set_visible_child_name("loading");
+                }
+                ctx.refresh();
+            }
+        });
+        ctx.on_first_load_failed({
+            let content = content.downgrade();
+            let failed = failed.downgrade();
+            move |message| {
+                if let (Some(content), Some(failed)) = (content.upgrade(), failed.upgrade()) {
+                    failed.set_description(Some(message));
+                    content.set_visible_child_name("error");
+                }
+            }
+        });
         // Until the first snapshot says which of them to show.
         content.set_visible_child_name("loading");
         header.set_title_widget(None::<&gtk::Widget>);

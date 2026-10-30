@@ -238,14 +238,19 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
             let weak = weak.clone();
             move |_| with(&weak, |inner| inner.validate())
         });
-        row.connect_apply({
-            let weak = weak.clone();
-            move |_| with(&weak, Inner::apply_network)
-        });
     }
+    // Each Apply writes its own row; the other network value stays as it is.
+    inner.url.connect_apply({
+        let weak = weak.clone();
+        move |_| with(&weak, Inner::apply_server)
+    });
+    inner.proxy.connect_apply({
+        let weak = weak.clone();
+        move |_| with(&weak, Inner::apply_proxy)
+    });
     inner.backend.connect_selected_notify({
         let weak = weak.clone();
-        move |_| with(&weak, Inner::apply_network)
+        move |_| with(&weak, Inner::apply_server)
     });
     inner.banner.connect_button_clicked({
         let weak = weak.clone();
@@ -369,9 +374,28 @@ impl Inner {
         }
     }
 
-    fn apply_network(self: &Rc<Self>) {
+    /// Server type and URL, which only make sense together. The proxy is
+    /// left at the value in force, whatever its field holds.
+    fn apply_server(self: &Rc<Self>) {
+        let proxy = self.network.borrow().proxy.clone();
+        let settings = self.build(
+            self.backend.selected() == 1,
+            &self.url.text(),
+            proxy.as_deref().unwrap_or(""),
+        );
+        self.apply_network(settings);
+    }
+
+    /// The proxy alone; the server stays at the value in force.
+    fn apply_proxy(self: &Rc<Self>) {
+        let network = self.network.borrow().clone();
+        let settings = self.build(network.is_electrum(), network.url(), &self.proxy.text());
+        self.apply_network(settings);
+    }
+
+    fn apply_network(self: &Rc<Self>, settings: Result<Settings, String>) {
         self.validate();
-        if let Ok(settings) = self.field_settings() {
+        if let Ok(settings) = settings {
             *self.network.borrow_mut() = Network::of(&settings);
             self.write(settings);
         }

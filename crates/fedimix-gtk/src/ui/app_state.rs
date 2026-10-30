@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
+use std::time::Duration;
 
 use fedimix_core::{OperationId, OperationState, QueueState, SavingState, SpendingState};
 
@@ -20,6 +21,7 @@ pub struct Snapshots {
 
 type Subscriber = Rc<dyn Fn(&Snapshots) -> bool>;
 type OperationWatcher = Rc<dyn Fn(&OperationState)>;
+type LoadFailed = Rc<dyn Fn(&str)>;
 
 struct Shared {
     operations: RefCell<OperationTable<OperationWatcher>>,
@@ -28,6 +30,8 @@ struct Shared {
     refresh: RefCell<RefreshGate>,
     /// A Refill dialog is open or being prepared.
     refill_open: Cell<bool>,
+    /// Told when a fetch fails while no snapshot has ever arrived.
+    load_failed: RefCell<Option<LoadFailed>>,
 }
 
 #[derive(Clone)]
@@ -36,6 +40,7 @@ pub struct AppContext {
     pub toasts: adw::ToastOverlay,
     pub nav: adw::NavigationView,
     pub stack: adw::ViewStack,
+    send_lock_timeout: Duration,
     shared: Rc<Shared>,
 }
 
@@ -45,20 +50,34 @@ impl AppContext {
         toasts: adw::ToastOverlay,
         nav: adw::NavigationView,
         stack: adw::ViewStack,
+        send_lock_timeout: Duration,
     ) -> Self {
         Self {
             bridge,
             toasts,
             nav,
             stack,
+            send_lock_timeout,
             shared: Rc::new(Shared {
                 operations: RefCell::new(OperationTable::new()),
                 latest: RefCell::default(),
                 subscribers: RefCell::default(),
                 refresh: RefCell::default(),
                 refill_open: Cell::new(false),
+                load_failed: RefCell::default(),
             }),
         }
+    }
+
+    /// Register what to do when the first snapshot cannot be loaded: there
+    /// is nothing to show yet, so a toast would leave the window empty.
+    pub fn on_first_load_failed(&self, f: impl Fn(&str) + 'static) {
+        *self.shared.load_failed.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// How long a Send may sit in Broadcasting before its dialog can close.
+    pub fn send_lock_timeout(&self) -> Duration {
+        self.send_lock_timeout
     }
 
     pub fn toast(&self, message: &str) {
@@ -152,10 +171,14 @@ impl AppContext {
                 match res {
                     Ok(snapshots) if finished.apply => ctx.apply(snapshots),
                     Ok(_) => {}
-                    Err(e) => ctx.toast(&format!(
-                        "Could not load wallet state. {}",
-                        user_message(&e)
-                    )),
+                    Err(e) => {
+                        let message = format!("Could not load wallet state. {}", user_message(&e));
+                        let handler = ctx.shared.load_failed.borrow().clone();
+                        match handler {
+                            Some(f) if ctx.latest().is_none() => f(&message),
+                            _ => ctx.toast(&message),
+                        }
+                    }
                 }
                 if let Some(next) = finished.restart {
                     ctx.fetch(next);

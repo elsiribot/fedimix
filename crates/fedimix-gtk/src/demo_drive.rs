@@ -23,6 +23,8 @@
 //! - `activate`: activate the application again, as a second launch does.
 //! - `expect-windows <n>`: the application has `<n>` windows.
 //! - `close-dialog`: close the open dialog, as Escape does.
+//! - `expect-disabled <text>` / `expect-enabled <text>`: the list row showing
+//!   `<text>` has a menu button or button, and none (or all) of them can be used.
 //! - `action <name>`: activate an application action such as `app.settings`
 //!   (menu popovers are not in the widget tree until opened).
 //!
@@ -50,6 +52,7 @@ pub enum Step {
     ExpectAbsent(String),
     ExpectLocked,
     ExpectPinned,
+    ExpectRowControls { text: String, enabled: bool },
     Apply(String),
     CloseDialog,
     Activate,
@@ -87,6 +90,14 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "expect" => Step::Expect(need("text")?),
         "expect-not" => Step::ExpectNot(need("text")?),
         "expect-absent" => Step::ExpectAbsent(need("text")?),
+        "expect-disabled" => Step::ExpectRowControls {
+            text: need("row text")?,
+            enabled: false,
+        },
+        "expect-enabled" => Step::ExpectRowControls {
+            text: need("row text")?,
+            enabled: true,
+        },
         "expect-locked" => Step::ExpectLocked,
         "expect-pinned" => Step::ExpectPinned,
         "apply" => Step::Apply(need("a title")?),
@@ -134,6 +145,10 @@ impl fmt::Display for Step {
             Step::ExpectAbsent(t) => write!(f, "expect-absent {t}"),
             Step::ExpectLocked => write!(f, "expect-locked"),
             Step::ExpectPinned => write!(f, "expect-pinned"),
+            Step::ExpectRowControls { text, enabled } => {
+                let cmd = if *enabled { "enabled" } else { "disabled" };
+                write!(f, "expect-{cmd} {text}")
+            }
             Step::Apply(t) => write!(f, "apply {t}"),
             Step::CloseDialog => write!(f, "close-dialog"),
             Step::Activate => write!(f, "activate"),
@@ -213,6 +228,14 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             poll(|| pinned(env).then_some(()))
                 .await
                 .ok_or("the page can still be popped")?;
+        }
+        Step::ExpectRowControls { text, enabled } => {
+            poll(|| (row_controls(env, text) == Some(*enabled)).then_some(()))
+                .await
+                .ok_or_else(|| {
+                    let want = if *enabled { "usable" } else { "unusable" };
+                    format!("no row with '{text}' whose controls are all {want}")
+                })?;
         }
         Step::Apply(title) => {
             poll(|| apply_entry(env, title).then_some(()))
@@ -349,6 +372,38 @@ fn pinned(env: &Env) -> bool {
         .filter(|nav| nav.is_mapped() && nav.navigation_stack().n_items() > 1)
         .filter_map(|nav| nav.visible_page())
         .any(|page| !page.can_pop())
+}
+
+/// Whether the controls of the mapped list row showing `text` can be used:
+/// `Some(true)` if all can, `Some(false)` if none can, `None` if the row is
+/// missing, has no controls, or is mixed.
+fn row_controls(env: &Env, text: &str) -> Option<bool> {
+    for root in roots(env) {
+        for w in descendants(&root) {
+            if !w.is_mapped() || w.downcast_ref::<gtk::ListBoxRow>().is_none() {
+                continue;
+            }
+            if !label_texts(&w).iter().any(|t| t.contains(text)) {
+                continue;
+            }
+            let controls: Vec<bool> = descendants(&w)
+                .iter()
+                .filter(|d| d.is::<gtk::MenuButton>() || d.is::<gtk::Button>())
+                .map(|d| d.is_sensitive())
+                .collect();
+            if controls.is_empty() {
+                continue;
+            }
+            if controls.iter().all(|c| *c) {
+                return Some(true);
+            }
+            if controls.iter().all(|c| !*c) {
+                return Some(false);
+            }
+            return None;
+        }
+    }
+    None
 }
 
 fn apply_entry(env: &Env, title: &str) -> bool {
@@ -524,6 +579,8 @@ expect-not Cover traffic
 expect-absent bc1q
 expect-locked
 expect-pinned
+expect-disabled waiting after reconnect
+expect-enabled waiting for lower fees
 apply Server URL
 close-dialog
 activate
@@ -549,6 +606,14 @@ action app.settings
                 Step::ExpectAbsent("bc1q".into()),
                 Step::ExpectLocked,
                 Step::ExpectPinned,
+                Step::ExpectRowControls {
+                    text: "waiting after reconnect".into(),
+                    enabled: false
+                },
+                Step::ExpectRowControls {
+                    text: "waiting for lower fees".into(),
+                    enabled: true
+                },
                 Step::Apply("Server URL".into()),
                 Step::CloseDialog,
                 Step::Activate,

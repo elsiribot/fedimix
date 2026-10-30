@@ -9,7 +9,7 @@ mod ui;
 mod window;
 
 use adw::prelude::*;
-use fedimix_core::DemoBackend;
+use fedimix_core::{DemoBackend, DemoTiming};
 
 const APP_ID: &str = "io.sirion.Fedimix";
 
@@ -41,7 +41,11 @@ fn main() -> gtk::glib::ExitCode {
     };
 
     let app = adw::Application::builder().application_id(APP_ID).build();
-    let bridge = bridge::CoreBridge::start(DemoBackend::new(args.scenario));
+    let timing = DemoTiming::for_scenario(args.scenario);
+    let send_lock_timeout = timing
+        .send_lock_timeout
+        .unwrap_or(present::SEND_LOCK_TIMEOUT);
+    let bridge = bridge::CoreBridge::start(DemoBackend::with_timing(args.scenario, timing));
     // One window for the app's lifetime: a second activation re-presents it.
     let window = std::cell::OnceCell::<window::FedimixWindow>::new();
     app.connect_activate(move |app| {
@@ -49,7 +53,7 @@ fn main() -> gtk::glib::ExitCode {
             window.present();
             return;
         }
-        let new = window::FedimixWindow::new(app, bridge.clone(), args.page);
+        let new = window::FedimixWindow::new(app, bridge.clone(), args.page, send_lock_timeout);
         new.present();
         if let Some(steps) = drive.clone() {
             demo_drive::start(new.drive_env(app), steps);
