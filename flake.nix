@@ -73,6 +73,20 @@
             preCheck = ''
               export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath buildInputs}
             '';
+            # Rust links without a runpath, so the binary would only start
+            # inside the dev shell.
+            postInstall = ''
+              patchelf --add-rpath ${pkgs.lib.makeLibraryPath buildInputs} $out/bin/fedimix
+            '';
+            # Exits 2 before touching a display; 127 means libraries are missing.
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              status=0
+              $out/bin/fedimix || status=$?
+              [ "$status" -eq 2 ]
+              runHook postInstallCheck
+            '';
             meta.mainProgram = "fedimix";
           }
         );

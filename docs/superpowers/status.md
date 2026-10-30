@@ -4,7 +4,7 @@ Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. The wh
 
 ## What works (commands run in `nix develop`)
 - `just clippy`, `just test` (45 core unit, 4 demo-flow, 16 operation, 67 gtk unit tests).
-- `nix build`, or `just build-nix` for that plus `nix flake check` (clippy, fmt, tests on the same source).
+- `nix build` (fails if the binary cannot load its libraries; `result/bin/fedimix --demo` was started once under headless sway with a clean environment), or `just build-nix` for that plus `nix flake check` (clippy, fmt, tests on the same source).
 - `just demo` / `just run`; `--demo-scenario funded|below-target|no-saving|first-run|offline|exit-deferred|long-names|device-disconnected|preview-expiry|device-rejects`, `--demo-page ...`.
 - Core API is the Phase 2 shape: operations with state events and cancel, expiring previews, exit quotes, `parse_destination`, device identity, queue deferrals.
 
