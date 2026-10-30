@@ -1,6 +1,6 @@
 # Status
 
-Phase 1, Tasks 1-4 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic).
+Phase 1, Tasks 1-5 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic; app shell with CLI, CoreBridge, AppContext and window).
 
 ## What works
 - `nix develop -c just build|test|clippy|fmt` on the `fedimix-core` + `fedimix-gtk` workspace.
@@ -12,8 +12,10 @@ Phase 1, Tasks 1-4 done (workspace split/dev shell/screenshot harness; core API 
 
 - `fedimix-gtk` has pure `format` (btc/date/parse) and `present` (captions, tags, history/queue rows, send validation) modules, 23 unit tests; crate-level `allow(dead_code)` until Task 12.
 
+- `nix develop -c just demo` (or `scripts/screenshot.sh out.png [--width 400] -- --demo [--demo-scenario <name>]`) shows the shell: Wide header switcher, bottom switcher bar below 500sp, placeholder tabs; `--demo-page` is parsed only. Without `--demo` the app exits 2.
+
 ## Next
-Task 5.
+Task 6.
 
 ## Needs user
 Nothing.

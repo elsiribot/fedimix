@@ -13,3 +13,5 @@ path = "src/main.rs"
 adw.workspace = true
 gtk.workspace = true
 fedimix-core = { path = "../fedimix-core" }
+async-channel.workspace = true
+tokio = { workspace = true, features = ["time"] }

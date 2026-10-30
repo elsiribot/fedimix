@@ -125,9 +125,11 @@ dependencies = [
 name = "fedimix-gtk"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "fedimix-core",
  "gtk4",
  "libadwaita",
+ "tokio",
 ]
 
 [[package]]
