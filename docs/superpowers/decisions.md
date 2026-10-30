@@ -11,3 +11,4 @@
 - `SendConfirmed` is emitted via `tokio::spawn` + sleep only when a tokio runtime is current; without one it is skipped rather than panicking.
 - tokio is now a regular dependency of core (features sync, time) for the demo backend's Mutex and sleep; the Backend trait stays runtime-agnostic.
 - Demo refill checks the signing device before the target gap, so NoSaving reports NotSetUp rather than "at target"; `exit_now` also requires a device.
+- Task 4: `queue_row` takes the anonymity target as a parameter for the meter; caption fraction is for_spending/target below target, else for_spending/(for_spending+moving); `format::date` computes the local UTC offset via glib and delegates to a pure `date_with_offset` so tests are timezone independent.

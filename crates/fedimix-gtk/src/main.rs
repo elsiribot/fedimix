@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+mod format;
+mod present;
 mod window;
 
 use adw::prelude::*;
