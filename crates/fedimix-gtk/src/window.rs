@@ -14,7 +14,7 @@ use crate::ui::{
     about, coin_detail, coins_page, moving_page, notes_page, receive_dialog, refill_dialog,
     send_dialog, settings_page, setup_saving,
 };
-use fedimix_core::{Amount, SendRequest, WalletKind};
+use fedimix_core::{Amount, SendAmount, SendRequest, WalletKind};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -212,7 +212,8 @@ impl FedimixWindow {
                 SendRequest {
                     wallet: WalletKind::Saving,
                     destination: "bc1qdemo0fedimix0review0address0for0screenshots0only".into(),
-                    amount: Some(Amount::from_sat(25_000_000)),
+                    amount: SendAmount::Exact(Amount::from_sat(25_000_000)),
+                    fee_rate_sat_vb: None,
                 },
             ),
             _ => {}

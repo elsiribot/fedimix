@@ -1,5 +1,11 @@
 //! Plain owned data types exchanged between the UI and the core.
 
+use std::fmt;
+
+/// Amounts from this many sats up display in BTC, smaller ones in sat.
+const DISPLAY_BTC_FROM_SAT: u64 = 100_000;
+const SATS_PER_BTC: u64 = 100_000_000;
+
 /// Amount in millisatoshis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Amount {
@@ -9,13 +15,22 @@ pub struct Amount {
 impl Amount {
     pub const ZERO: Amount = Amount { msat: 0 };
 
+    /// Saturates at `u64::MAX` msat. Valid amounts (at most the 21M BTC
+    /// supply, 2.1e18 msat) never reach it, but user input must not panic.
     pub fn from_sat(sat: u64) -> Self {
-        Amount { msat: sat * 1000 }
+        Amount {
+            msat: sat.saturating_mul(1000),
+        }
     }
 
     /// Whole sats, rounding down.
     pub fn as_sat(self) -> u64 {
         self.msat / 1000
+    }
+
+    /// Whole sats, rounding up; for fees, which must never read as zero.
+    pub fn as_sat_ceil(self) -> u64 {
+        self.msat.div_ceil(1000)
     }
 
     pub fn checked_add(self, rhs: Amount) -> Option<Amount> {
@@ -29,6 +44,22 @@ impl Amount {
     pub fn saturating_sub(self, rhs: Amount) -> Amount {
         Amount {
             msat: self.msat.saturating_sub(rhs.msat),
+        }
+    }
+}
+
+/// Human text: `0.0123 BTC` from 0.001 BTC up, otherwise `420 sat`.
+impl fmt::Display for Amount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sat = self.as_sat();
+        if sat < DISPLAY_BTC_FROM_SAT {
+            return write!(f, "{} sat", self.as_sat_ceil());
+        }
+        let whole = sat / SATS_PER_BTC;
+        let frac = format!("{:08}", sat % SATS_PER_BTC);
+        match frac.trim_end_matches('0') {
+            "" => write!(f, "{whole} BTC"),
+            frac => write!(f, "{whole}.{frac} BTC"),
         }
     }
 }
@@ -167,8 +198,21 @@ pub struct QueueState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SendRequest {
     pub wallet: WalletKind,
+    /// As entered; the core parses it with [`crate::parse_destination`].
     pub destination: String,
-    pub amount: Option<Amount>,
+    pub amount: SendAmount,
+    /// On-chain fee rate for Saving sends; `None` is the backend's estimate.
+    /// Spending ignores it: the federation sets its fee.
+    pub fee_rate_sat_vb: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendAmount {
+    Exact(Amount),
+    /// Everything spendable, minus the fee.
+    Max,
+    /// The amount the destination carries (invoice or BIP21 URI).
+    FromInvoice,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -280,6 +324,31 @@ mod tests {
     fn amount_max_supply_fits() {
         let a = Amount::from_sat(2_100_000_000_000_000);
         assert_eq!(a.as_sat(), 2_100_000_000_000_000);
+    }
+
+    #[test]
+    fn from_sat_saturates() {
+        assert_eq!(Amount::from_sat(u64::MAX).msat, u64::MAX);
+    }
+
+    #[test]
+    fn as_sat_ceil_rounds_up() {
+        assert_eq!(Amount { msat: 1 }.as_sat_ceil(), 1);
+        assert_eq!(Amount { msat: 1000 }.as_sat_ceil(), 1);
+        assert_eq!(Amount { msat: 1001 }.as_sat_ceil(), 2);
+        assert_eq!(Amount::ZERO.as_sat_ceil(), 0);
+    }
+
+    #[test]
+    fn display_is_btc_or_sat() {
+        assert_eq!(Amount::from_sat(420).to_string(), "420 sat");
+        assert_eq!(Amount { msat: 1 }.to_string(), "1 sat");
+        assert_eq!(Amount::ZERO.to_string(), "0 sat");
+        assert_eq!(Amount::from_sat(99_999).to_string(), "99999 sat");
+        assert_eq!(Amount::from_sat(100_000).to_string(), "0.001 BTC");
+        assert_eq!(Amount::from_sat(1_230_000).to_string(), "0.0123 BTC");
+        assert_eq!(Amount::from_sat(47_000_420).to_string(), "0.4700042 BTC");
+        assert_eq!(Amount::from_sat(100_000_000).to_string(), "1 BTC");
     }
 
     #[test]

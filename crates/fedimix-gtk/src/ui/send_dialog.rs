@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use fedimix_core::{SendPreview, SendRequest, WalletKind};
+use fedimix_core::{SendAmount, SendPreview, SendRequest, WalletKind};
 use gtk::glib;
 
 use crate::format;
@@ -94,6 +94,15 @@ fn build(
     let dest = adw::EntryRow::builder().title(hint).build();
     let amount = adw::EntryRow::builder().title("Amount (BTC)").build();
     amount.set_input_purpose(gtk::InputPurpose::Number);
+    let max = gtk::Button::with_label("Max");
+    max.set_valign(gtk::Align::Center);
+    max.add_css_class("flat");
+    max.connect_clicked(glib::clone!(
+        #[weak]
+        amount,
+        move |_| amount.set_text("max")
+    ));
+    amount.add_suffix(&max);
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .build();
@@ -141,14 +150,10 @@ fn build(
                 return;
             };
             let d = dest.text();
-            let requires = present::send_requires_amount(wallet, &d);
-            amount.set_visible(requires);
+            amount.set_visible(!present::destination_has_amount(&d));
             let a = amount.text();
-            set_error(
-                &error,
-                present::send_form_error(&d, &a, requires).as_deref(),
-            );
-            review.set_sensitive(present::send_validation(&d, &a, requires).is_ok());
+            set_error(&error, present::send_form_error(wallet, &d, &a).as_deref());
+            review.set_sensitive(present::send_amount(wallet, &d, &a).is_ok());
         }
     });
     for row in [&dest, &amount] {
@@ -171,16 +176,12 @@ fn build(
         dialog,
         move |button| {
             let d = dest.text().trim().to_string();
-            let amt = if present::send_requires_amount(wallet, &d) {
-                match format::parse_btc(&amount.text()) {
-                    Ok(a) => Some(a),
-                    Err(e) => {
-                        set_error(&error, Some(&e));
-                        return;
-                    }
+            let amt = match present::send_amount(wallet, &d, &amount.text()) {
+                Ok(a) => a,
+                Err(e) => {
+                    set_error(&error, Some(&e));
+                    return;
                 }
-            } else {
-                None
             };
             set_error(&error, None);
             button.set_sensitive(false);
@@ -188,6 +189,7 @@ fn build(
                 wallet,
                 destination: d,
                 amount: amt,
+                fee_rate_sat_vb: None,
             };
             let core = ctx.bridge.core();
             ctx.bridge.call(
@@ -219,7 +221,7 @@ fn build(
 
     if let Some(request) = prefill {
         dest.set_text(&request.destination);
-        if let Some(a) = request.amount {
+        if let SendAmount::Exact(a) = request.amount {
             amount.set_text(&format::btc_short(a));
         }
     }

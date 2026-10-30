@@ -3,7 +3,6 @@
 use fedimix_core::api::{Amount, Timestamp};
 
 const SATS_PER_BTC: u64 = 100_000_000;
-const MAX_SUPPLY_SAT: u64 = 21_000_000 * SATS_PER_BTC;
 
 /// Truncated 4-decimal number, or the dust marker.
 fn plain4(a: Amount) -> String {
@@ -44,46 +43,9 @@ pub fn signed(a: Amount, incoming: bool) -> String {
     format!("{sign}{}", plain4(a))
 }
 
+/// Rounds up: fees are the main use, and a fee never reads as "0 sat".
 pub fn sats(a: Amount) -> String {
-    format!("{} sat", a.as_sat())
-}
-
-pub fn parse_btc(s: &str) -> Result<Amount, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("Enter an amount".to_string());
-    }
-    let (whole, frac) = match s.split_once('.') {
-        Some((w, f)) => (w, f),
-        None => (s, ""),
-    };
-    if (whole.is_empty() && frac.is_empty())
-        || !whole.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err("Enter a valid amount".to_string());
-    }
-    if frac.len() > 8 {
-        return Err("At most 8 decimal places".to_string());
-    }
-    let whole_n: u64 = if whole.is_empty() {
-        0
-    } else {
-        whole.parse().map_err(|_| "Amount too large".to_string())?
-    };
-    let frac_n: u64 = if frac.is_empty() {
-        0
-    } else {
-        format!("{frac:0<8}")
-            .parse()
-            .map_err(|_| "Enter a valid amount".to_string())?
-    };
-    let sat = whole_n
-        .checked_mul(SATS_PER_BTC)
-        .and_then(|w| w.checked_add(frac_n))
-        .filter(|&v| v <= MAX_SUPPLY_SAT)
-        .ok_or_else(|| "Amount too large".to_string())?;
-    Ok(Amount::from_sat(sat))
+    format!("{} sat", a.as_sat_ceil())
 }
 
 const MONTHS: [&str; 12] = [
@@ -184,17 +146,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_btc_rejects_bad_input() {
-        for bad in ["", "  ", "abc", "-1", "0.123456789", "21000001", "."] {
-            assert!(parse_btc(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn parse_btc_accepts() {
-        assert_eq!(parse_btc("0.0012"), Ok(sat(120_000)));
-        assert_eq!(parse_btc(" 1 "), Ok(sat(100_000_000)));
-        assert_eq!(parse_btc("21000000"), Ok(sat(2_100_000_000_000_000)));
+    fn sats_round_up() {
+        assert_eq!(sats(Amount { msat: 1 }), "1 sat");
+        assert_eq!(sats(Amount { msat: 1500 }), "2 sat");
     }
 
     #[test]

@@ -10,16 +10,18 @@ use tokio::sync::Mutex;
 
 use crate::api::*;
 use crate::backend::Backend;
+use crate::destination::{DestinationKind, parse_destination};
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream, Notice};
 
 mod fixtures;
-use fixtures::{BASE_TS, btc};
+use fixtures::BASE_TS;
 
 const ONCHAIN_FEE_SAT: u64 = 420;
 const LIGHTNING_FEE_SAT: u64 = 12;
 const SMALL_CHANGE_SAT: u64 = 10_000;
-const FIXED_INVOICE: f64 = 0.0012;
+/// Virtual size of a demo Saving transaction; 420 sat at 3 sat/vB.
+const TX_VBYTES: u64 = 140;
 const NOTIFY_DELAY: Duration = Duration::from_secs(2);
 /// Largest first; used to split a balance into notes.
 const DENOMINATIONS_SAT: [u64; 13] = [
@@ -154,6 +156,10 @@ fn sum(amounts: impl Iterator<Item = Amount>) -> Amount {
     })
 }
 
+fn with_fee(amount: Amount, fee: Amount) -> Amount {
+    sum([amount, fee].into_iter())
+}
+
 pub struct DemoBackend {
     state: Mutex<State>,
     senders: Senders,
@@ -184,10 +190,48 @@ impl DemoBackend {
     }
 }
 
-fn valid_destination(dest: &str) -> bool {
-    ["lnbc", "bc1", "tb1", "bcrt1"]
-        .iter()
-        .any(|p| dest.starts_with(p))
+/// The amount to send, given what the destination carries. `Max` stays
+/// unresolved here: it depends on the wallet's balance and fee.
+fn requested_amount(requested: SendAmount, carried: Option<Amount>) -> Result<SendAmount> {
+    let amount = match (requested, carried) {
+        (SendAmount::FromInvoice, Some(a)) => SendAmount::Exact(a),
+        (SendAmount::FromInvoice, None) => {
+            return Err(FedimixError::InvalidAmount(
+                "This destination has no amount: enter one".to_string(),
+            ));
+        }
+        (SendAmount::Exact(a), Some(b)) if a != b => {
+            return Err(FedimixError::InvalidAmount(
+                "This destination asks for a different amount".to_string(),
+            ));
+        }
+        (SendAmount::Max, Some(_)) => {
+            return Err(FedimixError::InvalidAmount(
+                "This destination has a fixed amount".to_string(),
+            ));
+        }
+        (other, _) => other,
+    };
+    if amount == SendAmount::Exact(Amount::ZERO) {
+        return Err(FedimixError::InvalidAmount(
+            "Amount must be above zero".to_string(),
+        ));
+    }
+    Ok(amount)
+}
+
+/// Resolve `Max` against `available`; `fee` comes off the top.
+fn resolve_amount(amount: SendAmount, available: Amount, fee: Amount) -> Result<Amount> {
+    match amount {
+        SendAmount::Exact(a) => Ok(a),
+        _ => available
+            .checked_sub(fee)
+            .filter(|a| *a != Amount::ZERO)
+            .ok_or(FedimixError::InsufficientFunds {
+                available,
+                needed: fee,
+            }),
+    }
 }
 
 #[async_trait]
@@ -325,40 +369,32 @@ impl Backend for DemoBackend {
             wallet,
             destination,
             amount,
+            fee_rate_sat_vb,
         } = request;
-        if !valid_destination(&destination) {
-            return Err(FedimixError::InvalidDestination(destination));
-        }
-        let lightning = destination.starts_with("lnbc");
-        let amount = match (amount, lightning) {
-            (Some(a), _) => a,
-            (None, true) => btc(FIXED_INVOICE),
-            (None, false) => {
-                return Err(FedimixError::InvalidAmount(
-                    "amount required for on-chain sends".to_string(),
-                ));
-            }
-        };
-        if amount == Amount::ZERO {
-            return Err(FedimixError::InvalidAmount(
-                "amount must be above zero".to_string(),
+        let destination = parse_destination(&destination)?;
+        let lightning = destination.kind == DestinationKind::Lightning;
+        if wallet == WalletKind::Saving && lightning {
+            return Err(FedimixError::InvalidDestination(
+                "Saving can only send to a bitcoin address".to_string(),
             ));
         }
-        let fee = Amount::from_sat(if lightning {
-            LIGHTNING_FEE_SAT
-        } else {
-            ONCHAIN_FEE_SAT
+        let amount = requested_amount(amount, destination.amount)?;
+        let fee = Amount::from_sat(match (wallet, fee_rate_sat_vb) {
+            _ if lightning => LIGHTNING_FEE_SAT,
+            (WalletKind::Saving, Some(rate)) => rate.saturating_mul(TX_VBYTES),
+            _ => ONCHAIN_FEE_SAT,
         });
-        let needed = amount.checked_add(fee).unwrap_or(Amount { msat: u64::MAX });
-
+        let destination = destination.normalized;
         let mut st = self.state.lock().await;
-        let (inputs, change) = match wallet {
+        let (amount, inputs, change) = match wallet {
             WalletKind::Spending => {
                 match &st.federation {
-                    None => return Err(FedimixError::NotSetUp("no federation joined".into())),
+                    None => return Err(FedimixError::NotSetUp("Join a federation first".into())),
                     Some(f) if !f.online => return Err(FedimixError::Offline),
                     Some(_) => {}
                 }
+                let amount = resolve_amount(amount, st.spending_balance, fee)?;
+                let needed = with_fee(amount, fee);
                 if needed > st.spending_balance {
                     return Err(FedimixError::InsufficientFunds {
                         available: st.spending_balance,
@@ -370,17 +406,16 @@ impl Backend for DemoBackend {
                     amount: needed,
                     tag: None,
                 };
-                (vec![input], ChangeDestination::None)
+                (amount, vec![input], ChangeDestination::None)
             }
             WalletKind::Saving => {
-                let balance = st.saving_balance();
-                if needed > balance {
-                    return Err(FedimixError::InsufficientFunds {
-                        available: balance,
-                        needed,
-                    });
-                }
                 let mut candidates: Vec<&Coin> = st.coins.iter().filter(|c| !c.frozen).collect();
+                let available = sum(candidates.iter().map(|c| c.amount));
+                let amount = resolve_amount(amount, available, fee)?;
+                let needed = with_fee(amount, fee);
+                if needed > available {
+                    return Err(FedimixError::InsufficientFunds { available, needed });
+                }
                 candidates.sort_by_key(|c| std::cmp::Reverse(c.amount));
                 let mut inputs = Vec::new();
                 let mut total = Amount::ZERO;
@@ -395,12 +430,6 @@ impl Backend for DemoBackend {
                         tag: Some(c.tag.clone()),
                     });
                 }
-                if total < needed {
-                    return Err(FedimixError::InsufficientFunds {
-                        available: total,
-                        needed,
-                    });
-                }
                 let change = total.saturating_sub(needed);
                 let change = if change == Amount::ZERO {
                     ChangeDestination::None
@@ -409,7 +438,7 @@ impl Backend for DemoBackend {
                 } else {
                     ChangeDestination::Spending { amount: change }
                 };
-                (inputs, change)
+                (amount, inputs, change)
             }
         };
         let preview = SendPreview {
@@ -522,7 +551,7 @@ impl Backend for DemoBackend {
         let device = st
             .device
             .clone()
-            .ok_or_else(|| FedimixError::NotSetUp("no signing device".to_string()))?;
+            .ok_or_else(|| FedimixError::NotSetUp("Set up Saving first".to_string()))?;
         let target = st.settings.spending_target;
         if st.for_spending >= target {
             return Err(FedimixError::InvalidAmount(
@@ -610,7 +639,7 @@ impl Backend for DemoBackend {
                 .position(|i| i.id == item_id)
                 .ok_or_else(|| FedimixError::UnknownItem(item_id.clone()))?;
             if st.device.is_none() {
-                return Err(FedimixError::NotSetUp("no signing device".to_string()));
+                return Err(FedimixError::NotSetUp("Set up Saving first".to_string()));
             }
             let item = st.queue.remove(pos);
             denom = item.denomination;
@@ -841,19 +870,24 @@ mod tests {
         ));
     }
 
-    fn send(wallet: WalletKind, dest: &str, amount: Option<Amount>) -> SendRequest {
+    fn send(wallet: WalletKind, dest: &str, amount: SendAmount) -> SendRequest {
         SendRequest {
             wallet,
             destination: dest.into(),
             amount,
+            fee_rate_sat_vb: None,
         }
+    }
+
+    fn exact(v: f64) -> SendAmount {
+        SendAmount::Exact(btc(v))
     }
 
     #[tokio::test]
     async fn send_rejects_garbage_destination() {
         let b = DemoBackend::new(DemoScenario::Funded);
         let r = b
-            .prepare_send(send(WalletKind::Saving, "garbage", Some(btc(0.1))))
+            .prepare_send(send(WalletKind::Saving, "garbage", exact(0.1)))
             .await;
         assert!(matches!(r, Err(FedimixError::InvalidDestination(_))));
     }
@@ -862,11 +896,15 @@ mod tests {
     async fn send_rejects_zero_amount() {
         let b = DemoBackend::new(DemoScenario::Funded);
         let r = b
-            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(Amount::ZERO)))
+            .prepare_send(send(
+                WalletKind::Saving,
+                "bc1qabc",
+                SendAmount::Exact(Amount::ZERO),
+            ))
             .await;
         assert!(matches!(r, Err(FedimixError::InvalidAmount(_))));
         let r = b
-            .prepare_send(send(WalletKind::Saving, "bc1qabc", None))
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", SendAmount::FromInvoice))
             .await;
         assert!(matches!(r, Err(FedimixError::InvalidAmount(_))));
     }
@@ -875,7 +913,7 @@ mod tests {
     async fn send_rejects_above_balance() {
         let b = DemoBackend::new(DemoScenario::Funded);
         let r = b
-            .prepare_send(send(WalletKind::Spending, "bc1qabc", Some(btc(0.47))))
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", exact(0.47)))
             .await;
         assert!(matches!(r, Err(FedimixError::InsufficientFunds { .. })));
     }
@@ -884,23 +922,114 @@ mod tests {
     async fn send_previews_and_offline() {
         let b = DemoBackend::new(DemoScenario::Funded);
         let p = b
-            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(btc(0.25))))
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(0.25)))
             .await
             .unwrap();
         assert_eq!(p.fee, Amount::from_sat(420));
         assert!(matches!(p.change, ChangeDestination::Spending { .. }));
         let ln = b
-            .prepare_send(send(WalletKind::Spending, "lnbc1x", None))
+            .prepare_send(send(
+                WalletKind::Spending,
+                "lnbc1200u1x",
+                SendAmount::FromInvoice,
+            ))
             .await
             .unwrap();
         assert_eq!(ln.amount, btc(0.0012));
         assert_eq!(ln.fee, Amount::from_sat(12));
         let off = DemoBackend::new(DemoScenario::Offline);
         assert_eq!(
-            off.prepare_send(send(WalletKind::Spending, "lnbc1x", None))
-                .await,
+            off.prepare_send(send(
+                WalletKind::Spending,
+                "lnbc1200u1x",
+                SendAmount::FromInvoice
+            ))
+            .await,
             Err(FedimixError::Offline)
         );
+    }
+
+    #[tokio::test]
+    async fn saving_rejects_lightning() {
+        let b = DemoBackend::new(DemoScenario::Funded);
+        let r = b
+            .prepare_send(send(WalletKind::Saving, "lnbc1x", exact(0.1)))
+            .await;
+        assert!(matches!(r, Err(FedimixError::InvalidDestination(_))));
+    }
+
+    #[tokio::test]
+    async fn destination_is_normalized_in_the_preview() {
+        let b = DemoBackend::new(DemoScenario::Funded);
+        let p = b
+            .prepare_send(send(
+                WalletKind::Spending,
+                "bitcoin:BC1QABC?amount=0.01",
+                SendAmount::FromInvoice,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(p.destination, "bc1qabc");
+        assert_eq!(p.amount, btc(0.01));
+    }
+
+    #[tokio::test]
+    async fn amount_mode_must_fit_the_destination() {
+        let b = DemoBackend::new(DemoScenario::Funded);
+        for (dest, amount) in [
+            ("lnbc1x", SendAmount::FromInvoice),
+            ("lnbc1200u1x", exact(0.5)),
+            ("lnbc1200u1x", SendAmount::Max),
+        ] {
+            let r = b
+                .prepare_send(send(WalletKind::Spending, dest, amount))
+                .await;
+            assert!(matches!(r, Err(FedimixError::InvalidAmount(_))), "{dest}");
+        }
+        // Same amount as the invoice is fine, and an amountless one takes any.
+        for (dest, amount) in [("lnbc1200u1x", exact(0.0012)), ("lnbc1x", exact(0.01))] {
+            assert!(
+                b.prepare_send(send(WalletKind::Spending, dest, amount))
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn max_spends_everything_but_the_fee() {
+        let b = DemoBackend::new(DemoScenario::Funded);
+        let p = b
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", SendAmount::Max))
+            .await
+            .unwrap();
+        assert_eq!(p.amount.checked_add(p.fee), Some(btc(0.47)));
+        let p = b
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", SendAmount::Max))
+            .await
+            .unwrap();
+        assert_eq!(p.amount.checked_add(p.fee), Some(btc(1.2034)));
+        assert_eq!(p.change, ChangeDestination::None);
+        let empty = DemoBackend::new(DemoScenario::NoSaving);
+        assert!(matches!(
+            empty
+                .prepare_send(send(WalletKind::Saving, "bc1qabc", SendAmount::Max))
+                .await,
+            Err(FedimixError::InsufficientFunds { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fee_rate_sets_the_saving_fee_only() {
+        let b = DemoBackend::new(DemoScenario::Funded);
+        let mut r = send(WalletKind::Saving, "bc1qabc", exact(0.1));
+        r.fee_rate_sat_vb = Some(10);
+        assert_eq!(
+            b.prepare_send(r.clone()).await.unwrap().fee,
+            Amount::from_sat(1400)
+        );
+        r.wallet = WalletKind::Spending;
+        assert_eq!(b.prepare_send(r).await.unwrap().fee, Amount::from_sat(420));
     }
 
     #[tokio::test]
@@ -909,7 +1038,7 @@ mod tests {
         let events = b.subscribe();
         let before = b.saving_state().await.unwrap();
         let p = b
-            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(btc(0.25))))
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(0.25)))
             .await
             .unwrap();
         b.confirm_send(p.id.clone()).await.unwrap();
@@ -950,7 +1079,7 @@ mod tests {
         let (n, bal) = notes_sum(&b).await;
         assert_eq!(n, bal);
         let p = b
-            .prepare_send(send(WalletKind::Spending, "bc1qabc", Some(btc(0.01))))
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", exact(0.01)))
             .await
             .unwrap();
         b.confirm_send(p.id).await.unwrap();
@@ -958,7 +1087,7 @@ mod tests {
         assert_eq!(n, bal);
         let f = DemoBackend::new(DemoScenario::Funded);
         let p = f
-            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(btc(0.25))))
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(0.25)))
             .await
             .unwrap();
         f.confirm_send(p.id).await.unwrap();
@@ -972,7 +1101,7 @@ mod tests {
         b.exit_now("queue-1".into()).await.unwrap();
         b.exit_now("queue-2".into()).await.unwrap();
         let p = b
-            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(btc(1.2))))
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(1.2)))
             .await
             .unwrap();
         assert!(p.inputs.len() > 1);

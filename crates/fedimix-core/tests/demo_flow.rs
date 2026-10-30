@@ -39,7 +39,8 @@ async fn funded_send_and_exit_update_state_and_emit() {
         .prepare_send(SendRequest {
             wallet: WalletKind::Saving,
             destination: "bc1qdemo0destination".into(),
-            amount: Some(Amount::from_sat(1_000_000)),
+            amount: SendAmount::Exact(Amount::from_sat(1_000_000)),
+            fee_rate_sat_vb: None,
         })
         .await
         .unwrap();

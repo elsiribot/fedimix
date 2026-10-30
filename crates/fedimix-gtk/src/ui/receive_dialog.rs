@@ -3,10 +3,9 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use fedimix_core::{Amount, ReceiveInfo, ReceiveMethod, ReceiveRequest, WalletKind};
+use fedimix_core::{Amount, ReceiveInfo, ReceiveMethod, ReceiveRequest, WalletKind, parse_btc};
 use gtk::glib;
 
-use crate::format;
 use crate::ui::app_state::AppContext;
 use crate::ui::qr;
 
@@ -178,7 +177,7 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
             // An edited amount makes the shown invoice stale.
             view.clear();
             create.set_sensitive(matches!(
-                format::parse_btc(&row.text()),
+                parse_btc(&row.text()),
                 Ok(a) if a != Amount::ZERO
             ));
         }
@@ -191,7 +190,7 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
         #[strong]
         view,
         move |button| {
-            let Ok(sats) = format::parse_btc(&amount.text()) else {
+            let Ok(sats) = parse_btc(&amount.text()) else {
                 return;
             };
             view.clear();

@@ -2,6 +2,7 @@
 
 use crate::format;
 use fedimix_core::api::*;
+use fedimix_core::{DestinationKind, parse_btc, parse_destination};
 
 const DOT: &str = "\u{b7}";
 const CHEVRON: &str = "\u{203a}";
@@ -213,10 +214,7 @@ pub fn exit_error_message(e: &fedimix_core::FedimixError) -> String {
 pub fn send_error_message(e: &fedimix_core::FedimixError) -> String {
     use fedimix_core::FedimixError as E;
     match e {
-        E::InvalidDestination(_) => {
-            "This is not a valid Lightning invoice or bitcoin address".to_string()
-        }
-        E::InvalidAmount(why) => format!("Invalid amount: {why}"),
+        E::InvalidDestination(why) | E::InvalidAmount(why) => why.clone(),
         E::InsufficientFunds { available, needed } => format!(
             "Not enough funds: {} available, {} needed including the fee",
             format::btc(*available),
@@ -227,18 +225,42 @@ pub fn send_error_message(e: &fedimix_core::FedimixError) -> String {
     }
 }
 
-/// Whether the amount field is needed: a Spending Lightning invoice carries
-/// its own amount.
-pub fn send_requires_amount(wallet: fedimix_core::WalletKind, dest: &str) -> bool {
-    !(wallet == fedimix_core::WalletKind::Spending && dest.trim().starts_with("lnbc"))
+/// Whether the amount field is hidden: the destination carries an amount.
+pub fn destination_has_amount(dest: &str) -> bool {
+    parse_destination(dest).is_ok_and(|d| d.amount.is_some())
 }
 
-/// Inline form error. Quiet until an amount has been typed.
-pub fn send_form_error(dest: &str, amount: &str, requires_amount: bool) -> Option<String> {
-    if amount.trim().is_empty() {
+/// The amount a Send form asks for. `amount` is the field's text; `max` there
+/// means everything.
+pub fn send_amount(wallet: WalletKind, dest: &str, amount: &str) -> Result<SendAmount, String> {
+    if dest.trim().is_empty() {
+        return Err("Enter a destination".to_string());
+    }
+    let parsed = parse_destination(dest).map_err(|e| send_error_message(&e))?;
+    if wallet == WalletKind::Saving && parsed.kind == DestinationKind::Lightning {
+        return Err("Saving can only send to a bitcoin address".to_string());
+    }
+    if parsed.amount.is_some() {
+        return Ok(SendAmount::FromInvoice);
+    }
+    if amount.trim().eq_ignore_ascii_case("max") {
+        return Ok(SendAmount::Max);
+    }
+    match parse_btc(amount).map_err(|e| send_error_message(&e))? {
+        Amount::ZERO => Err("Amount must be greater than zero".to_string()),
+        a => Ok(SendAmount::Exact(a)),
+    }
+}
+
+/// Inline form error. Quiet while the form is still being filled in; a
+/// destination the wallet can never pay to is reported at once.
+pub fn send_form_error(wallet: WalletKind, dest: &str, amount: &str) -> Option<String> {
+    let pays_lightning =
+        |d: &str| parse_destination(d).is_ok_and(|p| p.kind == DestinationKind::Lightning);
+    if amount.trim().is_empty() && !(wallet == WalletKind::Saving && pays_lightning(dest)) {
         return None;
     }
-    send_validation(dest, amount, requires_amount).err()
+    send_amount(wallet, dest, amount).err()
 }
 
 /// Review line saying where change goes, if any.
@@ -299,16 +321,6 @@ pub fn visible_history(items: &[HistoryItem], show_cover: bool) -> Vec<HistoryIt
         .collect()
 }
 
-pub fn send_validation(dest: &str, amount: &str, requires_amount: bool) -> Result<(), String> {
-    if dest.trim().is_empty() {
-        return Err("Enter a destination".to_string());
-    }
-    if requires_amount && format::parse_btc(amount)? == Amount::ZERO {
-        return Err("Amount must be greater than zero".to_string());
-    }
-    Ok(())
-}
-
 /// Raw values of the Settings page, as the widgets report them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsForm<'a> {
@@ -339,7 +351,7 @@ pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
     }
     let proxy = form.proxy.trim();
     Ok(Settings {
-        spending_target: format::parse_btc(form.target_btc)?,
+        spending_target: parse_btc(form.target_btc).map_err(|e| send_error_message(&e))?,
         anonymity_target: in_range("Anonymity target", form.anonymity_target, 1.0, 1000.0)? as u32,
         min_time_in_pool_secs: in_range("Minimum hours", form.min_hours, 0.0, 720.0)? * 3600,
         online_grace_secs: in_range("Grace minutes", form.grace_minutes, 0.0, 120.0)? * 60,
@@ -594,12 +606,12 @@ mod tests {
     fn send_error_messages() {
         use fedimix_core::FedimixError as E;
         assert_eq!(
-            send_error_message(&E::InvalidDestination("x".into())),
-            "This is not a valid Lightning invoice or bitcoin address"
+            send_error_message(&E::InvalidDestination("Nope".into())),
+            "Nope"
         );
         assert_eq!(
-            send_error_message(&E::InvalidAmount("amount must be above zero".into())),
-            "Invalid amount: amount must be above zero"
+            send_error_message(&E::InvalidAmount("Too low".into())),
+            "Too low"
         );
         assert_eq!(
             send_error_message(&E::InsufficientFunds {
@@ -617,13 +629,18 @@ mod tests {
     #[test]
     fn send_form_helpers() {
         use fedimix_core::{ChangeDestination as C, WalletKind as W};
-        assert!(!send_requires_amount(W::Spending, "lnbc1x"));
-        assert!(send_requires_amount(W::Spending, "bc1qx"));
-        assert!(send_requires_amount(W::Saving, "lnbc1x"));
-        assert_eq!(send_form_error("", "", true), None);
-        assert_eq!(send_form_error("bc1q", "", true), None);
-        assert!(send_form_error("bc1q", "abc", true).is_some());
-        assert!(send_form_error("", "0.1", true).is_some());
+        assert!(destination_has_amount("lnbc1200u1x"));
+        assert!(destination_has_amount("BITCOIN:BC1QX?AMOUNT=0.1"));
+        assert!(!destination_has_amount("lnbc1x"));
+        assert!(!destination_has_amount("bc1qx"));
+        assert_eq!(send_form_error(W::Saving, "", ""), None);
+        assert_eq!(send_form_error(W::Saving, "bc1q", ""), None);
+        assert!(send_form_error(W::Saving, "bc1qx", "abc").is_some());
+        assert!(send_form_error(W::Saving, "", "0.1").is_some());
+        assert!(send_form_error(W::Spending, "nonsense", "0.1").is_some());
+        // No point waiting for an amount: Saving can never pay this.
+        assert!(send_form_error(W::Saving, "lnbc1x", "").is_some());
+        assert_eq!(send_form_error(W::Spending, "lnbc1x", ""), None);
         assert_eq!(change_text(&C::None), None);
         assert_eq!(
             change_text(&C::Spending { amount: btc(0.1) }).unwrap(),
@@ -656,13 +673,30 @@ mod tests {
     }
 
     #[test]
-    fn validation_inline_errors() {
-        assert!(send_validation("", "0.1", true).is_err());
-        assert!(send_validation("bc1qxyz", "", true).is_err());
-        assert!(send_validation("bc1qxyz", "abc", true).is_err());
-        assert!(send_validation("bc1qxyz", "0", true).is_err());
-        assert!(send_validation("bc1qxyz", "", false).is_ok());
-        assert!(send_validation("bc1qxyz", "0.1", true).is_ok());
+    fn send_amount_from_the_form() {
+        use fedimix_core::WalletKind::{Saving, Spending};
+        assert!(send_amount(Spending, "", "0.1").is_err());
+        assert!(send_amount(Spending, "bc1qxyz", "").is_err());
+        assert!(send_amount(Spending, "bc1qxyz", "abc").is_err());
+        assert!(send_amount(Spending, "bc1qxyz", "0").is_err());
+        assert_eq!(
+            send_amount(Spending, "bc1qxyz", "0.1"),
+            Ok(SendAmount::Exact(btc(0.1)))
+        );
+        assert_eq!(send_amount(Saving, "bc1qxyz", " MAX "), Ok(SendAmount::Max));
+        assert_eq!(
+            send_amount(Spending, "lnbc1200u1x", ""),
+            Ok(SendAmount::FromInvoice)
+        );
+        assert_eq!(
+            send_amount(Saving, "bitcoin:bc1qx?amount=0.1", ""),
+            Ok(SendAmount::FromInvoice)
+        );
+        assert_eq!(
+            send_amount(Spending, "lnbc1x", "0.1"),
+            Ok(SendAmount::Exact(btc(0.1)))
+        );
+        assert!(send_amount(Saving, "lnbc1x", "0.1").is_err());
     }
 
     #[test]
@@ -687,7 +721,7 @@ mod tests {
     /// Same call sequence the UI uses, checked through the presentation layer.
     #[tokio::test]
     async fn demo_flow_presentation() {
-        use fedimix_core::{DemoBackend, DemoScenario, Fedimix, SendRequest, WalletKind};
+        use fedimix_core::{DemoBackend, DemoScenario, Fedimix, SendRequest};
         const NOW: Timestamp = 1_793_318_400;
 
         // First run: join, then set up Saving.
@@ -713,7 +747,8 @@ mod tests {
             .prepare_send(SendRequest {
                 wallet: WalletKind::Saving,
                 destination: "bc1qdemo0destination".into(),
-                amount: Some(Amount::from_sat(1_000_000)),
+                amount: SendAmount::Exact(Amount::from_sat(1_000_000)),
+                fee_rate_sat_vb: None,
             })
             .await
             .unwrap();

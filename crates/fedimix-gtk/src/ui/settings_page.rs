@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use adw::prelude::*;
-use fedimix_core::{ChainBackend, FederationInfo, Settings};
+use fedimix_core::{ChainBackend, FederationInfo, Settings, parse_btc};
 use gtk::glib;
 
 use crate::format;
@@ -270,7 +270,7 @@ impl Inner {
             proxy: &proxy,
         };
         let result = present::settings_from_form(&form);
-        let target_bad = format::parse_btc(&target).is_err();
+        let target_bad = parse_btc(&target).is_err();
         let url_bad = url.trim().is_empty();
         set_error(&self.target, target_bad);
         set_error(&self.url, url_bad);
