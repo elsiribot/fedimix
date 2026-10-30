@@ -17,6 +17,7 @@ struct Inner {
     suggested: gtk::ListBox,
     entry: adw::EntryRow,
     error: gtk::Label,
+    spinner: gtk::Spinner,
     on_joined: RefCell<Option<JoinedCallback>>,
 }
 
@@ -55,10 +56,16 @@ impl JoinPage {
             .build();
         error.add_css_class("error");
 
+        let spinner = gtk::Spinner::builder()
+            .visible(false)
+            .halign(gtk::Align::Center)
+            .build();
+
         let form = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
             .build();
+        form.append(&spinner);
         form.append(&suggested);
         form.append(&invite_list);
         form.append(&error);
@@ -82,6 +89,7 @@ impl JoinPage {
             suggested,
             entry,
             error,
+            spinner,
             on_joined: RefCell::new(None),
         });
 
@@ -177,7 +185,7 @@ impl Inner {
         }
         self.clear_error();
         // Insensitive while the join runs, so it cannot be started twice.
-        self.form.set_sensitive(false);
+        self.set_busy(true);
         let core = self.ctx.bridge.core();
         let weak = Rc::downgrade(self);
         let ctx = self.ctx.clone();
@@ -185,7 +193,7 @@ impl Inner {
             async move { core.join_federation(invite).await },
             move |res| {
                 if let Some(inner) = weak.upgrade() {
-                    inner.form.set_sensitive(true);
+                    inner.set_busy(false);
                     match &res {
                         Ok(_) => {
                             if let Some(f) = inner.on_joined.borrow().as_ref() {
@@ -205,6 +213,12 @@ impl Inner {
                 }
             },
         );
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.form.set_sensitive(!busy);
+        self.spinner.set_visible(busy);
+        self.spinner.set_spinning(busy);
     }
 
     fn show_error(&self, text: &str) {

@@ -7,6 +7,12 @@ shot before
 click Refill from Saving
 expect Refill Spending
 shot dialog
+# A second click cannot stack another dialog: one Cancel closes it.
+click Refill from Saving
+click Cancel
+expect-not Refill Spending
+click Refill from Saving
+expect Refill Spending
 click Confirm on Ledger Nano S+
 expect Refill started
 expect Refill confirmed

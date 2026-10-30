@@ -1,6 +1,6 @@
 //! Shared application context: snapshot cache, fan-out and error toasts.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
 
@@ -26,6 +26,8 @@ struct Shared {
     latest: RefCell<Option<Snapshots>>,
     subscribers: RefCell<Vec<Subscriber>>,
     refresh: RefCell<RefreshGate>,
+    /// A Refill dialog is open or being prepared.
+    refill_open: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -54,12 +56,22 @@ impl AppContext {
                 latest: RefCell::default(),
                 subscribers: RefCell::default(),
                 refresh: RefCell::default(),
+                refill_open: Cell::new(false),
             }),
         }
     }
 
     pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
+    }
+
+    /// Claim the single Refill dialog; `false` if one is already up.
+    pub fn claim_refill(&self) -> bool {
+        !self.shared.refill_open.replace(true)
+    }
+
+    pub fn release_refill(&self) {
+        self.shared.refill_open.set(false);
     }
 
     /// Show `message` now, ahead of any toast on screen. For outcomes, which

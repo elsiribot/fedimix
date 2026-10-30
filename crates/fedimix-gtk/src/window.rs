@@ -114,7 +114,7 @@ impl FedimixWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Fedimix")
-            .default_width(480)
+            .default_width(560)
             .default_height(640)
             .width_request(MIN_WIDTH)
             .height_request(MIN_HEIGHT)
@@ -140,6 +140,18 @@ impl FedimixWindow {
         spending_slot.append(spending_tab.widget());
         let join_page = JoinPage::new(&ctx);
         content.add_named(join_page.widget(), Some("join"));
+        let spinner = gtk::Spinner::builder()
+            .spinning(true)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .width_request(32)
+            .height_request(32)
+            .build();
+        content.add_named(&spinner, Some("loading"));
+        // Until the first snapshot says which of them to show.
+        content.set_visible_child_name("loading");
+        header.set_title_widget(None::<&gtk::Widget>);
+        switcher_bar.set_visible(false);
         let chrome = Chrome {
             content,
             header,

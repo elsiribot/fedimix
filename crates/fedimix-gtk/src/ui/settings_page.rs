@@ -447,6 +447,14 @@ impl Inner {
             });
     }
 
+    /// Redraw the radios from the core, after a switch it refused.
+    fn show_active_federation(self: &Rc<Self>) {
+        *self.fed_shown.borrow_mut() = None;
+        if let Some(s) = self.ctx.latest() {
+            self.update(&s);
+        }
+    }
+
     fn render_federations(self: &Rc<Self>, feds: &[FederationInfo], s: Option<&Snapshots>) {
         let active = s
             .and_then(|s| s.spending.federation.as_ref())
@@ -478,11 +486,22 @@ impl Inner {
             radio.connect_toggled({
                 let ctx = self.ctx.clone();
                 let id = fed.id.clone();
+                let weak = Rc::downgrade(self);
                 move |radio| {
                     if radio.is_active() {
                         let core = ctx.bridge.core();
                         let id = id.clone();
-                        ctx.run(async move { core.set_active_federation(id).await }, |()| {});
+                        let done = ctx.clone();
+                        let weak = weak.clone();
+                        ctx.bridge.call(
+                            async move { core.set_active_federation(id).await },
+                            move |res| {
+                                if let Err(e) = res {
+                                    done.toast(&present::user_message(&e));
+                                    with(&weak, Inner::show_active_federation);
+                                }
+                            },
+                        );
                     }
                 }
             });

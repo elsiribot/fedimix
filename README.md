@@ -12,9 +12,9 @@ rustfmt and rust-analyzer), GTK4, libadwaita and `just`, plus sway, grim and jq 
 
 ```sh
 nix develop
-just run      # build and launch the app
+just run      # build and launch the app (the demo, for now)
 just test     # run the workspace tests
-just screenshot NAME  # headless screenshot to target/screenshots/NAME.png
+just screenshot NAME [--demo-scenario S] [--demo-page P]  # headless, to target/screenshots/NAME.png
 just screenshot-all   # every scenario x page at 480 and 360 wide
 just interact-demo    # scripted UI flows under headless sway
 just clippy   # lint with warnings denied
@@ -47,11 +47,10 @@ maps or the app logs `CRITICAL` or `panicked`.
 
 `--demo-drive <file>` (requires `--demo`) replays a script inside the running
 app, because OS-level input injection does not reach GTK under headless sway.
-One step per line: `click <label>`, `type <title> <text>`, `expect <text>`,
-`wait <ms>`, `shot <name>`, `expect-not <text>` and
-`action <name>` (e.g. `app.settings`). It prints `DRIVE OK`, or
+The steps are documented at the top of `crates/fedimix-gtk/src/demo_drive.rs`.
+It prints `DRIVE OK`, or
 `DRIVE FAILED: <step>` and exits 1. `scripts/interact-demo.sh` (`just
 interact-demo [flow...]`) runs `scripts/demo-flows/*.drive` under headless
 sway and takes a grim screenshot per `shot` into `target/screenshots/interact/`.
-A flow's `# scenario:` and `# size:` header comments pick its scenario and
-window size.
+A flow's `# scenario:`, `# page:` and `# size:` header comments pick its
+scenario, start page and window size.

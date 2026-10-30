@@ -1,0 +1,9 @@
+# scenario: device-rejects
+# page: setup-saving
+# Setup errors stay in the dialog, which stays open for another try.
+expect Ledger Nano S+
+click Set up
+expect The device rejected the transaction
+shot rejected
+click Set up
+expect The device rejected the transaction

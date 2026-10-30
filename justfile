@@ -4,8 +4,8 @@ default:
 build:
     cargo build --workspace
 
-run:
-    cargo run -p fedimix-gtk
+# Phase 1 only runs on the demo backend
+run: demo
 
 demo:
     cargo run -p fedimix-gtk -- --demo
@@ -27,9 +27,9 @@ build-nix:
     nix build
     nix flake check
 
-# Render the app headlessly to target/screenshots/<name>.png
+# Render the app headlessly to target/screenshots/<name>.png; args go to the app after --demo
 screenshot name *args:
-    scripts/screenshot.sh target/screenshots/{{name}}.png -- {{args}}
+    scripts/screenshot.sh target/screenshots/{{name}}.png -- --demo {{args}}
 
 # Screenshot every scenario x page at 480 and 360 wide into target/screenshots
 screenshot-all:

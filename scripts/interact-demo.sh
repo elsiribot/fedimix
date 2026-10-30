@@ -2,7 +2,8 @@
 # Run scripted UI flows (scripts/demo-flows/*.drive) through the in-app demo
 # driver under headless sway, taking a grim screenshot at every `shot` step.
 # Usage: scripts/interact-demo.sh [flow-name ...]   (default: all flows)
-# Flow header comments: `# scenario: <demo scenario>`, `# size: WxH`.
+# Flow header comments: `# scenario: <demo scenario>`, `# page: <demo page>`,
+# `# size: WxH`.
 # Output: target/screenshots/interact/<flow>-<shot>.png
 set -euo pipefail
 
@@ -33,9 +34,10 @@ cleanup() {
 trap cleanup EXIT
 
 run_flow() {
-    local file="$1" name scenario size width height
+    local file="$1" name scenario page size width height
     name="$(basename "$file" .drive)"
     scenario="$(sed -n 's/^# scenario: *//p' "$file" | head -n1)"
+    page="$(sed -n 's/^# page: *//p' "$file" | head -n1)"
     size="$(sed -n 's/^# size: *//p' "$file" | head -n1)"
     scenario="${scenario:-funded}"
     size="${size:-480x640}"
@@ -64,7 +66,8 @@ run_flow() {
     mkfifo "$rt/stdin"
     exec 3<>"$rt/stdin"
     GDK_BACKEND=wayland GSK_RENDERER=cairo GTK_A11Y=none \
-        "$bin" --demo --demo-scenario "$scenario" --demo-drive "$file" \
+        "$bin" --demo --demo-scenario "$scenario" ${page:+--demo-page "$page"} \
+        --demo-drive "$file" \
         <&3 >"$rt/out.log" 2>"$rt/err.log" &
     app_pid=$!
 

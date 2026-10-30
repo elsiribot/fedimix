@@ -12,6 +12,9 @@ use crate::ui::app_state::AppContext;
 /// Prepare a refill and show the confirmation dialog. A failed preparation
 /// is a toast and no dialog. `expanded` starts with the coin list revealed.
 pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
+    if !ctx.claim_refill() {
+        return;
+    }
     let core = ctx.bridge.core();
     let ctx = ctx.clone();
     ctx.bridge
@@ -19,7 +22,10 @@ pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
             let ctx = ctx.clone();
             move |res| match res {
                 Ok(preview) => show(&ctx, preview, expanded),
-                Err(e) => ctx.toast(&present::user_message(&e)),
+                Err(e) => {
+                    ctx.release_refill();
+                    ctx.toast(&present::user_message(&e));
+                }
             }
         });
 }
@@ -154,6 +160,10 @@ fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {
                     .call(async move { core.discard_preview(id).await }, |_| {});
             }
         }
+    });
+    dialog.connect_closed({
+        let ctx = ctx.clone();
+        move |_| ctx.release_refill()
     });
     dialog.present(Some(&ctx.nav));
 }
