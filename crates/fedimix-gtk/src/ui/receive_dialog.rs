@@ -4,11 +4,15 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use fedimix_core::{Amount, ReceiveInfo, ReceiveMethod, ReceiveRequest, WalletKind, parse_btc};
+
 use gtk::glib;
 
-use crate::present::user_message;
+use crate::present::{self, user_message};
 use crate::ui::app_state::AppContext;
-use crate::ui::qr;
+use crate::ui::{qr, widgets};
+
+/// How long a new invoice stays payable.
+const INVOICE_EXPIRY_SECS: u32 = 3_600;
 
 /// QR, selectable payload text and a Copy button.
 #[derive(Clone)]
@@ -17,6 +21,7 @@ struct PayloadView {
     picture: gtk::Picture,
     text: gtk::Label,
     copy: gtk::Button,
+    expiry: gtk::Label,
     status: gtk::Label,
     content: gtk::Box,
 }
@@ -37,6 +42,9 @@ impl PayloadView {
         let copy = gtk::Button::with_label("Copy");
         copy.add_css_class("pill");
         copy.set_halign(gtk::Align::Center);
+        let expiry = gtk::Label::builder().visible(false).xalign(0.0).build();
+        expiry.add_css_class("dim-label");
+        expiry.add_css_class("caption");
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -44,6 +52,7 @@ impl PayloadView {
             .build();
         content.append(&picture);
         content.append(&text);
+        content.append(&expiry);
         content.append(&copy);
         let status = gtk::Label::builder()
             .wrap(true)
@@ -73,6 +82,7 @@ impl PayloadView {
             picture,
             text,
             copy,
+            expiry,
             status,
             content,
         }
@@ -92,6 +102,11 @@ impl PayloadView {
                 self.show_status(&format!("Could not draw QR code: {e}"));
             }
         }
+        let expiry = info
+            .expires_at
+            .map(|at| present::expiry_line(at, widgets::now()));
+        self.expiry.set_visible(expiry.is_some());
+        self.expiry.set_label(expiry.as_deref().unwrap_or(""));
         self.copy.set_sensitive(true);
         self.content.set_visible(true);
     }
@@ -154,11 +169,15 @@ fn load_address(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
 fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box {
     let amount = adw::EntryRow::builder().title("Amount (BTC)").build();
     amount.set_input_purpose(gtk::InputPurpose::Number);
+    let description = adw::EntryRow::builder()
+        .title("Description (optional)")
+        .build();
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .build();
     list.add_css_class("boxed-list");
     list.append(&amount);
+    list.append(&description);
     let create = gtk::Button::with_label("Create invoice");
     create.add_css_class("pill");
     create.add_css_class("suggested-action");
@@ -189,6 +208,8 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
         ctx,
         #[weak]
         amount,
+        #[weak]
+        description,
         #[strong]
         view,
         move |button| {
@@ -200,7 +221,11 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
             let core = ctx.bridge.core();
             let request = ReceiveRequest {
                 wallet: WalletKind::Spending,
-                method: ReceiveMethod::Lightning { amount: sats },
+                method: ReceiveMethod::Lightning {
+                    amount: sats,
+                    description: description.text().trim().to_string(),
+                    expiry_secs: INVOICE_EXPIRY_SECS,
+                },
             };
             ctx.bridge.call(
                 async move { core.receive(request).await },

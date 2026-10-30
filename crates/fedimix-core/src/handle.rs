@@ -49,8 +49,8 @@ impl Fedimix {
     pub async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
         self.backend.detect_devices().await
     }
-    pub async fn setup_saving(&self, device: DeviceInfo) -> Result<()> {
-        self.backend.setup_saving(device).await
+    pub async fn setup_saving(&self, device_id: String) -> Result<()> {
+        self.backend.setup_saving(device_id).await
     }
     pub async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo> {
         self.backend.receive(request).await

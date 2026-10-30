@@ -23,7 +23,7 @@ async fn first_run_join_then_setup_saving() {
     assert!(!spending.saving_ready);
 
     let device = core.detect_devices().await.unwrap().remove(0);
-    core.setup_saving(device.clone()).await.unwrap();
+    core.setup_saving(device.id.clone()).await.unwrap();
     assert_eq!(core.saving_state().await.unwrap().device, Some(device));
     assert!(core.spending_state().await.unwrap().saving_ready);
 }

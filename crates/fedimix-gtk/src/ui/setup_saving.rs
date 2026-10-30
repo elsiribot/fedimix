@@ -99,12 +99,12 @@ fn device_row(ctx: &Rc<AppContext>, dialog: &adw::Dialog, device: &DeviceInfo) -
             // One setup at a time: the button stays off until it resolves.
             button.set_sensitive(false);
             let core = ctx.bridge.core();
-            let device = device.clone();
+            let id = device.id.clone();
             let button = button.downgrade();
             let ctx2 = ctx.clone();
             let dialog = dialog.clone();
             ctx.bridge.call(
-                async move { core.setup_saving(device).await },
+                async move { core.setup_saving(id).await },
                 move |res| match res {
                     Ok(()) => {
                         dialog.close();

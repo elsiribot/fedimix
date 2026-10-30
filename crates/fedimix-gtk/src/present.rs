@@ -167,6 +167,10 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
             required,
         } => format!("{confirmations}/{required} conf"),
         HistoryStatus::Complete => format::date(item.timestamp, now),
+        HistoryStatus::Pending => "pending".to_string(),
+        HistoryStatus::Failed => "failed".to_string(),
+        HistoryStatus::Refunded => "refunded".to_string(),
+        HistoryStatus::Expired => "expired".to_string(),
     };
     HistoryRowView {
         icon,
@@ -184,6 +188,15 @@ pub fn queue_row(item: &QueueItem, anonymity_target: u32) -> QueueRowView {
         QueueItemStatus::Queued => format!("{cur} \u{2192} ~{}", item.anonymity_attainable),
         QueueItemStatus::Eligible => format!("{cur} {DOT} eligible"),
         QueueItemStatus::Scheduled { .. } => format!("{cur} {DOT} scheduled"),
+        QueueItemStatus::Deferred { reason } => {
+            let why = match reason {
+                DeferReason::FeeGuard => "waiting for lower fees",
+                DeferReason::FeeUnaffordable => "Spending cannot pay the fee",
+                DeferReason::Offline => "waiting to reconnect",
+                DeferReason::GracePeriod => "waiting after reconnect",
+            };
+            format!("{cur} {DOT} {why}")
+        }
         QueueItemStatus::Withdrawing { .. } => format!("{cur} {DOT} withdrawing"),
         QueueItemStatus::Landed => format!("{cur} {DOT} landed"),
     };
@@ -191,6 +204,38 @@ pub fn queue_row(item: &QueueItem, anonymity_target: u32) -> QueueRowView {
         label: format::btc_short(item.denomination),
         fraction: fraction(cur.into(), anonymity_target.into()),
         detail,
+    }
+}
+
+/// Whether "Exit now" can run. The fee guard and the grace period are
+/// deferrals of automatic exits only; a manual exit overrides them.
+pub fn exit_allowed(status: &QueueItemStatus) -> bool {
+    !matches!(
+        status,
+        QueueItemStatus::Withdrawing { .. }
+            | QueueItemStatus::Landed
+            | QueueItemStatus::Deferred {
+                reason: DeferReason::Offline | DeferReason::FeeUnaffordable,
+            }
+    )
+}
+
+/// Spending hint for exits it cannot pay for (spec section 4).
+pub fn spending_hint(q: &QueueState) -> Option<String> {
+    let waiting = q
+        .items
+        .iter()
+        .filter(|i| {
+            i.status
+                == (QueueItemStatus::Deferred {
+                    reason: DeferReason::FeeUnaffordable,
+                })
+        })
+        .count();
+    match waiting {
+        0 => None,
+        1 => Some("1 exit waits until Spending can pay its fee".to_string()),
+        n => Some(format!("{n} exits wait until Spending can pay their fees")),
     }
 }
 
@@ -257,6 +302,14 @@ pub fn send_form_error(wallet: WalletKind, dest: &str, amount: &str) -> Option<S
         return None;
     }
     send_amount(wallet, dest, amount).err()
+}
+
+/// "Expires in ~1 hour", or that it no longer can be paid.
+pub fn expiry_line(expires_at: Timestamp, now: Timestamp) -> String {
+    if expires_at <= now {
+        return "Expired".to_string();
+    }
+    format!("Expires in {}", format::duration_rough(expires_at - now))
 }
 
 /// Review line saying where change goes, if any.
@@ -504,6 +557,93 @@ mod tests {
     }
 
     #[test]
+    fn queue_row_says_why_an_item_is_deferred() {
+        let row = |reason| queue_row(&qitem(QueueItemStatus::Deferred { reason }, 5, 9), 50).detail;
+        assert_eq!(
+            row(DeferReason::FeeGuard),
+            "5 \u{b7} waiting for lower fees"
+        );
+        assert_eq!(
+            row(DeferReason::FeeUnaffordable),
+            "5 \u{b7} Spending cannot pay the fee"
+        );
+        assert_eq!(row(DeferReason::Offline), "5 \u{b7} waiting to reconnect");
+        assert_eq!(
+            row(DeferReason::GracePeriod),
+            "5 \u{b7} waiting after reconnect"
+        );
+    }
+
+    #[test]
+    fn exit_allowed_by_status() {
+        use DeferReason::*;
+        let deferred = |reason| QueueItemStatus::Deferred { reason };
+        for allowed in [
+            QueueItemStatus::Queued,
+            QueueItemStatus::Eligible,
+            QueueItemStatus::Scheduled { at: 0 },
+            deferred(FeeGuard),
+            deferred(GracePeriod),
+        ] {
+            assert!(exit_allowed(&allowed), "{allowed:?}");
+        }
+        for refused in [
+            QueueItemStatus::Withdrawing { txid: "t".into() },
+            QueueItemStatus::Landed,
+            deferred(Offline),
+            deferred(FeeUnaffordable),
+        ] {
+            assert!(!exit_allowed(&refused), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn spending_hint_counts_unaffordable_exits() {
+        let queue = |n| QueueState {
+            total: Amount::ZERO,
+            anonymity_estimate: 0,
+            typical_exit_secs: 0,
+            waiting_for_saving: false,
+            items: std::iter::repeat_n(
+                qitem(
+                    QueueItemStatus::Deferred {
+                        reason: DeferReason::FeeUnaffordable,
+                    },
+                    1,
+                    1,
+                ),
+                n,
+            )
+            .chain([qitem(QueueItemStatus::Queued, 1, 1)])
+            .collect(),
+        };
+        assert_eq!(spending_hint(&queue(0)), None);
+        assert_eq!(
+            spending_hint(&queue(1)).unwrap(),
+            "1 exit waits until Spending can pay its fee"
+        );
+        assert_eq!(
+            spending_hint(&queue(2)).unwrap(),
+            "2 exits wait until Spending can pay their fees"
+        );
+    }
+
+    #[test]
+    fn history_trailing_for_every_status() {
+        let trailing = |status| history_row(&hist(HistoryKind::Paid, false, status), 0).trailing;
+        assert_eq!(trailing(HistoryStatus::Pending), "pending");
+        assert_eq!(trailing(HistoryStatus::Failed), "failed");
+        assert_eq!(trailing(HistoryStatus::Refunded), "refunded");
+        assert_eq!(trailing(HistoryStatus::Expired), "expired");
+    }
+
+    #[test]
+    fn expiry_line_text() {
+        assert_eq!(expiry_line(3700, 100), "Expires in ~1 hour");
+        assert_eq!(expiry_line(100, 100), "Expired");
+    }
+
+    #[test]
     fn queue_summary_text() {
         let q = QueueState {
             total: btc(0.42),
@@ -656,7 +796,9 @@ mod tests {
     fn confirm_button_states() {
         use fedimix_core::{DeviceInfo, WalletKind as W};
         let dev = |connected| DeviceInfo {
+            id: "c".into(),
             name: "Coldcard".into(),
+            kind: fedimix_core::DeviceKind::Coldcard,
             connected,
         };
         assert_eq!(confirm_button(W::Spending, None), ("Send".into(), true));
@@ -720,7 +862,7 @@ mod tests {
             .clone();
         core.join_federation(invite).await.unwrap();
         let device = core.detect_devices().await.unwrap().remove(0);
-        core.setup_saving(device).await.unwrap();
+        core.setup_saving(device.id).await.unwrap();
         let sp = core.spending_state().await.unwrap();
         assert_eq!(saving_banner(&sp), None);
         assert!(sp.federation.is_some());

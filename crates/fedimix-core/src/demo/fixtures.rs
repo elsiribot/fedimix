@@ -11,6 +11,7 @@ const DAY: u64 = 86_400;
 pub const FEDERATION_NAME: &str = "Fedi Alpha";
 pub const FEDERATION_ID: &str = "demo-fed-alpha";
 pub const DEVICE_NAME: &str = "Ledger Nano S+";
+pub const DEVICE_ID: &str = "demo-ledger-0";
 
 pub fn btc(v: f64) -> Amount {
     Amount::from_sat((v * 1e8).round() as u64)
@@ -33,7 +34,9 @@ pub struct Fixture {
 
 pub fn device() -> DeviceInfo {
     DeviceInfo {
+        id: DEVICE_ID.to_string(),
         name: DEVICE_NAME.to_string(),
+        kind: DeviceKind::Ledger,
         connected: true,
     }
 }
@@ -230,6 +233,73 @@ fn funded_queue() -> Vec<QueueItem> {
     ]
 }
 
+fn deferred(reason: DeferReason) -> QueueItemStatus {
+    QueueItemStatus::Deferred { reason }
+}
+
+/// Spending cannot pay exit fees; every deferral and unusual history status.
+fn exit_deferred() -> Fixture {
+    let moving = 0.1;
+    let for_spending = 0.000_002;
+    Fixture {
+        spending_balance: btc(moving + for_spending),
+        for_spending: btc(for_spending),
+        moving: btc(moving),
+        queue: vec![
+            queue_item(1, 0.05, deferred(DeferReason::FeeUnaffordable), 40, 60),
+            queue_item(2, 0.02, deferred(DeferReason::FeeGuard), 35, 60),
+            queue_item(3, 0.02, deferred(DeferReason::GracePeriod), 12, 48),
+            queue_item(4, 0.005, deferred(DeferReason::Offline), 12, 48),
+            queue_item(
+                5,
+                0.002,
+                QueueItemStatus::Withdrawing {
+                    txid: outpoint_for(50),
+                },
+                71,
+                71,
+            ),
+            queue_item(6, 0.002, QueueItemStatus::Landed, 71, 71),
+            queue_item(7, 0.001, QueueItemStatus::Scheduled { at: BASE_TS }, 71, 71),
+        ],
+        spending_history: vec![
+            hist(
+                "p-p",
+                HistoryKind::Paid,
+                0.001,
+                false,
+                HistoryStatus::Pending,
+                HOUR,
+            ),
+            hist(
+                "p-f",
+                HistoryKind::Paid,
+                0.002,
+                false,
+                HistoryStatus::Failed,
+                2 * HOUR,
+            ),
+            hist(
+                "p-r",
+                HistoryKind::Paid,
+                0.003,
+                false,
+                HistoryStatus::Refunded,
+                3 * HOUR,
+            ),
+            hist(
+                "p-e",
+                HistoryKind::ReceivedLightning,
+                0.004,
+                true,
+                HistoryStatus::Expired,
+                4 * HOUR,
+            ),
+        ],
+        ..funded()
+    }
+}
+
 fn funded() -> Fixture {
     Fixture {
         device: Some(device()),
@@ -312,8 +382,16 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
         },
         DemoScenario::Offline => Fixture {
             federation: Some(federation(false)),
+            queue: funded_queue()
+                .into_iter()
+                .map(|item| QueueItem {
+                    status: deferred(DeferReason::Offline),
+                    ..item
+                })
+                .collect(),
             ..funded()
         },
+        DemoScenario::ExitDeferred => exit_deferred(),
     }
 }
 

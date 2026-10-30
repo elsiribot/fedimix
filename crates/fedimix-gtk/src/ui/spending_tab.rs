@@ -20,6 +20,7 @@ struct Inner {
     caption: gtk::Label,
     caption_link: gtk::Button,
     refill: gtk::Button,
+    hint: gtk::Label,
     history: HistoryList,
     show_cover: gtk::CheckButton,
     /// Last state rendered, to skip identical rebuilds.
@@ -88,6 +89,14 @@ impl SpendingTab {
             move |_| refill_dialog::open(&ctx, false)
         });
 
+        let hint = gtk::Label::builder()
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .visible(false)
+            .build();
+        hint.add_css_class("caption");
+        hint.add_css_class("warning");
+
         let hero = widgets::hero_box();
         hero.append(&federation);
         hero.append(balance.widget());
@@ -95,6 +104,7 @@ impl SpendingTab {
         hero.append(&caption);
         hero.append(&caption_link);
         hero.append(&refill);
+        hero.append(&hint);
         hero.append(&widgets::send_receive_row(&ctx, WalletKind::Spending));
 
         let heading = gtk::Label::builder()
@@ -149,6 +159,7 @@ impl SpendingTab {
             caption,
             caption_link,
             refill,
+            hint,
             history,
             show_cover: show_cover.clone(),
             last: RefCell::new(None),
@@ -183,6 +194,9 @@ impl SpendingTab {
 
 impl Inner {
     fn update(&self, s: &Snapshots) {
+        let hint = present::spending_hint(&s.queue);
+        self.hint.set_visible(hint.is_some());
+        self.hint.set_label(hint.as_deref().unwrap_or(""));
         if self.last.borrow().as_ref() == Some(&s.spending) {
             return;
         }

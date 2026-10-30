@@ -31,7 +31,8 @@ cargo run -p fedimix-gtk -- --demo --demo-scenario below-target --demo-page refi
 ```
 
 Scenarios (`--demo-scenario`): `funded` (default), `below-target`,
-`no-saving`, `first-run` (Join page, no federation), `offline`.
+`no-saving`, `first-run` (Join page, no federation), `offline`,
+`exit-deferred` (Spending too low for exit fees, every queue and history status).
 
 Pages (`--demo-page`): `saving`, `spending`, `coins`, `coin-detail`, `moving`,
 `notes`, `send`, `send-review`, `receive`, `refill`, `refill-expanded`, `join`,

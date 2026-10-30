@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -36,6 +36,8 @@ pub enum DemoScenario {
     NoSaving,
     FirstRun,
     Offline,
+    /// Spending too low for exit fees, every queue deferral and history status.
+    ExitDeferred,
 }
 
 impl FromStr for DemoScenario {
@@ -48,8 +50,9 @@ impl FromStr for DemoScenario {
             "no-saving" => Ok(Self::NoSaving),
             "first-run" => Ok(Self::FirstRun),
             "offline" => Ok(Self::Offline),
+            "exit-deferred" => Ok(Self::ExitDeferred),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred)"
             )),
         }
     }
@@ -148,6 +151,13 @@ impl State {
         self.next_id += 1;
         100 + n as usize
     }
+}
+
+fn now_secs() -> Timestamp {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 fn sum(amounts: impl Iterator<Item = Amount>) -> Amount {
@@ -330,7 +340,11 @@ impl Backend for DemoBackend {
         Ok(vec![fixtures::device()])
     }
 
-    async fn setup_saving(&self, device: DeviceInfo) -> Result<()> {
+    async fn setup_saving(&self, device_id: String) -> Result<()> {
+        let device = fixtures::device();
+        if device.id != device_id {
+            return Err(FedimixError::UnknownItem(device_id));
+        }
         if !device.connected {
             return Err(FedimixError::DeviceNotConnected(device.name));
         }
@@ -346,12 +360,23 @@ impl Backend for DemoBackend {
     }
 
     async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo> {
+        if request.wallet == WalletKind::Spending {
+            let st = self.state.lock().await;
+            if st.federation.as_ref().is_some_and(|f| !f.online) {
+                return Err(FedimixError::Offline);
+            }
+        }
         Ok(match request.method {
-            ReceiveMethod::Lightning { amount } => {
+            ReceiveMethod::Lightning {
+                amount,
+                expiry_secs,
+                ..
+            } => {
                 let payload = format!("lnbc{}n1pdemo0fedimix0invoice", amount.as_sat() * 10);
                 ReceiveInfo {
                     uri: format!("lightning:{payload}"),
                     payload,
+                    expires_at: Some(now_secs() + u64::from(expiry_secs)),
                 }
             }
             ReceiveMethod::OnChain => {
@@ -359,6 +384,7 @@ impl Backend for DemoBackend {
                 ReceiveInfo {
                     uri: format!("bitcoin:{payload}"),
                     payload,
+                    expires_at: None,
                 }
             }
         })
@@ -725,12 +751,13 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 5] = [
+    const ALL: [DemoScenario; 6] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
         DemoScenario::FirstRun,
         DemoScenario::Offline,
+        DemoScenario::ExitDeferred,
     ];
 
     fn btc(v: f64) -> Amount {
@@ -1129,6 +1156,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_honours_offline_and_reports_expiry() {
+        let lightning = ReceiveRequest {
+            wallet: WalletKind::Spending,
+            method: ReceiveMethod::Lightning {
+                amount: btc(0.001),
+                description: "Coffee".into(),
+                expiry_secs: 3600,
+            },
+        };
+        let onchain = ReceiveRequest {
+            wallet: WalletKind::Spending,
+            method: ReceiveMethod::OnChain,
+        };
+        let saving = ReceiveRequest {
+            wallet: WalletKind::Saving,
+            method: ReceiveMethod::OnChain,
+        };
+        let off = DemoBackend::new(DemoScenario::Offline);
+        assert_eq!(
+            off.receive(lightning.clone()).await,
+            Err(FedimixError::Offline)
+        );
+        assert_eq!(
+            off.receive(onchain.clone()).await,
+            Err(FedimixError::Offline)
+        );
+        assert!(
+            off.receive(saving).await.is_ok(),
+            "Saving needs no federation"
+        );
+
+        let on = DemoBackend::new(DemoScenario::Funded);
+        let invoice = on.receive(lightning).await.unwrap();
+        assert!(invoice.expires_at.unwrap() > now_secs() + 3000);
+        assert_eq!(
+            crate::parse_destination(&invoice.payload).unwrap().amount,
+            Some(btc(0.001))
+        );
+        assert_eq!(on.receive(onchain).await.unwrap().expires_at, None);
+    }
+
+    #[tokio::test]
     async fn join_rejects_bad_invite() {
         let b = DemoBackend::new(DemoScenario::FirstRun);
         assert!(matches!(
@@ -1145,7 +1214,11 @@ mod tests {
         let sp = b.spending_state().await.unwrap();
         assert!(sp.federation.is_some());
         let dev = b.detect_devices().await.unwrap().remove(0);
-        b.setup_saving(dev).await.unwrap();
+        assert!(matches!(
+            b.setup_saving("nope".into()).await,
+            Err(FedimixError::UnknownItem(_))
+        ));
+        b.setup_saving(dev.id).await.unwrap();
         let sp = b.spending_state().await.unwrap();
         assert!(sp.saving_ready);
         assert!(b.saving_state().await.unwrap().device.is_some());

@@ -73,9 +73,25 @@ pub enum WalletKind {
     Spending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Ledger,
+    Trezor,
+    Coldcard,
+    Jade,
+    BitBox,
+    /// Test signer; never offered outside tests.
+    Software,
+}
+
+/// A hardware wallet. The device Saving was set up with stays in
+/// `SavingState::device` while unplugged, as `Some` with `connected: false`;
+/// `None` means Saving is not set up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceInfo {
+    pub id: String,
     pub name: String,
+    pub kind: DeviceKind,
     pub connected: bool,
 }
 
@@ -108,8 +124,17 @@ pub struct SentChange {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HistoryStatus {
-    Confirming { confirmations: u32, required: u32 },
+    Pending,
+    Confirming {
+        confirmations: u32,
+        required: u32,
+    },
     Complete,
+    Failed,
+    /// A payment that failed and came back.
+    Refunded,
+    /// An invoice nobody paid in time.
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,9 +197,28 @@ pub struct SpendingState {
 pub enum QueueItemStatus {
     Queued,
     Eligible,
-    Scheduled { at: Timestamp },
-    Withdrawing { txid: String },
+    Scheduled {
+        at: Timestamp,
+    },
+    /// Waiting for a condition; see [`DeferReason`].
+    Deferred {
+        reason: DeferReason,
+    },
+    Withdrawing {
+        txid: String,
+    },
     Landed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferReason {
+    /// The withdrawal fee is above the fee guard.
+    FeeGuard,
+    /// Spending cannot pay the withdrawal fee.
+    FeeUnaffordable,
+    Offline,
+    /// Within the online grace period.
+    GracePeriod,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -252,7 +296,11 @@ pub struct RefillPreview {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReceiveMethod {
-    Lightning { amount: Amount },
+    Lightning {
+        amount: Amount,
+        description: String,
+        expiry_secs: u32,
+    },
     OnChain,
 }
 
@@ -267,6 +315,8 @@ pub struct ReceiveRequest {
 pub struct ReceiveInfo {
     pub payload: String,
     pub uri: String,
+    /// When an invoice stops being payable; addresses do not expire.
+    pub expires_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

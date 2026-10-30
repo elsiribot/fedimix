@@ -25,6 +25,7 @@ for p in $funded_pages; do add funded "$p"; done
 for p in spending refill refill-expanded; do add below-target "$p"; done
 for p in saving spending setup-saving; do add no-saving "$p"; done
 add offline spending
+for p in spending moving; do add exit-deferred "$p"; done
 add first-run start
 add first-run join
 

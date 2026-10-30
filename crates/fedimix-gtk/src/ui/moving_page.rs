@@ -155,7 +155,7 @@ impl Inner {
             .icon_name("view-more-symbolic")
             .menu_model(&menu)
             .valign(gtk::Align::Center)
-            .sensitive(!waiting)
+            .sensitive(!waiting && present::exit_allowed(&item.status))
             .tooltip_text("Item actions")
             .build();
         button.add_css_class("flat");
