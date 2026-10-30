@@ -7,6 +7,9 @@ type "Target (BTC)" 0.1
 click Back
 click Spending
 expect 0.05 of 0.1 target
+# Below target, the queue stays reachable next to Refill.
+expect Refill from Saving
+expect 0.42 moving to Saving
 shot after-change
 action app.settings
 expect Target (BTC)

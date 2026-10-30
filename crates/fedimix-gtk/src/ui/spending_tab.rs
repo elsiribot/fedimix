@@ -227,9 +227,10 @@ impl Inner {
         let caption = present::spending_caption(s);
         self.bar.set_value(caption.fraction);
         self.caption.set_label(&caption.text);
-        self.caption.set_visible(!caption.opens_queue);
-        self.caption_link.set_label(&caption.text);
-        self.caption_link.set_visible(caption.opens_queue);
+        self.caption.set_visible(!caption.text.is_empty());
+        self.caption_link
+            .set_label(caption.queue_link.as_deref().unwrap_or(""));
+        self.caption_link.set_visible(caption.queue_link.is_some());
         self.refill.set_visible(caption.shows_refill);
 
         let now = widgets::now();

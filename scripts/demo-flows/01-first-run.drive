@@ -6,7 +6,9 @@ click Join
 expect Fedi Alpha
 shot tabs
 click Spending
-expect Refill from Saving
+# Refill needs Saving: not offered until it exists.
+expect 0 of 0.05 target
+expect-not Refill from Saving
 shot spending
 click Saving
 shot saving
@@ -16,3 +18,5 @@ shot setup-dialog
 click Set up
 expect Saving is set up
 shot saving-ready
+click Spending
+expect Refill from Saving

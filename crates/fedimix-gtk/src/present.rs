@@ -9,8 +9,10 @@ const CHEVRON: &str = "\u{203a}";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Caption {
+    /// Plain caption; empty when the link says it all.
     pub text: String,
-    pub opens_queue: bool,
+    /// Link to the Moving to Saving page.
+    pub queue_link: Option<String>,
     pub shows_refill: bool,
     /// Bar fill, always within 0..=1.
     pub fraction: f64,
@@ -50,34 +52,47 @@ fn fraction(num: u64, den: u64) -> f64 {
 
 pub fn spending_caption(s: &SpendingState) -> Caption {
     let spend = format::btc_short(s.for_spending);
+    let moving = format::btc_short(s.moving);
+    let is_moving = s.moving > Amount::ZERO;
+    let moving_link = format!("{moving} moving to Saving {CHEVRON}");
+    let waiting = format!("{moving} waiting for Saving");
     if s.for_spending < s.target {
+        let target = format!("{spend} of {} target", format::btc_short(s.target));
         return Caption {
-            text: format!("{spend} of {} target", format::btc_short(s.target)),
-            opens_queue: false,
-            shows_refill: true,
+            text: if is_moving && !s.saving_ready {
+                format!("{target} {DOT} {waiting}")
+            } else {
+                target
+            },
+            queue_link: (is_moving && s.saving_ready).then_some(moving_link),
+            shows_refill: s.saving_ready,
             fraction: fraction(s.for_spending.msat, s.target.msat),
         };
     }
-    if s.moving == Amount::ZERO {
+    if !is_moving {
         return Caption {
             text: format!("{spend} for spending"),
-            opens_queue: false,
+            queue_link: None,
             shows_refill: false,
             fraction: 1.0,
         };
     }
-    let moving = format::btc_short(s.moving);
     let total = s.for_spending.msat.saturating_add(s.moving.msat);
-    let (tail, opens_queue) = if s.saving_ready {
-        (format!("{moving} moving to Saving {CHEVRON}"), true)
+    let fraction = fraction(s.for_spending.msat, total);
+    if s.saving_ready {
+        Caption {
+            text: String::new(),
+            queue_link: Some(format!("{spend} for spending {DOT} {moving_link}")),
+            shows_refill: false,
+            fraction,
+        }
     } else {
-        (format!("{moving} waiting for Saving"), false)
-    };
-    Caption {
-        text: format!("{spend} for spending {DOT} {tail}"),
-        opens_queue,
-        shows_refill: false,
-        fraction: fraction(s.for_spending.msat, total),
+        Caption {
+            text: format!("{spend} for spending {DOT} {waiting}"),
+            queue_link: None,
+            shows_refill: false,
+            fraction,
+        }
     }
 }
 
@@ -499,11 +514,12 @@ mod tests {
     #[test]
     fn caption_above_target() {
         let c = spending_caption(&spending(0.05, 0.42, 0.05, true));
+        assert_eq!(c.text, "");
         assert_eq!(
-            c.text,
-            "0.05 for spending \u{b7} 0.42 moving to Saving \u{203a}"
+            c.queue_link.as_deref(),
+            Some("0.05 for spending \u{b7} 0.42 moving to Saving \u{203a}")
         );
-        assert!(c.opens_queue && !c.shows_refill);
+        assert!(!c.shows_refill);
         assert!((c.fraction - 0.106).abs() < 0.001);
     }
 
@@ -511,15 +527,38 @@ mod tests {
     fn caption_below_target() {
         let c = spending_caption(&spending(0.0112, 0.0, 0.05, true));
         assert_eq!(c.text, "0.0112 of 0.05 target");
-        assert!(c.shows_refill && !c.opens_queue);
+        assert_eq!(c.queue_link, None);
+        assert!(c.shows_refill);
         assert!((c.fraction - 0.224).abs() < 0.001);
+    }
+
+    #[test]
+    fn caption_below_target_keeps_the_queue() {
+        let c = spending_caption(&spending(0.05, 0.3, 5.0, true));
+        assert_eq!(c.text, "0.05 of 5 target");
+        assert_eq!(
+            c.queue_link.as_deref(),
+            Some("0.3 moving to Saving \u{203a}")
+        );
+        assert!(c.shows_refill);
+    }
+
+    #[test]
+    fn no_refill_without_saving() {
+        let c = spending_caption(&spending(0.01, 0.0, 0.05, false));
+        assert_eq!(c.text, "0.01 of 0.05 target");
+        assert!(!c.shows_refill);
+        let c = spending_caption(&spending(0.01, 0.2, 0.05, false));
+        assert_eq!(c.text, "0.01 of 0.05 target \u{b7} 0.2 waiting for Saving");
+        assert_eq!(c.queue_link, None);
+        assert!(!c.shows_refill);
     }
 
     #[test]
     fn caption_waiting_for_saving() {
         let c = spending_caption(&spending(0.05, 0.42, 0.05, false));
         assert_eq!(c.text, "0.05 for spending \u{b7} 0.42 waiting for Saving");
-        assert!(!c.opens_queue);
+        assert_eq!(c.queue_link, None);
     }
 
     #[test]
@@ -966,7 +1005,7 @@ mod tests {
         let events = core.subscribe();
         let sp = core.spending_state().await.unwrap();
         let caption = spending_caption(&sp);
-        assert!(caption.opens_queue && !caption.shows_refill);
+        assert!(caption.queue_link.is_some() && !caption.shows_refill);
         let saving = core.saving_state().await.unwrap();
         assert!(in_flight_line(&saving).is_some());
         let preview = core
@@ -1008,7 +1047,10 @@ mod tests {
         let sp = core.spending_state().await.unwrap();
         let caption = spending_caption(&sp);
         assert!(!caption.shows_refill);
-        assert!(caption.text.contains("for spending"), "{}", caption.text);
+        assert!(
+            caption.queue_link.unwrap().contains("for spending"),
+            "overshoot joined the queue"
+        );
         assert_eq!(visible_history(&sp.history, false).len(), sp.history.len());
     }
 }
