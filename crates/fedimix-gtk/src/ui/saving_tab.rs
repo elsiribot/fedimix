@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use fedimix_core::{SavingState, WalletKind};
@@ -10,7 +9,7 @@ use fedimix_core::{SavingState, WalletKind};
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::widgets;
+use crate::ui::{coins_page, widgets};
 
 struct Inner {
     pages: gtk::Stack,
@@ -25,13 +24,6 @@ struct Inner {
 #[derive(Clone)]
 pub struct SavingTab {
     root: gtk::ScrolledWindow,
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
 }
 
 impl SavingTab {
@@ -51,8 +43,7 @@ impl SavingTab {
         let balance = widgets::amount_button("hero-balance");
         balance.connect_clicked({
             let ctx = ctx.clone();
-            // Task 7 provides ui::coins_page::push(ctx).
-            move || ctx.toast("Not available yet")
+            move || coins_page::push(&ctx)
         });
 
         let in_flight = gtk::Button::builder().halign(gtk::Align::Center).build();
@@ -165,7 +156,7 @@ impl Inner {
                     }
                     None => self.in_flight.set_visible(false),
                 }
-                let now = now();
+                let now = widgets::now();
                 let rows: Vec<_> = saving
                     .history
                     .iter()

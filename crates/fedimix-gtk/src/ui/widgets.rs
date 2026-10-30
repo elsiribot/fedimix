@@ -1,5 +1,7 @@
 //! Small shared widgets used by the Saving and Spending tabs.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use adw::prelude::*;
 use fedimix_core::WalletKind;
 
@@ -82,4 +84,12 @@ pub fn send_receive_row(ctx: &AppContext, _wallet: WalletKind) -> gtk::Box {
     row.append(&send);
     row.append(&receive);
     row
+}
+
+/// Current Unix time in seconds.
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }

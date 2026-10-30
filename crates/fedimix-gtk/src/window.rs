@@ -5,8 +5,11 @@ use adw::prelude::*;
 use gtk::gio;
 
 use crate::bridge::CoreBridge;
-use crate::ui::app_state::AppContext;
+use crate::cli::StartPage;
+use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::saving_tab::SavingTab;
+use crate::ui::spending_tab::SpendingTab;
+use crate::ui::{coin_detail, coins_page, notes_page};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -28,16 +31,8 @@ fn load_css() {
     }
 }
 
-fn placeholder(title: &str, icon: &str) -> adw::StatusPage {
-    adw::StatusPage::builder()
-        .title(title)
-        .icon_name(icon)
-        .vexpand(true)
-        .build()
-}
-
 impl FedimixWindow {
-    pub fn new(app: &adw::Application, bridge: CoreBridge) -> Self {
+    pub fn new(app: &adw::Application, bridge: CoreBridge, start_page: Option<StartPage>) -> Self {
         load_css();
 
         let stack = adw::ViewStack::new();
@@ -48,8 +43,9 @@ impl FedimixWindow {
             "Saving",
             "security-high-symbolic",
         );
+        let spending_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         stack.add_titled_with_icon(
-            &placeholder("Spending", "emblem-system-symbolic"),
+            &spending_slot,
             Some("spending"),
             "Spending",
             "emblem-system-symbolic",
@@ -66,7 +62,7 @@ impl FedimixWindow {
         menu.append(Some("About"), Some("app.about"));
         menu.append(Some("Quit"), Some("app.quit"));
         let menu_button = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
+            .icon_name("view-more-symbolic")
             .menu_model(&menu)
             .build();
 
@@ -104,12 +100,15 @@ impl FedimixWindow {
         breakpoint.add_setter(&header_switcher, "visible", Some(&false.to_value()));
         window.add_breakpoint(breakpoint);
 
-        let ctx = AppContext::new(bridge, toasts, nav, stack);
-        let saving_tab = SavingTab::new(Rc::new(ctx.clone()));
+        let ctx = Rc::new(AppContext::new(bridge, toasts, nav, stack));
+        let saving_tab = SavingTab::new(ctx.clone());
         saving_tab.widget().set_vexpand(true);
         saving_slot.append(saving_tab.widget());
+        let spending_tab = SpendingTab::new(ctx.clone());
+        spending_tab.widget().set_vexpand(true);
+        spending_slot.append(spending_tab.widget());
         Self::install_actions(app, &ctx);
-        Self::wire_state(&ctx);
+        Self::wire_state(&ctx, start_page);
         ctx.refresh();
 
         Self { window }
@@ -135,24 +134,43 @@ impl FedimixWindow {
         app.add_action_entries([quit, settings, about]);
     }
 
-    fn wire_state(ctx: &AppContext) {
-        // Pick the initial tab once, from the first snapshot: Saving unless
-        // no Saving device exists.
+    /// Pick the initial tab and `--demo-page` page from the first snapshot.
+    /// Later tasks add their own pages here.
+    fn apply_start_page(ctx: &Rc<AppContext>, page: Option<StartPage>, s: &Snapshots) {
+        let default_tab = if s.saving.device.is_some() {
+            "saving"
+        } else {
+            "spending"
+        };
+        let tab = match page {
+            // Forced so the Saving empty state can be screenshotted.
+            Some(StartPage::Saving) => "saving",
+            Some(StartPage::Spending) => "spending",
+            _ => default_tab,
+        };
+        ctx.stack.set_visible_child_name(tab);
+        match page {
+            Some(StartPage::Coins) => coins_page::push(ctx),
+            Some(StartPage::CoinDetail) => {
+                if let Some(coin) = s.saving.coins.first() {
+                    coin_detail::push(ctx, coin.clone());
+                }
+            }
+            Some(StartPage::Notes) => notes_page::push(ctx),
+            _ => {}
+        }
+    }
+
+    fn wire_state(ctx: &Rc<AppContext>, start_page: Option<StartPage>) {
         let picked = Rc::new(Cell::new(false));
-        let stack = ctx.stack.downgrade();
-        ctx.on_snapshots(move |s| {
-            if picked.replace(true) {
-                return false;
+        ctx.on_snapshots({
+            let ctx = ctx.clone();
+            move |s| {
+                if !picked.replace(true) {
+                    Self::apply_start_page(&ctx, start_page, s);
+                }
+                false
             }
-            if let Some(stack) = stack.upgrade() {
-                let name = if s.saving.device.is_some() {
-                    "saving"
-                } else {
-                    "spending"
-                };
-                stack.set_visible_child_name(name);
-            }
-            false
         });
 
         // Any backend event invalidates the snapshots.

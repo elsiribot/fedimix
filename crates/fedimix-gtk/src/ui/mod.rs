@@ -1,4 +1,8 @@
 pub mod app_state;
+pub mod coin_detail;
+pub mod coins_page;
 pub mod history_list;
+pub mod notes_page;
 pub mod saving_tab;
+pub mod spending_tab;
 pub mod widgets;

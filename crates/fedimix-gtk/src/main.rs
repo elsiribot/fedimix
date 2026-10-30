@@ -28,7 +28,7 @@ fn main() -> gtk::glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     let bridge = bridge::CoreBridge::start(DemoBackend::new(args.scenario));
     app.connect_activate(move |app| {
-        window::FedimixWindow::new(app, bridge.clone()).present();
+        window::FedimixWindow::new(app, bridge.clone(), args.page).present();
     });
 
     app.run_with_args::<&str>(&[])
