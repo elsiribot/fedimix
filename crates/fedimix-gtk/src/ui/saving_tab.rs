@@ -146,7 +146,7 @@ impl Inner {
             None => self.pages.set_visible_child_name("empty"),
             Some(device) => {
                 self.pages.set_visible_child_name("content");
-                self.device_label.set_label(&device.name);
+                self.device_label.set_label(&present::device_line(device));
                 self.balance.set_amount(&crate::format::btc(saving.balance));
                 match present::in_flight_line(saving) {
                     Some(line) => {

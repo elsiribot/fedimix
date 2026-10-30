@@ -60,6 +60,10 @@ pub enum DemoScenario {
     Offline,
     /// Spending too low for exit fees, every queue deferral and history status.
     ExitDeferred,
+    /// Below target with a queue, and names far longer than any screen.
+    LongNames,
+    /// Saving set up, its device unplugged.
+    DeviceDisconnected,
     /// Funded, with previews that expire within a second.
     PreviewExpiry,
     /// Funded, with a device that refuses to sign and to set up.
@@ -97,10 +101,12 @@ impl FromStr for DemoScenario {
             "first-run" => Ok(Self::FirstRun),
             "offline" => Ok(Self::Offline),
             "exit-deferred" => Ok(Self::ExitDeferred),
+            "long-names" => Ok(Self::LongNames),
+            "device-disconnected" => Ok(Self::DeviceDisconnected),
             "preview-expiry" => Ok(Self::PreviewExpiry),
             "device-rejects" => Ok(Self::DeviceRejects),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, preview-expiry, device-rejects)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects)"
             )),
         }
     }
@@ -116,6 +122,8 @@ fn broadcast(senders: &Senders, event: &Event) {
 
 struct State {
     device: Option<DeviceInfo>,
+    detected: Vec<DeviceInfo>,
+    suggested: Vec<SuggestedFederation>,
     in_flight: Amount,
     coins: Vec<Coin>,
     saving_history: Vec<HistoryItem>,
@@ -297,6 +305,8 @@ impl State {
         let f = fixtures::fixture(scenario);
         State {
             device: f.device,
+            detected: f.detected,
+            suggested: f.suggested,
             in_flight: f.in_flight,
             coins: f.coins,
             saving_history: f.saving_history,
@@ -805,7 +815,7 @@ impl Backend for DemoBackend {
     }
 
     async fn suggested_federations(&self) -> Result<Vec<SuggestedFederation>> {
-        Ok(fixtures::suggested())
+        Ok(self.state.lock().await.suggested.clone())
     }
 
     async fn join_federation(&self, invite: String) -> Result<FederationInfo> {
@@ -840,14 +850,21 @@ impl Backend for DemoBackend {
     }
 
     async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
-        Ok(vec![fixtures::device()])
+        Ok(self.state.lock().await.detected.clone())
     }
 
     async fn setup_saving(&self, device_id: String) -> Result<()> {
-        let device = fixtures::device();
-        if device.id != device_id {
+        let Some(device) = self
+            .state
+            .lock()
+            .await
+            .detected
+            .iter()
+            .find(|d| d.id == device_id)
+            .cloned()
+        else {
             return Err(FedimixError::UnknownItem(device_id));
-        }
+        };
         if self.rejects {
             return Err(FedimixError::DeviceRejected);
         }
@@ -1162,13 +1179,15 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 8] = [
+    const ALL: [DemoScenario; 10] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
         DemoScenario::FirstRun,
         DemoScenario::Offline,
         DemoScenario::ExitDeferred,
+        DemoScenario::LongNames,
+        DemoScenario::DeviceDisconnected,
         DemoScenario::PreviewExpiry,
         DemoScenario::DeviceRejects,
     ];

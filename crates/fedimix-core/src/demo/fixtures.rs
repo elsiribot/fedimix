@@ -12,6 +12,11 @@ pub const FEDERATION_NAME: &str = "Fedi Alpha";
 pub const FEDERATION_ID: &str = "demo-fed-alpha";
 pub const DEVICE_NAME: &str = "Ledger Nano S+";
 pub const DEVICE_ID: &str = "demo-ledger-0";
+/// Wraps only where a line must break: no spaces for most of its length.
+const LONG_FEDERATION: &str = "The-Extraordinarily-Long-Named-Community-Mutual-Aid-Federation \
+of the Greater Metropolitan Area and All of Its Surrounding Districts";
+const LONG_DEVICE: &str = "Ledger Nano S Plus Limited Anniversary Edition Hardware Wallet \
+With An Unreasonably Long Display Name";
 
 pub fn btc(v: f64) -> Amount {
     Amount::from_sat((v * 1e8).round() as u64)
@@ -19,6 +24,9 @@ pub fn btc(v: f64) -> Amount {
 
 pub struct Fixture {
     pub device: Option<DeviceInfo>,
+    /// What `detect_devices` finds.
+    pub detected: Vec<DeviceInfo>,
+    pub suggested: Vec<SuggestedFederation>,
     pub in_flight: Amount,
     pub coins: Vec<Coin>,
     pub saving_history: Vec<HistoryItem>,
@@ -300,9 +308,41 @@ fn exit_deferred() -> Fixture {
     }
 }
 
+fn long_names() -> Fixture {
+    let device = DeviceInfo {
+        name: LONG_DEVICE.to_string(),
+        ..device()
+    };
+    let coins = funded_coins()
+        .into_iter()
+        .map(|c| Coin {
+            source_federation: c.source_federation.map(|_| LONG_FEDERATION.to_string()),
+            ..c
+        })
+        .collect();
+    Fixture {
+        device: Some(device.clone()),
+        detected: vec![device],
+        suggested: vec![SuggestedFederation {
+            name: LONG_FEDERATION.to_string(),
+            invite: "fed1demolong".to_string(),
+        }],
+        coins,
+        federation: Some(FederationInfo {
+            name: LONG_FEDERATION.to_string(),
+            ..federation(true)
+        }),
+        spending_balance: btc(0.43),
+        for_spending: btc(0.01),
+        ..funded()
+    }
+}
+
 fn funded() -> Fixture {
     Fixture {
         device: Some(device()),
+        detected: vec![device()],
+        suggested: suggested(),
         in_flight: btc(0.42),
         coins: funded_coins(),
         saving_history: funded_saving_history(),
@@ -370,6 +410,8 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
         },
         DemoScenario::FirstRun => Fixture {
             device: None,
+            detected: vec![device()],
+            suggested: suggested(),
             in_flight: Amount::ZERO,
             coins: Vec::new(),
             saving_history: Vec::new(),
@@ -394,6 +436,15 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
             ..funded()
         },
         DemoScenario::ExitDeferred => exit_deferred(),
+        DemoScenario::LongNames => long_names(),
+        DemoScenario::DeviceDisconnected => Fixture {
+            device: Some(DeviceInfo {
+                connected: false,
+                ..device()
+            }),
+            detected: Vec::new(),
+            ..funded()
+        },
     }
 }
 

@@ -32,7 +32,10 @@ cargo run -p fedimix-gtk -- --demo --demo-scenario below-target --demo-page refi
 
 Scenarios (`--demo-scenario`): `funded` (default), `below-target`,
 `no-saving`, `first-run` (Join page, no federation), `offline`,
-`exit-deferred` (Spending too low for exit fees, every queue and history status).
+`exit-deferred` (Spending too low for exit fees, every queue and history
+status), `long-names` (below target with a queue, oversized names),
+`device-disconnected` (Saving set up, device unplugged), `preview-expiry`
+(previews expire within a second), `device-rejects` (the device refuses).
 
 Pages (`--demo-page`): `saving`, `spending`, `coins`, `coin-detail`, `moving`,
 `notes`, `send`, `send-review`, `receive`, `refill`, `refill-expanded`, `join`,

@@ -1,0 +1,20 @@
+# scenario: long-names
+# size: 360x640
+# Very long names at the narrowest width, through the pages that show them.
+expect Ledger Nano S Plus
+shot saving
+click Send
+type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
+type "Amount (BTC)" 0.0123
+click Review
+expect Network fee
+shot review
+close-dialog
+click Spending
+expect The-Extraordinarily
+expect 0.01 of 0.05 target
+expect 0.42 moving to Saving
+shot spending
+click Refill from Saving
+expect Refill Spending
+shot refill

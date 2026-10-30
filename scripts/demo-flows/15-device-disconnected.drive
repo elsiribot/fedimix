@@ -1,0 +1,18 @@
+# scenario: device-disconnected
+# An unplugged device is named as such; signing waits for it, exits do not.
+expect Ledger Nano S+ · Not connected
+shot saving
+click Send
+type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
+type "Amount (BTC)" 0.0123
+click Review
+expect Connect your Ledger Nano S+
+expect-not Confirm on Ledger Nano S+
+shot review
+close-dialog
+click Spending
+click 0.05 for spending · 0.42 moving to Saving ›
+click Item actions
+click Exit now (lower privacy)
+click Exit now
+expect Moved to Saving

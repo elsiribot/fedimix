@@ -105,6 +105,16 @@ pub fn saving_banner(s: &SpendingState) -> Option<String> {
     })
 }
 
+/// Saving tab status line. An unplugged device stays named, so the user
+/// knows what to reach for.
+pub fn device_line(d: &DeviceInfo) -> String {
+    if d.connected {
+        d.name.clone()
+    } else {
+        format!("{} {DOT} Not connected", d.name)
+    }
+}
+
 pub fn in_flight_line(s: &SavingState) -> Option<String> {
     (s.in_flight > Amount::ZERO)
         .then(|| format!("+{} depositing {CHEVRON}", format::btc(s.in_flight)))
@@ -651,6 +661,19 @@ mod tests {
         );
         assert_eq!(saving_banner(&spending(0.05, 0.42, 0.05, true)), None);
         assert_eq!(saving_banner(&spending(0.05, 0.0, 0.05, false)), None);
+    }
+
+    #[test]
+    fn device_line_says_when_unplugged() {
+        let mut d = DeviceInfo {
+            id: "c".into(),
+            name: "Coldcard".into(),
+            kind: fedimix_core::DeviceKind::Coldcard,
+            connected: true,
+        };
+        assert_eq!(device_line(&d), "Coldcard");
+        d.connected = false;
+        assert_eq!(device_line(&d), "Coldcard \u{b7} Not connected");
     }
 
     #[test]

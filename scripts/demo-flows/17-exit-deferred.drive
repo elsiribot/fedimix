@@ -1,0 +1,15 @@
+# scenario: exit-deferred
+# Exits Spending cannot pay for: the hint, the reasons, and what Exit now allows.
+click Spending
+expect 1 exit waits until Spending can pay its fee
+expect pending
+expect refunded
+expect expired
+shot spending
+click 0.1 moving to Saving ›
+expect Spending cannot pay the fee
+expect waiting for lower fees
+expect waiting after reconnect
+expect waiting to reconnect
+expect withdrawing
+shot moving
