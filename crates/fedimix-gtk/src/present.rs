@@ -272,6 +272,17 @@ pub fn confirm_button(
     }
 }
 
+/// Refill dialog note about the overshoot; empty when there is none.
+pub fn refill_overshoot_note(overshoot: Amount) -> String {
+    if overshoot == Amount::ZERO {
+        return String::new();
+    }
+    format!(
+        "No change output. {} above target rejoins the exit queue.",
+        format::btc_plain(overshoot)
+    )
+}
+
 pub fn visible_history(items: &[HistoryItem], show_cover: bool) -> Vec<HistoryItem> {
     items
         .iter()
@@ -595,5 +606,14 @@ mod tests {
         assert!(send_validation("bc1qxyz", "0", true).is_err());
         assert!(send_validation("bc1qxyz", "", false).is_ok());
         assert!(send_validation("bc1qxyz", "0.1", true).is_ok());
+    }
+
+    #[test]
+    fn refill_overshoot_note_text() {
+        assert_eq!(
+            refill_overshoot_note(sat(2_120_000)),
+            "No change output. 0.0212 above target rejoins the exit queue."
+        );
+        assert_eq!(refill_overshoot_note(Amount::ZERO), "");
     }
 }

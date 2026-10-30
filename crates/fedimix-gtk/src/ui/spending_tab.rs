@@ -9,7 +9,7 @@ use fedimix_core::{SpendingState, WalletKind};
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::{moving_page, notes_page, widgets};
+use crate::ui::{moving_page, notes_page, refill_dialog, widgets};
 
 struct Inner {
     offline: adw::Banner,
@@ -86,8 +86,7 @@ impl SpendingTab {
         refill.set_halign(gtk::Align::Center);
         refill.connect_clicked({
             let ctx = ctx.clone();
-            // Task 10 provides ui::refill_dialog::open(ctx).
-            move |_| ctx.toast("Not available yet")
+            move |_| refill_dialog::open(&ctx, false)
         });
 
         let hero = widgets::hero_box();
