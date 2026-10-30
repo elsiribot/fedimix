@@ -115,7 +115,7 @@ fn device_row(ctx: &Rc<AppContext>, dialog: &adw::Dialog, device: &DeviceInfo) -
                         if let Some(button) = button.upgrade() {
                             button.set_sensitive(true);
                         }
-                        ctx2.toast(&e.to_string());
+                        ctx2.toast(&crate::present::user_message(&e));
                     }
                 },
             );

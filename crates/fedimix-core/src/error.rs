@@ -21,6 +21,12 @@ pub enum FedimixError {
     Offline,
     #[error("not set up: {0}")]
     NotSetUp(String),
+    #[error("preview expired")]
+    PreviewExpired,
+    #[error("device rejected the transaction")]
+    DeviceRejected,
+    #[error("cancelled")]
+    Cancelled,
     #[error("internal error: {0}")]
     Internal(String),
 }

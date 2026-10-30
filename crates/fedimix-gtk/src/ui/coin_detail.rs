@@ -83,7 +83,7 @@ pub fn push(ctx: &Rc<AppContext>, coin: Coin) {
                 async move { core.set_coin_frozen(outpoint, frozen).await },
                 move |res| {
                     if let Err(e) = res {
-                        ctx2.toast(&e.to_string());
+                        ctx2.toast(&crate::present::user_message(&e));
                         if let Some(inner) = weak.upgrade() {
                             inner.set_frozen(!frozen);
                         }

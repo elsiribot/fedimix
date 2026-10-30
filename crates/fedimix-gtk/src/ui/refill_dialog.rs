@@ -19,7 +19,7 @@ pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
             let ctx = ctx.clone();
             move |res| match res {
                 Ok(preview) => show(&ctx, preview, expanded),
-                Err(e) => ctx.toast(&crate::present::refill_error_message(&e)),
+                Err(e) => ctx.toast(&present::user_message(&e)),
             }
         });
 }
@@ -155,7 +155,7 @@ fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {
                 .call(async move { core.confirm_refill(id).await }, move |res| {
                     match res {
                         Ok(()) => done.toast("Refill confirmed"),
-                        Err(e) => done.toast(&e.to_string()),
+                        Err(e) => done.toast(&present::user_message(&e)),
                     }
                     done.refresh();
                 });

@@ -6,6 +6,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use fedimix_core::FedimixError;
 
+use crate::present;
 use crate::ui::app_state::AppContext;
 
 type JoinedCallback = Box<dyn Fn()>;
@@ -191,13 +192,13 @@ impl Inner {
                                 f();
                             }
                         }
-                        Err(FedimixError::InvalidInvite(why)) => {
-                            inner.show_error(&format!("Invalid invite code: {why}"));
+                        Err(e @ FedimixError::InvalidInvite(_)) => {
+                            inner.show_error(&present::user_message(e));
                         }
-                        Err(e) => ctx.toast(&e.to_string()),
+                        Err(e) => ctx.toast(&present::user_message(e)),
                     }
                 } else if let Err(e) = &res {
-                    ctx.toast(&e.to_string());
+                    ctx.toast(&present::user_message(e));
                 }
                 if res.is_ok() {
                     ctx.refresh();

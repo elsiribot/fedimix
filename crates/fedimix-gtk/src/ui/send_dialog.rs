@@ -211,7 +211,7 @@ fn build(
                             Ok(preview) => {
                                 nav.push(&review_page(&ctx, &dialog, preview));
                             }
-                            Err(e) => set_error(&error, Some(&present::send_error_message(&e))),
+                            Err(e) => set_error(&error, Some(&present::user_message(&e))),
                         }
                     }
                 ),
@@ -386,7 +386,7 @@ fn review_page(
                             spinner.stop();
                             spinner.set_visible(false);
                             button.set_sensitive(true);
-                            set_error(&error, Some(&present::send_error_message(&e)));
+                            set_error(&error, Some(&present::user_message(&e)));
                         }
                     }
                 ),

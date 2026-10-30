@@ -6,6 +6,7 @@ use adw::prelude::*;
 use fedimix_core::{Amount, ReceiveInfo, ReceiveMethod, ReceiveRequest, WalletKind, parse_btc};
 use gtk::glib;
 
+use crate::present::user_message;
 use crate::ui::app_state::AppContext;
 use crate::ui::qr;
 
@@ -143,7 +144,8 @@ fn load_address(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
             view,
             move |res| match res {
                 Ok(info) => view.show(&info),
-                Err(e) => view.show_status(&format!("Could not get an address: {e}")),
+                Err(e) =>
+                    view.show_status(&format!("Could not get an address. {}", user_message(&e))),
             }
         ),
     );
@@ -211,7 +213,10 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
                         button.set_sensitive(true);
                         match res {
                             Ok(info) => view.show(&info),
-                            Err(e) => view.show_status(&format!("Could not create invoice: {e}")),
+                            Err(e) => view.show_status(&format!(
+                                "Could not create invoice. {}",
+                                user_message(&e)
+                            )),
                         }
                     }
                 ),

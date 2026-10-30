@@ -189,7 +189,7 @@ fn confirm_exit(ctx: &Rc<AppContext>, id: String) {
             ctx.bridge
                 .call(async move { core.exit_now(id).await }, move |res| {
                     if let Err(e) = res {
-                        done.toast(&present::exit_error_message(&e));
+                        done.toast(&present::user_message(&e));
                     }
                     done.refresh();
                 });

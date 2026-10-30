@@ -7,6 +7,7 @@ use std::rc::Rc;
 use fedimix_core::{QueueState, SavingState, SpendingState};
 
 use crate::bridge::CoreBridge;
+use crate::present::user_message;
 
 #[derive(Debug, Clone)]
 pub struct Snapshots {
@@ -99,7 +100,10 @@ impl AppContext {
             },
             move |res| match res {
                 Ok(snapshots) => ctx.apply(seq, snapshots),
-                Err(e) => ctx.toast(&format!("Could not load wallet state: {e}")),
+                Err(e) => ctx.toast(&format!(
+                    "Could not load wallet state. {}",
+                    user_message(&e)
+                )),
             },
         );
     }
@@ -135,7 +139,7 @@ impl AppContext {
         let ctx = self.clone();
         self.bridge.call(fut, move |res| match res {
             Ok(v) => on_ok(v),
-            Err(e) => ctx.toast(&e.to_string()),
+            Err(e) => ctx.toast(&user_message(&e)),
         });
     }
 }

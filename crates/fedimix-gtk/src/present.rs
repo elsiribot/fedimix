@@ -202,26 +202,22 @@ pub fn queue_summary(q: &QueueState) -> String {
     )
 }
 
-/// Toast text for a failed "Exit now".
-pub fn exit_error_message(e: &fedimix_core::FedimixError) -> String {
-    match e {
-        fedimix_core::FedimixError::UnknownItem(_) => "This item has already left".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// Inline text for a failed `prepare_send` / `confirm_send`.
-pub fn send_error_message(e: &fedimix_core::FedimixError) -> String {
+/// The text shown to the user for any core error.
+pub fn user_message(e: &fedimix_core::FedimixError) -> String {
     use fedimix_core::FedimixError as E;
     match e {
-        E::InvalidDestination(why) | E::InvalidAmount(why) => why.clone(),
-        E::InsufficientFunds { available, needed } => format!(
-            "Not enough funds: {} available, {} needed including the fee",
-            format::btc(*available),
-            format::btc(*needed)
-        ),
+        E::InvalidDestination(why) | E::InvalidAmount(why) | E::NotSetUp(why) => why.clone(),
+        E::InsufficientFunds { available, needed } => {
+            format!("Not enough funds: {available} available, {needed} needed including the fee")
+        }
+        E::InvalidInvite(why) => format!("Invalid invite code: {why}"),
+        E::UnknownItem(_) => "This item is no longer available".to_string(),
+        E::DeviceNotConnected(device) => format!("Connect your {device}"),
         E::Offline => "You are offline. Reconnect and try again".to_string(),
-        other => other.to_string(),
+        E::PreviewExpired => "This review expired. Check the details and try again".to_string(),
+        E::DeviceRejected => "The device rejected the transaction".to_string(),
+        E::Cancelled => "Cancelled".to_string(),
+        E::Internal(why) => format!("Something went wrong: {why}"),
     }
 }
 
@@ -236,7 +232,7 @@ pub fn send_amount(wallet: WalletKind, dest: &str, amount: &str) -> Result<SendA
     if dest.trim().is_empty() {
         return Err("Enter a destination".to_string());
     }
-    let parsed = parse_destination(dest).map_err(|e| send_error_message(&e))?;
+    let parsed = parse_destination(dest).map_err(|e| user_message(&e))?;
     if wallet == WalletKind::Saving && parsed.kind == DestinationKind::Lightning {
         return Err("Saving can only send to a bitcoin address".to_string());
     }
@@ -246,7 +242,7 @@ pub fn send_amount(wallet: WalletKind, dest: &str, amount: &str) -> Result<SendA
     if amount.trim().eq_ignore_ascii_case("max") {
         return Ok(SendAmount::Max);
     }
-    match parse_btc(amount).map_err(|e| send_error_message(&e))? {
+    match parse_btc(amount).map_err(|e| user_message(&e))? {
         Amount::ZERO => Err("Amount must be greater than zero".to_string()),
         a => Ok(SendAmount::Exact(a)),
     }
@@ -291,14 +287,6 @@ pub fn confirm_button(
         Some(d) if d.connected => (format!("Confirm on {}", d.name), true),
         Some(d) => (format!("Connect your {}", d.name), false),
         None => ("Connect your device".to_string(), false),
-    }
-}
-
-/// Toast text for a failed `prepare_refill`.
-pub fn refill_error_message(e: &fedimix_core::FedimixError) -> String {
-    match e {
-        fedimix_core::FedimixError::InvalidAmount(why) => why.clone(),
-        other => other.to_string(),
     }
 }
 
@@ -351,7 +339,7 @@ pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
     }
     let proxy = form.proxy.trim();
     Ok(Settings {
-        spending_target: parse_btc(form.target_btc).map_err(|e| send_error_message(&e))?,
+        spending_target: parse_btc(form.target_btc).map_err(|e| user_message(&e))?,
         anonymity_target: in_range("Anonymity target", form.anonymity_target, 1.0, 1000.0)? as u32,
         min_time_in_pool_secs: in_range("Minimum hours", form.min_hours, 0.0, 720.0)? * 3600,
         online_grace_secs: in_range("Grace minutes", form.grace_minutes, 0.0, 120.0)? * 60,
@@ -516,18 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_error_message_for_gone_item() {
-        assert_eq!(
-            exit_error_message(&fedimix_core::FedimixError::UnknownItem("x".into())),
-            "This item has already left"
-        );
-        assert_eq!(
-            exit_error_message(&fedimix_core::FedimixError::Offline),
-            "offline"
-        );
-    }
-
-    #[test]
     fn queue_summary_text() {
         let q = QueueState {
             total: btc(0.42),
@@ -603,27 +579,50 @@ mod tests {
     }
 
     #[test]
-    fn send_error_messages() {
+    fn user_messages_are_sentences_without_debug_text() {
         use fedimix_core::FedimixError as E;
-        assert_eq!(
-            send_error_message(&E::InvalidDestination("Nope".into())),
-            "Nope"
-        );
-        assert_eq!(
-            send_error_message(&E::InvalidAmount("Too low".into())),
-            "Too low"
-        );
-        assert_eq!(
-            send_error_message(&E::InsufficientFunds {
-                available: btc(0.46),
-                needed: btc(0.47),
-            }),
-            "Not enough funds: 0.4600 BTC available, 0.4700 BTC needed including the fee"
-        );
-        assert_eq!(
-            send_error_message(&E::Offline),
-            "You are offline. Reconnect and try again"
-        );
+        let cases = [
+            (E::InvalidDestination("Nope".into()), "Nope"),
+            (E::InvalidAmount("Too low".into()), "Too low"),
+            (
+                E::InsufficientFunds {
+                    available: btc(0.46),
+                    needed: sat(47_000_420),
+                },
+                "Not enough funds: 0.46 BTC available, 0.4700042 BTC needed including the fee",
+            ),
+            (
+                E::InsufficientFunds {
+                    available: sat(200),
+                    needed: sat(420),
+                },
+                "Not enough funds: 200 sat available, 420 sat needed including the fee",
+            ),
+            (E::InvalidInvite("bad".into()), "Invalid invite code: bad"),
+            (
+                E::UnknownItem("x".into()),
+                "This item is no longer available",
+            ),
+            (
+                E::DeviceNotConnected("Coldcard".into()),
+                "Connect your Coldcard",
+            ),
+            (E::Offline, "You are offline. Reconnect and try again"),
+            (
+                E::NotSetUp("Set up Saving first".into()),
+                "Set up Saving first",
+            ),
+            (
+                E::PreviewExpired,
+                "This review expired. Check the details and try again",
+            ),
+            (E::DeviceRejected, "The device rejected the transaction"),
+            (E::Cancelled, "Cancelled"),
+            (E::Internal("boom".into()), "Something went wrong: boom"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(user_message(&error), expected);
+        }
     }
 
     #[test]
@@ -697,16 +696,6 @@ mod tests {
             Ok(SendAmount::Exact(btc(0.1)))
         );
         assert!(send_amount(Saving, "lnbc1x", "0.1").is_err());
-    }
-
-    #[test]
-    fn refill_error_message_drops_prefix() {
-        use fedimix_core::FedimixError as E;
-        assert_eq!(
-            refill_error_message(&E::InvalidAmount("Spending is at target".into())),
-            "Spending is at target"
-        );
-        assert_eq!(refill_error_message(&E::Offline), E::Offline.to_string());
     }
 
     #[test]
