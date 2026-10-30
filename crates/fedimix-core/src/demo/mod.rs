@@ -22,9 +22,9 @@ const SMALL_CHANGE_SAT: u64 = 10_000;
 const FIXED_INVOICE: f64 = 0.0012;
 const NOTIFY_DELAY: Duration = Duration::from_secs(2);
 /// Largest first; used to split a balance into notes.
-const DENOMINATIONS_SAT: [u64; 12] = [
+const DENOMINATIONS_SAT: [u64; 13] = [
     10_000_000, 5_000_000, 2_000_000, 1_000_000, 500_000, 200_000, 100_000, 50_000, 20_000, 10_000,
-    2_000, 1_000,
+    2_000, 1_000, 1,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,8 +141,10 @@ impl State {
         notes
     }
 
-    fn next_coin_index(&self) -> usize {
-        self.coins.len() + self.saving_history.len() + 100
+    fn next_coin_index(&mut self) -> usize {
+        let n = self.next_id;
+        self.next_id += 1;
+        100 + n as usize
     }
 }
 
@@ -930,6 +932,57 @@ mod tests {
             }
         }
         assert!(got);
+    }
+
+    async fn notes_sum(b: &DemoBackend) -> (Amount, Amount) {
+        let sp = b.spending_state().await.unwrap();
+        let notes = sum(sp.notes.iter().map(|n| Amount {
+            msat: n.denomination.msat * u64::from(n.count),
+        }));
+        (notes, sp.balance)
+    }
+
+    #[tokio::test]
+    async fn notes_sum_to_balance_after_balance_changes() {
+        let b = DemoBackend::new(DemoScenario::BelowTarget);
+        let p = b.prepare_refill().await.unwrap();
+        b.confirm_refill(p.id).await.unwrap();
+        let (n, bal) = notes_sum(&b).await;
+        assert_eq!(n, bal);
+        let p = b
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", Some(btc(0.01))))
+            .await
+            .unwrap();
+        b.confirm_send(p.id).await.unwrap();
+        let (n, bal) = notes_sum(&b).await;
+        assert_eq!(n, bal);
+        let f = DemoBackend::new(DemoScenario::Funded);
+        let p = f
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(btc(0.25))))
+            .await
+            .unwrap();
+        f.confirm_send(p.id).await.unwrap();
+        let (n, bal) = notes_sum(&f).await;
+        assert_eq!(n, bal);
+    }
+
+    #[tokio::test]
+    async fn outpoints_unique_after_multi_input_send_and_exit() {
+        let b = DemoBackend::new(DemoScenario::Funded);
+        b.exit_now("queue-1".into()).await.unwrap();
+        b.exit_now("queue-2".into()).await.unwrap();
+        let p = b
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", Some(btc(1.2))))
+            .await
+            .unwrap();
+        assert!(p.inputs.len() > 1);
+        b.confirm_send(p.id).await.unwrap();
+        b.exit_now("queue-3".into()).await.unwrap();
+        let coins = b.saving_state().await.unwrap().coins;
+        let mut ops: Vec<_> = coins.iter().map(|c| c.outpoint.clone()).collect();
+        ops.sort();
+        ops.dedup();
+        assert_eq!(ops.len(), coins.len());
     }
 
     #[tokio::test]
