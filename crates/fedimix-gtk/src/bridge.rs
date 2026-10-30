@@ -67,6 +67,8 @@ impl CoreBridge {
         });
     }
 
+    /// The core's events. Clones of this receiver share one queue, so there
+    /// must be a single consumer: the window's event loop.
     pub fn events(&self) -> async_channel::Receiver<Event> {
         self.events.clone()
     }

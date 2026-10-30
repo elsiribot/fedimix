@@ -5,7 +5,7 @@
 - `just screenshot` writes to `target/screenshots/<name>.png`, which is already gitignored via `/target/`.
 - Screenshot harness waits for sway app_id `fedimix` (what GTK reports under headless sway), not the reverse-DNS application id.
 - `Amount::from_sat` saturates: valid amounts never reach `u64::MAX` msat, but user input must not panic.
-- `EventStream` derives Clone (async_channel receivers are cloneable, work-sharing) so the UI can hand it to tasks easily.
+- `EventStream` derives Clone (async_channel receivers are cloneable): clones share one queue and split the events, so independent consumers call `subscribe()` instead.
 - tokio is a dev-dependency only (features macros, rt) in core; the async API stays runtime-agnostic.
 - DemoBackend keeps event senders in a separate std Mutex (not the state Mutex) because `subscribe()` is sync and must also be reachable from the delayed-notification task; each subscriber gets its own unbounded channel and closed ones are pruned on emit.
 - `SendConfirmed` is emitted via `tokio::spawn` + sleep only when a tokio runtime is current; without one it is skipped rather than panicking.

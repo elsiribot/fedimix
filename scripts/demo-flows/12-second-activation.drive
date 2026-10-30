@@ -1,0 +1,14 @@
+# scenario: funded
+# Launching again re-presents the window; events still reach it.
+expect 1.2034 BTC
+expect-windows 1
+activate
+expect-windows 1
+activate
+expect-windows 1
+click Spending
+click 0.05 for spending · 0.42 moving to Saving ›
+click Item actions
+click Exit now (lower privacy)
+click Exit now
+expect 0.2200 BTC

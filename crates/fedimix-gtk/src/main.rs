@@ -42,12 +42,19 @@ fn main() -> gtk::glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     let bridge = bridge::CoreBridge::start(DemoBackend::new(args.scenario));
+    // One window for the app's lifetime: a second activation re-presents it.
+    let window = std::cell::OnceCell::<window::FedimixWindow>::new();
     app.connect_activate(move |app| {
-        let window = window::FedimixWindow::new(app, bridge.clone(), args.page);
-        window.present();
-        if let Some(steps) = drive.clone() {
-            demo_drive::start(window.drive_env(app), steps);
+        if let Some(window) = window.get() {
+            window.present();
+            return;
         }
+        let new = window::FedimixWindow::new(app, bridge.clone(), args.page);
+        new.present();
+        if let Some(steps) = drive.clone() {
+            demo_drive::start(new.drive_env(app), steps);
+        }
+        let _ = window.set(new);
     });
 
     app.run_with_args::<&str>(&[])

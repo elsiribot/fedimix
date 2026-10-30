@@ -17,6 +17,8 @@
 //! - `expect-absent <text>`: no label holds `<text>`, even on a hidden page.
 //! - `expect-locked`: the open dialog cannot be closed and its page cannot be
 //!   popped, which is what Escape and Back go through.
+//! - `activate`: activate the application again, as a second launch does.
+//! - `expect-windows <n>`: the application has `<n>` windows.
 //! - `close-dialog`: close the open dialog, as Escape does.
 //! - `action <name>`: activate an application action such as `app.settings`
 //!   (menu popovers are not in the widget tree until opened).
@@ -45,6 +47,8 @@ pub enum Step {
     ExpectAbsent(String),
     ExpectLocked,
     CloseDialog,
+    Activate,
+    ExpectWindows(usize),
     Wait(u64),
     Shot(String),
     Action(String),
@@ -80,6 +84,11 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "expect-absent" => Step::ExpectAbsent(need("text")?),
         "expect-locked" => Step::ExpectLocked,
         "close-dialog" => Step::CloseDialog,
+        "activate" => Step::Activate,
+        "expect-windows" => Step::ExpectWindows(
+            rest.parse()
+                .map_err(|_| format!("'expect-windows' needs a count, got '{rest}'"))?,
+        ),
         "shot" => Step::Shot(need("a name")?),
         "action" => Step::Action(need("an action name")?),
         "wait" => Step::Wait(
@@ -118,6 +127,8 @@ impl fmt::Display for Step {
             Step::ExpectAbsent(t) => write!(f, "expect-absent {t}"),
             Step::ExpectLocked => write!(f, "expect-locked"),
             Step::CloseDialog => write!(f, "close-dialog"),
+            Step::Activate => write!(f, "activate"),
+            Step::ExpectWindows(n) => write!(f, "expect-windows {n}"),
             Step::Wait(ms) => write!(f, "wait {ms}"),
             Step::Shot(n) => write!(f, "shot {n}"),
             Step::Action(a) => write!(f, "action {a}"),
@@ -195,6 +206,16 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
                 return Err("the dialog refused to close".to_string());
             }
             glib::timeout_future(Duration::from_millis(150)).await;
+        }
+        Step::Activate => {
+            env.app.activate();
+            glib::timeout_future(Duration::from_millis(150)).await;
+        }
+        Step::ExpectWindows(n) => {
+            let windows = env.app.windows().len();
+            if windows != *n {
+                return Err(format!("{windows} windows"));
+            }
         }
         Step::Wait(ms) => glib::timeout_future(Duration::from_millis(*ms)).await,
         Step::Shot(name) => shot(name).await,
@@ -454,6 +475,8 @@ expect-not Cover traffic
 expect-absent bc1q
 expect-locked
 close-dialog
+activate
+expect-windows 1
 wait 250
 shot funded-moving
 action app.settings
@@ -475,6 +498,8 @@ action app.settings
                 Step::ExpectAbsent("bc1q".into()),
                 Step::ExpectLocked,
                 Step::CloseDialog,
+                Step::Activate,
+                Step::ExpectWindows(1),
                 Step::Wait(250),
                 Step::Shot("funded-moving".into()),
                 Step::Action("app.settings".into()),
