@@ -683,6 +683,70 @@ mod tests {
         );
         assert_eq!(refill_overshoot_note(Amount::ZERO), "");
     }
+
+    /// Same call sequence the UI uses, checked through the presentation layer.
+    #[tokio::test]
+    async fn demo_flow_presentation() {
+        use fedimix_core::{DemoBackend, DemoScenario, Fedimix, SendRequest, WalletKind};
+        const NOW: Timestamp = 1_793_318_400;
+
+        // First run: join, then set up Saving.
+        let core = Fedimix::new(DemoBackend::new(DemoScenario::FirstRun));
+        let invite = core.suggested_federations().await.unwrap()[0]
+            .invite
+            .clone();
+        core.join_federation(invite).await.unwrap();
+        let device = core.detect_devices().await.unwrap().remove(0);
+        core.setup_saving(device).await.unwrap();
+        let sp = core.spending_state().await.unwrap();
+        assert_eq!(saving_banner(&sp), None);
+        assert!(sp.federation.is_some());
+
+        // Funded: caption, send review, history rows, exit now.
+        let core = Fedimix::new(DemoBackend::new(DemoScenario::Funded));
+        let sp = core.spending_state().await.unwrap();
+        let caption = spending_caption(&sp);
+        assert!(caption.opens_queue && !caption.shows_refill);
+        let saving = core.saving_state().await.unwrap();
+        assert!(in_flight_line(&saving).is_some());
+        let preview = core
+            .prepare_send(SendRequest {
+                wallet: WalletKind::Saving,
+                destination: "bc1qdemo0destination".into(),
+                amount: Some(Amount::from_sat(1_000_000)),
+            })
+            .await
+            .unwrap();
+        assert!(change_text(&preview.change).is_some());
+        let (label, enabled) = confirm_button(WalletKind::Saving, saving.device.as_ref());
+        assert!(enabled && label.starts_with("Confirm on "));
+        core.confirm_send(preview.id).await.unwrap();
+        let saving = core.saving_state().await.unwrap();
+        let row = history_row(&saving.history[0], NOW);
+        assert_eq!(row.title, "Sent");
+        assert!(row.amount.starts_with('-') || row.amount.starts_with('\u{2212}'));
+
+        let q = core.queue_state().await.unwrap();
+        let n = q.items.len();
+        let rows: Vec<_> = q.items.iter().map(|i| queue_row(i, 50)).collect();
+        assert!(rows.iter().all(|r| (0.0..=1.0).contains(&r.fraction)));
+        core.exit_now(q.items[0].id.clone()).await.unwrap();
+        let q = core.queue_state().await.unwrap();
+        assert_eq!(q.items.len(), n - 1);
+        assert!(queue_summary(&q).contains("typical exit"));
+
+        // Below target: refill moves the caption to "for spending".
+        let core = Fedimix::new(DemoBackend::new(DemoScenario::BelowTarget));
+        let sp = core.spending_state().await.unwrap();
+        assert!(spending_caption(&sp).shows_refill);
+        let p = core.prepare_refill().await.unwrap();
+        core.confirm_refill(p.id).await.unwrap();
+        let sp = core.spending_state().await.unwrap();
+        let caption = spending_caption(&sp);
+        assert!(!caption.shows_refill);
+        assert!(caption.text.ends_with("for spending"));
+        assert_eq!(visible_history(&sp.history, false).len(), sp.history.len());
+    }
 }
 
 #[cfg(test)]

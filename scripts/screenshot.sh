@@ -87,4 +87,9 @@ if [[ $mapped -ne 1 ]]; then
 fi
 sleep 1
 grim "$out"
+if grep -Eq 'CRITICAL|panicked' "$rt/app.log"; then
+    echo "app reported CRITICAL/panic:" >&2
+    grep -E 'CRITICAL|panicked' "$rt/app.log" >&2
+    exit 1
+fi
 echo "wrote $out"

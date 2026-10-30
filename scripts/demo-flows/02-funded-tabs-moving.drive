@@ -1,0 +1,24 @@
+# scenario: funded
+# Tab switch, Coins and back, Moving to Saving, Exit now on one item.
+expect 1.2034 BTC
+shot saving
+click Spending
+expect 0.4700 BTC
+shot spending
+click Saving
+click 1.2034 BTC
+expect 0.9534
+shot coins
+click Back
+expect History
+click Spending
+click 0.05 for spending · 0.42 moving to Saving ›
+expect 0.4200 BTC
+shot moving
+click Item actions
+click Exit now (lower privacy)
+expect A withdrawal fee applies
+shot exit-dialog
+click Exit now
+expect 0.2200 BTC
+shot moving-after-exit

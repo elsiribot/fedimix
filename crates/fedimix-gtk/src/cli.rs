@@ -49,6 +49,8 @@ pub struct Args {
     pub demo: bool,
     pub scenario: DemoScenario,
     pub page: Option<StartPage>,
+    /// Script for the in-app demo driver.
+    pub drive: Option<std::path::PathBuf>,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -56,6 +58,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut demo = false;
     let mut scenario = None;
     let mut page = None;
+    let mut drive = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--demo" => demo = true,
@@ -67,16 +70,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let v = args.next().ok_or("--demo-page needs a value")?;
                 page = Some(StartPage::from_name(&v).ok_or_else(|| format!("unknown page '{v}'"))?);
             }
+            "--demo-drive" => {
+                let v = args.next().ok_or("--demo-drive needs a file")?;
+                drive = Some(std::path::PathBuf::from(v));
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
-    if !demo && (scenario.is_some() || page.is_some()) {
-        return Err("--demo-scenario and --demo-page require --demo".to_string());
+    if !demo && (scenario.is_some() || page.is_some() || drive.is_some()) {
+        return Err("--demo-scenario, --demo-page and --demo-drive require --demo".to_string());
     }
     Ok(Args {
         demo,
         scenario: scenario.unwrap_or(DemoScenario::Funded),
         page,
+        drive,
     })
 }
 
@@ -121,6 +129,14 @@ mod tests {
     fn rejects_scenario_without_demo() {
         assert!(p(&["--demo-scenario", "funded"]).is_err());
         assert!(p(&["--demo-page", "saving"]).is_err());
+    }
+
+    #[test]
+    fn parses_drive_file_and_requires_demo() {
+        let a = p(&["--demo", "--demo-drive", "flow.drive"]).unwrap();
+        assert_eq!(a.drive, Some("flow.drive".into()));
+        assert!(p(&["--demo-drive", "flow.drive"]).is_err());
+        assert!(p(&["--demo", "--demo-drive"]).is_err());
     }
 
     #[test]

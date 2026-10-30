@@ -1,0 +1,13 @@
+# scenario: funded
+# Settings: change the spending target and pop at once (debounce flush); it persists and reopens.
+action app.settings
+expect Target (BTC)
+shot settings
+type "Target (BTC)" 0.1
+click Back
+click Spending
+expect 0.05 of 0.1 target
+shot after-change
+action app.settings
+expect Target (BTC)
+shot reopened

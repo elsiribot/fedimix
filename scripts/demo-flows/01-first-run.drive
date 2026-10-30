@@ -1,0 +1,18 @@
+# scenario: first-run
+# Join a suggested federation; the tabs appear.
+expect Join a federation
+shot join
+click Join
+expect Fedi Alpha
+shot tabs
+click Spending
+expect Refill from Saving
+shot spending
+click Saving
+shot saving
+click Set up
+expect Set up Saving
+shot setup-dialog
+click Set up
+expect Saving is set up
+shot saving-ready

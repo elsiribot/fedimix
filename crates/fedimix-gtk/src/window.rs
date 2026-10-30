@@ -42,6 +42,7 @@ impl Chrome {
 /// Main application window.
 pub struct FedimixWindow {
     window: adw::ApplicationWindow,
+    stack: adw::ViewStack,
 }
 
 fn load_css() {
@@ -128,6 +129,7 @@ impl FedimixWindow {
         breakpoint.add_setter(&header_switcher, "visible", Some(&false.to_value()));
         window.add_breakpoint(breakpoint);
 
+        let tabs = stack.clone();
         let ctx = Rc::new(AppContext::new(bridge, toasts, nav, stack));
         let saving_tab = SavingTab::new(ctx.clone());
         saving_tab.widget().set_vexpand(true);
@@ -147,7 +149,10 @@ impl FedimixWindow {
         Self::wire_state(&ctx, chrome, start_page);
         ctx.refresh();
 
-        Self { window }
+        Self {
+            window,
+            stack: tabs,
+        }
     }
 
     fn install_actions(app: &adw::Application, ctx: &Rc<AppContext>) {
@@ -236,6 +241,15 @@ impl FedimixWindow {
                 ctx.refresh();
             }
         });
+    }
+
+    /// Handles the demo driver needs (`--demo-drive`).
+    pub fn drive_env(&self, app: &adw::Application) -> crate::demo_drive::Env {
+        crate::demo_drive::Env {
+            app: app.clone(),
+            window: self.window.clone(),
+            stack: self.stack.clone(),
+        }
     }
 
     pub fn present(&self) {

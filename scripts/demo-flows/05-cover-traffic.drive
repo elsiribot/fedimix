@@ -1,0 +1,10 @@
+# scenario: funded
+# Show cover traffic toggle reveals and hides the cover rows.
+click Spending
+shot hidden
+click Show cover traffic
+expect Cover traffic
+shot shown
+click Show cover traffic
+wait 300
+shot hidden-again

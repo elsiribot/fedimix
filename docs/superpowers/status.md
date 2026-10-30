@@ -1,31 +1,25 @@
 # Status
 
-Phase 1, Tasks 1-11 done (workspace split/dev shell/screenshot harness; core API types, events, Backend trait, Fedimix handle; DemoBackend; gtk format/present logic; app shell with CLI, CoreBridge, AppContext and window; Saving tab with shared widgets and history list; Spending tab, Coins/coin detail/Notes pages; Moving to Saving page; Send and Receive dialogs; Refill dialog; first-run Join, Saving setup, Settings, About).
+Phase 1 is complete apart from the final review (Tasks 1-12). The Fedimix UI runs end to end over `DemoBackend`; the real backend is later phases.
 
 ## What works
-- `nix develop -c just build|test|clippy|fmt` on the `fedimix-core` + `fedimix-gtk` workspace.
-- `nix develop -c just run` launches the placeholder window.
-- `nix develop -c just screenshot <name> [args...]` renders the app headlessly
-  (sway + grim) to `target/screenshots/<name>.png`.
+- `nix develop -c just build|test|clippy|fmt` on the `fedimix-core` + `fedimix-gtk` workspace (23 core unit, 3 core integration, 47 gtk unit tests).
+- `nix develop -c just demo` runs the app with `--demo [--demo-scenario funded|below-target|no-saving|first-run|offline] [--demo-page ...]`; without `--demo` it exits 2.
+- All pages exist: Saving and Spending tabs, Coins/coin detail/Notes, Moving to Saving, Send/Receive/Refill dialogs, Join (first run), Saving setup, Settings, About.
+- `just screenshot-all` writes 48 PNGs (scenario x page, 480 and 360 wide) to `target/screenshots/`.
+- `just interact-demo [flow]` runs `scripts/demo-flows/*.drive` through the in-app `--demo-drive` driver.
 
-- `fedimix-core` exposes `Amount`, state/preview types, `Event`/`EventStream`, `FedimixError`, `Backend` (async_trait) and the `Fedimix` forwarding handle; `DemoBackend::new(DemoScenario)` (funded, below-target, no-saving, first-run, offline) implements Backend with mockup data; 21 unit tests via `nix develop -c just test`.
+## Verified headlessly (sway + grim, GTK_A11Y=none, cairo renderer)
+- Every page screenshots at 480x640 and 360x640 without a CRITICAL or panic (screenshot-all); a sample of PNGs was read by eye against the mockups.
+- Six scripted flows pass: (1) first-run Join then tabs, Saving setup dialog; (2) tab switch, Coins and back, Moving, Exit now (queue 0.42 -> 0.22); (3) Saving Send review -> confirm -> history; (4) below-target Refill -> confirm -> balance; (5) cover-traffic toggle; (6) Settings target change then immediate Back persists (debounce flush) and survives reopen.
+- Core flow: `fedimix-core/tests/demo_flow.rs` and `present::tests::demo_flow_presentation`.
 
-- `fedimix-gtk` has pure `format` (btc/date/parse) and `present` (captions, tags, history/queue rows, send validation) modules, 23 unit tests; crate-level `allow(dead_code)` until Task 12.
-
-- `nix develop -c just demo` (or `scripts/screenshot.sh out.png [--width 400] -- --demo [--demo-scenario <name>]`) shows the shell: Wide header switcher, bottom switcher bar below 500sp, placeholder tabs; `--demo-page` is parsed only. Without `--demo` the app exits 2.
-
-- The Saving tab shows device, balance, depositing link, Send/Receive (dialogs), and history with `--demo`; with `--demo-scenario no-saving` its empty state offers "Set up" (opens the setup dialog). Its balance opens the Coins page (rows open coin detail with a Freeze switch).
-
-- The Spending tab shows Offline and "Set up Saving" banners, balance (opens Notes page), bar and caption, "Refill from Saving", Send/Receive and history with a "Show cover traffic" toggle. Refill and Send/Receive open dialogs; Set up opens the Saving setup dialog. The Moving queue link opens the Moving to Saving page (live rows, level bars, row menu "Exit now (lower privacy)" with confirm dialog; insensitive while waiting for Saving). `--demo-page saving|spending|coins|coin-detail|notes|moving|send|send-review|receive|refill|refill-expanded` work; `setup-saving|settings|about` open the new dialogs/pages and `join` pushes the add-federation page.
-
-- Send dialog (recipient+amount, Review page with Confirm / "Confirm on <device>" / "Connect your <device>") and Receive dialog (Lightning + On-chain for Spending, direct address for Saving) with QR and Copy.
-
-- Refill dialog ("Refill from Saving"): calls prepare_refill (error = toast, no dialog), shows amount with a chevron toggling the coin list and overshoot note, Confirm on <device> (or disabled "Connect your <device>"), outcome toast.
-
-- First run (`--demo --demo-scenario first-run`): the window shows the Join page (suggested federations + invite entry, inline InvalidInvite error, no tabs, menu kept) and swaps to the tabs when a federation exists. Menu: Settings (federations radio list + add, spending target, exit, cover budget, hardware wallet, network; applies on change, debounced 400 ms, bad target gets the `error` class and no write) and About.
+## Not verified
+- Real pointer/keyboard input (the driver emits clicks and sets text directly; OS-level injection does not reach GTK under headless sway), popover menu rendering by hand, hardware, dark theme, accessibility (A11y disabled), real backend.
+- Header menu is opened via `action app.settings`, not by clicking the menu popover.
 
 ## Next
-Task 12.
+Final review of Phase 1.
 
 ## Needs user
 Nothing.
