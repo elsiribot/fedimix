@@ -9,7 +9,7 @@ use fedimix_core::{SpendingState, WalletKind};
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::{moving_page, notes_page, refill_dialog, widgets};
+use crate::ui::{moving_page, notes_page, refill_dialog, setup_saving, widgets};
 
 struct Inner {
     offline: adw::Banner,
@@ -39,8 +39,7 @@ impl SpendingTab {
             .build();
         nudge.connect_button_clicked({
             let ctx = ctx.clone();
-            // Task 11 provides ui::setup_saving::open(ctx).
-            move |_| ctx.toast("Not available yet")
+            move |_| setup_saving::open(&ctx)
         });
 
         let federation = gtk::Label::builder()
@@ -194,8 +193,9 @@ impl Inner {
     fn render(&self) {
         let last = self.last.borrow();
         let Some(s) = last.as_ref() else { return };
-        let online = s.federation.as_ref().is_some_and(|f| f.online);
-        self.offline.set_revealed(!online);
+        // Without a federation the window shows the Join page instead.
+        let offline = matches!(&s.federation, Some(f) if !f.online);
+        self.offline.set_revealed(offline);
         match present::saving_banner(s) {
             Some(text) => {
                 self.nudge.set_title(&text);

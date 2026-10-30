@@ -9,7 +9,7 @@ use fedimix_core::{SavingState, WalletKind};
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::{coins_page, widgets};
+use crate::ui::{coins_page, setup_saving, widgets};
 
 struct Inner {
     pages: gtk::Stack,
@@ -80,10 +80,9 @@ impl SavingTab {
         setup.add_css_class("pill");
         setup.add_css_class("suggested-action");
         setup.set_halign(gtk::Align::Center);
-        // Task 11 provides ui::setup_saving::open(ctx).
         setup.connect_clicked({
             let ctx = ctx.clone();
-            move |_| ctx.toast("Not available yet")
+            move |_| setup_saving::open(&ctx)
         });
         let empty = adw::StatusPage::builder()
             .icon_name("media-removable-symbolic")

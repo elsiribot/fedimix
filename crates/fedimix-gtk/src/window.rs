@@ -7,15 +7,37 @@ use gtk::gio;
 use crate::bridge::CoreBridge;
 use crate::cli::StartPage;
 use crate::ui::app_state::{AppContext, Snapshots};
+use crate::ui::join_page::JoinPage;
 use crate::ui::saving_tab::SavingTab;
 use crate::ui::spending_tab::SpendingTab;
 use crate::ui::{
-    coin_detail, coins_page, moving_page, notes_page, receive_dialog, refill_dialog, send_dialog,
+    about, coin_detail, coins_page, moving_page, notes_page, receive_dialog, refill_dialog,
+    send_dialog, settings_page, setup_saving,
 };
 use fedimix_core::{Amount, SendRequest, WalletKind};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
+
+/// The parts of the window that differ between the Join page and the tabs.
+struct Chrome {
+    content: gtk::Stack,
+    header: adw::HeaderBar,
+    header_switcher: adw::ViewSwitcher,
+    switcher_bar: adw::ViewSwitcherBar,
+}
+
+impl Chrome {
+    /// Show the tabs when a federation is joined, the Join page otherwise.
+    /// The menu stays in both cases; only the tab switchers go away.
+    fn show_tabs(&self, joined: bool) {
+        self.content
+            .set_visible_child_name(if joined { "tabs" } else { "join" });
+        self.header
+            .set_title_widget(joined.then_some(&self.header_switcher));
+        self.switcher_bar.set_visible(joined);
+    }
+}
 
 /// Main application window.
 pub struct FedimixWindow {
@@ -73,9 +95,12 @@ impl FedimixWindow {
         header.set_title_widget(Some(&header_switcher));
         header.pack_end(&menu_button);
 
+        // The tabs, or the Join page while there is no federation.
+        let content = gtk::Stack::new();
+        content.add_named(&stack, Some("tabs"));
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&stack));
+        toolbar.set_content(Some(&content));
         toolbar.add_bottom_bar(&switcher_bar);
 
         let root = adw::NavigationPage::new(&toolbar, "Fedimix");
@@ -110,28 +135,35 @@ impl FedimixWindow {
         let spending_tab = SpendingTab::new(ctx.clone());
         spending_tab.widget().set_vexpand(true);
         spending_slot.append(spending_tab.widget());
+        let join_page = JoinPage::new(&ctx);
+        content.add_named(join_page.widget(), Some("join"));
+        let chrome = Chrome {
+            content,
+            header,
+            header_switcher,
+            switcher_bar,
+        };
         Self::install_actions(app, &ctx);
-        Self::wire_state(&ctx, start_page);
+        Self::wire_state(&ctx, chrome, start_page);
         ctx.refresh();
 
         Self { window }
     }
 
-    fn install_actions(app: &adw::Application, ctx: &AppContext) {
+    fn install_actions(app: &adw::Application, ctx: &Rc<AppContext>) {
         let quit = gio::ActionEntry::builder("quit")
             .activate(|app: &adw::Application, _, _| app.quit())
             .build();
-        // Settings and About pages arrive with later tasks.
         let settings = gio::ActionEntry::builder("settings")
             .activate({
                 let ctx = ctx.clone();
-                move |_: &adw::Application, _, _| ctx.toast("Settings are not available yet")
+                move |_: &adw::Application, _, _| settings_page::push(&ctx)
             })
             .build();
         let about = gio::ActionEntry::builder("about")
             .activate({
                 let ctx = ctx.clone();
-                move |_: &adw::Application, _, _| ctx.toast("About is not available yet")
+                move |_: &adw::Application, _, _| about::show(&ctx)
             })
             .build();
         app.add_action_entries([quit, settings, about]);
@@ -165,6 +197,10 @@ impl FedimixWindow {
             Some(StartPage::Refill) => refill_dialog::open(ctx, false),
             Some(StartPage::RefillExpanded) => refill_dialog::open(ctx, true),
             Some(StartPage::Receive) => receive_dialog::open(ctx, WalletKind::Spending),
+            Some(StartPage::SetupSaving) => setup_saving::open(ctx),
+            Some(StartPage::Join) => settings_page::push_join(ctx),
+            Some(StartPage::Settings) => settings_page::push(ctx),
+            Some(StartPage::About) => about::show(ctx),
             // Demo-only: drive the Saving send flow to its review page.
             Some(StartPage::SendReview) => send_dialog::open_review(
                 ctx,
@@ -178,11 +214,12 @@ impl FedimixWindow {
         }
     }
 
-    fn wire_state(ctx: &Rc<AppContext>, start_page: Option<StartPage>) {
+    fn wire_state(ctx: &Rc<AppContext>, chrome: Chrome, start_page: Option<StartPage>) {
         let picked = Rc::new(Cell::new(false));
         ctx.on_snapshots({
             let ctx = ctx.clone();
             move |s| {
+                chrome.show_tabs(s.spending.federation.is_some());
                 if !picked.replace(true) {
                     Self::apply_start_page(&ctx, start_page, s);
                 }

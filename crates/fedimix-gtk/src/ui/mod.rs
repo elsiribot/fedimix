@@ -1,7 +1,9 @@
+pub mod about;
 pub mod app_state;
 pub mod coin_detail;
 pub mod coins_page;
 pub mod history_list;
+pub mod join_page;
 pub mod moving_page;
 pub mod notes_page;
 pub mod qr;
@@ -9,5 +11,7 @@ pub mod receive_dialog;
 pub mod refill_dialog;
 pub mod saving_tab;
 pub mod send_dialog;
+pub mod settings_page;
+pub mod setup_saving;
 pub mod spending_tab;
 pub mod widgets;

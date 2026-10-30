@@ -301,6 +301,57 @@ pub fn send_validation(dest: &str, amount: &str, requires_amount: bool) -> Resul
     Ok(())
 }
 
+/// Raw values of the Settings page, as the widgets report them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsForm<'a> {
+    pub target_btc: &'a str,
+    pub anonymity_target: f64,
+    pub min_hours: f64,
+    pub grace_minutes: f64,
+    pub fee_guard_percent: f64,
+    pub cover_budget_sat: f64,
+    pub electrum: bool,
+    pub url: &'a str,
+    pub proxy: &'a str,
+}
+
+fn in_range(name: &str, v: f64, min: f64, max: f64) -> Result<u64, String> {
+    if v.is_finite() && (min..=max).contains(&v) {
+        Ok(v.round() as u64)
+    } else {
+        Err(format!("{name} must be between {min} and {max}"))
+    }
+}
+
+/// Validate the Settings form and build the new [`Settings`] from it. The form
+/// edits every field today; `_current` is where fields it does not edit would
+/// be carried over from.
+pub fn settings_from_form(form: &SettingsForm, _current: &Settings) -> Result<Settings, String> {
+    let url = form.url.trim();
+    if url.is_empty() {
+        return Err("Enter a server URL".to_string());
+    }
+    let proxy = form.proxy.trim();
+    Ok(Settings {
+        spending_target: format::parse_btc(form.target_btc)?,
+        anonymity_target: in_range("Anonymity target", form.anonymity_target, 1.0, 1000.0)? as u32,
+        min_time_in_pool_secs: in_range("Minimum hours", form.min_hours, 0.0, 720.0)? * 3600,
+        online_grace_secs: in_range("Grace minutes", form.grace_minutes, 0.0, 120.0)? * 60,
+        fee_guard_percent: in_range("Fee guard", form.fee_guard_percent, 0.0, 100.0)? as u32,
+        cover_budget_sat_per_month: in_range("Budget", form.cover_budget_sat, 0.0, 10_000_000.0)?,
+        chain_backend: if form.electrum {
+            ChainBackend::Electrum {
+                url: url.to_string(),
+            }
+        } else {
+            ChainBackend::Esplora {
+                url: url.to_string(),
+            }
+        },
+        socks5_proxy: (!proxy.is_empty()).then(|| proxy.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +666,74 @@ mod tests {
             "No change output. 0.0212 above target rejoins the exit queue."
         );
         assert_eq!(refill_overshoot_note(Amount::ZERO), "");
+    }
+}
+
+#[cfg(test)]
+mod settings_form_tests {
+    use super::*;
+
+    fn form() -> SettingsForm<'static> {
+        SettingsForm {
+            target_btc: "0.05",
+            anonymity_target: 100.0,
+            min_hours: 12.0,
+            grace_minutes: 5.0,
+            fee_guard_percent: 3.0,
+            cover_budget_sat: 30_000.0,
+            electrum: true,
+            url: " ssl://electrum.example:50002 ",
+            proxy: "",
+        }
+    }
+
+    #[test]
+    fn accepts_valid_form() {
+        let s = settings_from_form(&form(), &Settings::default()).unwrap();
+        assert_eq!(s.spending_target, Amount::from_sat(5_000_000));
+        assert_eq!(s.anonymity_target, 100);
+        assert_eq!(s.min_time_in_pool_secs, 12 * 3600);
+        assert_eq!(s.online_grace_secs, 300);
+        assert_eq!(s.fee_guard_percent, 3);
+        assert_eq!(s.cover_budget_sat_per_month, 30_000);
+        assert_eq!(
+            s.chain_backend,
+            ChainBackend::Electrum {
+                url: "ssl://electrum.example:50002".into()
+            }
+        );
+        assert_eq!(s.socks5_proxy, None);
+    }
+
+    #[test]
+    fn proxy_is_trimmed_and_kept() {
+        let mut f = form();
+        f.proxy = " 127.0.0.1:9050 ";
+        let s = settings_from_form(&f, &Settings::default()).unwrap();
+        assert_eq!(s.socks5_proxy.as_deref(), Some("127.0.0.1:9050"));
+    }
+
+    #[test]
+    fn rejects_bad_target() {
+        for bad in ["", "abc", "-1", "21000001"] {
+            let mut f = form();
+            f.target_btc = bad;
+            let err = settings_from_form(&f, &Settings::default()).unwrap_err();
+            assert!(!err.is_empty(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_numbers_and_empty_url() {
+        let cur = Settings::default();
+        let mut f = form();
+        f.anonymity_target = 0.0;
+        assert!(settings_from_form(&f, &cur).is_err());
+        let mut f = form();
+        f.fee_guard_percent = 101.0;
+        assert!(settings_from_form(&f, &cur).is_err());
+        let mut f = form();
+        f.url = "  ";
+        assert!(settings_from_form(&f, &cur).is_err());
     }
 }
