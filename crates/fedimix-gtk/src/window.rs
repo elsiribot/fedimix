@@ -9,7 +9,8 @@ use crate::cli::StartPage;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::saving_tab::SavingTab;
 use crate::ui::spending_tab::SpendingTab;
-use crate::ui::{coin_detail, coins_page, moving_page, notes_page};
+use crate::ui::{coin_detail, coins_page, moving_page, notes_page, receive_dialog, send_dialog};
+use fedimix_core::{Amount, SendRequest, WalletKind};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -158,6 +159,17 @@ impl FedimixWindow {
             }
             Some(StartPage::Notes) => notes_page::push(ctx),
             Some(StartPage::Moving) => moving_page::push(ctx),
+            Some(StartPage::Send) => send_dialog::open(ctx, WalletKind::Spending),
+            Some(StartPage::Receive) => receive_dialog::open(ctx, WalletKind::Spending),
+            // Demo-only: drive the Saving send flow to its review page.
+            Some(StartPage::SendReview) => send_dialog::open_review(
+                ctx,
+                SendRequest {
+                    wallet: WalletKind::Saving,
+                    destination: "bc1qdemo0fedimix0review0address0for0screenshots0only".into(),
+                    amount: Some(Amount::from_sat(25_000_000)),
+                },
+            ),
             _ => {}
         }
     }

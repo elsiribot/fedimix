@@ -209,6 +209,69 @@ pub fn exit_error_message(e: &fedimix_core::FedimixError) -> String {
     }
 }
 
+/// Inline text for a failed `prepare_send` / `confirm_send`.
+pub fn send_error_message(e: &fedimix_core::FedimixError) -> String {
+    use fedimix_core::FedimixError as E;
+    match e {
+        E::InvalidDestination(_) => {
+            "This is not a valid Lightning invoice or bitcoin address".to_string()
+        }
+        E::InvalidAmount(why) => format!("Invalid amount: {why}"),
+        E::InsufficientFunds { available, needed } => format!(
+            "Not enough funds: {} available, {} needed including the fee",
+            format::btc(*available),
+            format::btc(*needed)
+        ),
+        E::Offline => "You are offline. Reconnect and try again".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether the amount field is needed: a Spending Lightning invoice carries
+/// its own amount.
+pub fn send_requires_amount(wallet: fedimix_core::WalletKind, dest: &str) -> bool {
+    !(wallet == fedimix_core::WalletKind::Spending && dest.trim().starts_with("lnbc"))
+}
+
+/// Inline form error. Quiet until an amount has been typed.
+pub fn send_form_error(dest: &str, amount: &str, requires_amount: bool) -> Option<String> {
+    if amount.trim().is_empty() {
+        return None;
+    }
+    send_validation(dest, amount, requires_amount).err()
+}
+
+/// Review line saying where change goes, if any.
+pub fn change_text(change: &fedimix_core::ChangeDestination) -> Option<String> {
+    use fedimix_core::ChangeDestination as C;
+    match change {
+        C::None => None,
+        C::Spending { amount } => Some(format!(
+            "Change \u{2192} Spending ({})",
+            format::btc(*amount)
+        )),
+        C::SmallChange { amount } => Some(format!(
+            "Stays in Saving as small change ({})",
+            format::btc(*amount)
+        )),
+    }
+}
+
+/// Label and sensitivity of the review Confirm button.
+pub fn confirm_button(
+    wallet: fedimix_core::WalletKind,
+    device: Option<&fedimix_core::DeviceInfo>,
+) -> (String, bool) {
+    if wallet == fedimix_core::WalletKind::Spending {
+        return ("Send".to_string(), true);
+    }
+    match device {
+        Some(d) if d.connected => (format!("Confirm on {}", d.name), true),
+        Some(d) => (format!("Connect your {}", d.name), false),
+        None => ("Connect your device".to_string(), false),
+    }
+}
+
 pub fn visible_history(items: &[HistoryItem], show_cover: bool) -> Vec<HistoryItem> {
     items
         .iter()
@@ -457,6 +520,71 @@ mod tests {
         assert_eq!(r.trailing, "1/3 conf");
         assert_eq!(r.tag.unwrap().text, "0.1");
         assert!(r.nested.is_none());
+    }
+
+    #[test]
+    fn send_error_messages() {
+        use fedimix_core::FedimixError as E;
+        assert_eq!(
+            send_error_message(&E::InvalidDestination("x".into())),
+            "This is not a valid Lightning invoice or bitcoin address"
+        );
+        assert_eq!(
+            send_error_message(&E::InvalidAmount("amount must be above zero".into())),
+            "Invalid amount: amount must be above zero"
+        );
+        assert_eq!(
+            send_error_message(&E::InsufficientFunds {
+                available: btc(0.46),
+                needed: btc(0.47),
+            }),
+            "Not enough funds: 0.4600 BTC available, 0.4700 BTC needed including the fee"
+        );
+        assert_eq!(
+            send_error_message(&E::Offline),
+            "You are offline. Reconnect and try again"
+        );
+    }
+
+    #[test]
+    fn send_form_helpers() {
+        use fedimix_core::{ChangeDestination as C, WalletKind as W};
+        assert!(!send_requires_amount(W::Spending, "lnbc1x"));
+        assert!(send_requires_amount(W::Spending, "bc1qx"));
+        assert!(send_requires_amount(W::Saving, "lnbc1x"));
+        assert_eq!(send_form_error("", "", true), None);
+        assert_eq!(send_form_error("bc1q", "", true), None);
+        assert!(send_form_error("bc1q", "abc", true).is_some());
+        assert!(send_form_error("", "0.1", true).is_some());
+        assert_eq!(change_text(&C::None), None);
+        assert_eq!(
+            change_text(&C::Spending { amount: btc(0.1) }).unwrap(),
+            "Change \u{2192} Spending (0.1000 BTC)"
+        );
+        assert!(
+            change_text(&C::SmallChange { amount: sat(5000) })
+                .unwrap()
+                .starts_with("Stays in Saving as small change")
+        );
+    }
+
+    #[test]
+    fn confirm_button_states() {
+        use fedimix_core::{DeviceInfo, WalletKind as W};
+        let dev = |connected| DeviceInfo {
+            name: "Coldcard".into(),
+            connected,
+        };
+        assert_eq!(confirm_button(W::Spending, None), ("Send".into(), true));
+        assert_eq!(
+            confirm_button(W::Saving, Some(&dev(true))),
+            ("Confirm on Coldcard".into(), true)
+        );
+        assert_eq!(
+            confirm_button(W::Saving, Some(&dev(false))),
+            ("Connect your Coldcard".into(), false)
+        );
+        assert!(!confirm_button(W::Saving, None).1);
     }
 
     #[test]

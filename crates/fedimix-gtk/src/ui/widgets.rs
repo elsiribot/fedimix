@@ -1,11 +1,13 @@
 //! Small shared widgets used by the Saving and Spending tabs.
 
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use fedimix_core::WalletKind;
 
 use crate::ui::app_state::AppContext;
+use crate::ui::{receive_dialog, send_dialog};
 
 /// Flat button showing the hero amount followed by a chevron.
 #[derive(Clone)]
@@ -64,7 +66,7 @@ pub fn hero_box() -> gtk::Box {
 }
 
 /// Centered `Send` / `Receive` pill buttons for `wallet`.
-pub fn send_receive_row(ctx: &AppContext, _wallet: WalletKind) -> gtk::Box {
+pub fn send_receive_row(ctx: &Rc<AppContext>, wallet: WalletKind) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
@@ -76,11 +78,14 @@ pub fn send_receive_row(ctx: &AppContext, _wallet: WalletKind) -> gtk::Box {
     send.add_css_class("suggested-action");
     let receive = gtk::Button::with_label("Receive");
     receive.add_css_class("pill");
-    // Task 9 replaces these with send_dialog::open / receive_dialog::open.
-    for button in [&send, &receive] {
+    send.connect_clicked({
         let ctx = ctx.clone();
-        button.connect_clicked(move |_| ctx.toast("Not available yet"));
-    }
+        move |_| send_dialog::open(&ctx, wallet)
+    });
+    receive.connect_clicked({
+        let ctx = ctx.clone();
+        move |_| receive_dialog::open(&ctx, wallet)
+    });
     row.append(&send);
     row.append(&receive);
     row
