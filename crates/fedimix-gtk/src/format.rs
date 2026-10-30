@@ -74,7 +74,9 @@ pub fn parse_btc(s: &str) -> Result<Amount, String> {
     let frac_n: u64 = if frac.is_empty() {
         0
     } else {
-        format!("{frac:0<8}").parse().expect("digits only")
+        format!("{frac:0<8}")
+            .parse()
+            .map_err(|_| "Enter a valid amount".to_string())?
     };
     let sat = whole_n
         .checked_mul(SATS_PER_BTC)

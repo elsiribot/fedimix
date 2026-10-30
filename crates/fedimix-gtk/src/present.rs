@@ -150,7 +150,15 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         HistoryKind::Paid => ("\u{2197}", "Paid", None, None),
         HistoryKind::ReceivedLightning => ("\u{2198}", "Received (Lightning)", None, None),
         HistoryKind::Deposit => ("\u{2198}", "Deposit", None, None),
-        HistoryKind::Cover => ("\u{21c4}", "Cover traffic", None, None),
+        HistoryKind::Cover => (
+            "\u{21c4}",
+            "Cover traffic",
+            Some(TagView {
+                text: "cover".to_string(),
+                css_class: "tag-cover",
+            }),
+            None,
+        ),
     };
     let trailing = match &item.status {
         HistoryStatus::Confirming {
@@ -379,6 +387,16 @@ mod tests {
         ];
         assert_eq!(visible_history(&items, false).len(), 1);
         assert_eq!(visible_history(&items, true).len(), 2);
+    }
+
+    #[test]
+    fn cover_row_has_cover_tag() {
+        let r = history_row(
+            &hist(HistoryKind::Cover, false, HistoryStatus::Complete),
+            1_793_356_920,
+        );
+        let tag = r.tag.unwrap();
+        assert_eq!((tag.text.as_str(), tag.css_class), ("cover", "tag-cover"));
     }
 
     #[test]
