@@ -3,14 +3,15 @@
 expect 1.2034 BTC
 click Send
 type "Bitcoin address" bc1qdemo0fedimix0flow0address0for0testing
-type "Amount (BTC)" 0.01
+type "Amount (BTC)" 0.0123
 click Review
 expect Network fee
 shot review
-click 0.01000000 BTC
+click 0.01230000 BTC
 expect Change → Spending
 shot review-details
 click Confirm on Ledger Nano S+
-expect 0.2500 BTC
-expect Sent
+# Only true after the send: no fixture row has -0.0123 or this change.
+expect −0.0123
+expect change → Spending · 0.941
 shot sent

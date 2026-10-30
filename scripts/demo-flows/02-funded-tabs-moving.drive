@@ -10,7 +10,7 @@ click 1.2034 BTC
 expect 0.9534
 shot coins
 click Back
-expect History
+expect +0.4200 BTC depositing
 click Spending
 click 0.05 for spending · 0.42 moving to Saving ›
 expect 0.4200 BTC
@@ -21,4 +21,5 @@ expect A withdrawal fee applies
 shot exit-dialog
 click Exit now
 expect 0.2200 BTC
+expect-not 0.4200 BTC
 shot moving-after-exit

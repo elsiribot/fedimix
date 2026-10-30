@@ -2,10 +2,14 @@
 # Below-target Refill: confirm, balance updated.
 click Spending
 expect Refill from Saving
+expect 0.0112 BTC
 shot before
 click Refill from Saving
 expect Refill Spending
 shot dialog
 click Confirm on Ledger Nano S+
 expect Refill confirmed
+expect 0.0711 BTC
+expect-not 0.0112 BTC
+expect-not Refill from Saving
 shot after

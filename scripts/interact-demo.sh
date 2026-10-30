@@ -28,7 +28,7 @@ cleanup() {
     [[ -n "$app_pid" ]] && kill "$app_pid" 2>/dev/null || true
     [[ -n "$sway_pid" ]] && kill "$sway_pid" 2>/dev/null || true
     exec 3>&- 2>/dev/null || true
-    [[ -n "$rt" ]] && rm -rf "$rt"
+    if [[ -n "$rt" ]]; then rm -rf "$rt"; fi
 }
 trap cleanup EXIT
 
@@ -60,6 +60,7 @@ run_flow() {
     [[ -n "$wl" && -n "$sock" ]] || { echo "sway did not start" >&2; return 1; }
     export WAYLAND_DISPLAY="$wl" SWAYSOCK="$sock"
 
+    : > "$rt/out.log"
     mkfifo "$rt/stdin"
     exec 3<>"$rt/stdin"
     GDK_BACKEND=wayland GSK_RENDERER=cairo GTK_A11Y=none \

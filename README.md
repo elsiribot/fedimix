@@ -47,7 +47,7 @@ maps or the app logs `CRITICAL` or `panicked`.
 `--demo-drive <file>` (requires `--demo`) replays a script inside the running
 app, because OS-level input injection does not reach GTK under headless sway.
 One step per line: `click <label>`, `type <title> <text>`, `expect <text>`,
-`wait <ms>`, `shot <name>`, `respond <id>` (answer the visible AlertDialog) and
+`wait <ms>`, `shot <name>`, `expect-not <text>` and
 `action <name>` (e.g. `app.settings`). It prints `DRIVE OK`, or
 `DRIVE FAILED: <step>` and exits 1. `scripts/interact-demo.sh` (`just
 interact-demo [flow...]`) runs `scripts/demo-flows/*.drive` under headless

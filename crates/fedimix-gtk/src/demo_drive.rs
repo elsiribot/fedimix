@@ -13,7 +13,7 @@
 //! - `expect <text>`: wait up to 3 s for a mapped label containing `<text>`.
 //! - `wait <ms>`, `shot <name>` (prints `SHOT <name>`, then waits for a line
 //!   on stdin, or 500 ms when stdin is a terminal or closed).
-//! - `respond <id>`: answer the visible AlertDialog with response `<id>`.
+//! - `expect-not <text>`: wait up to 3 s until no mapped label contains `<text>`.
 //! - `action <name>`: activate an application action such as `app.settings`
 //!   (menu popovers are not in the widget tree until opened).
 //!
@@ -37,9 +37,9 @@ pub enum Step {
     Click(String),
     Type { widget: String, text: String },
     Expect(String),
+    ExpectNot(String),
     Wait(u64),
     Shot(String),
-    Respond(String),
     Action(String),
 }
 
@@ -69,8 +69,8 @@ fn parse_line(line: &str) -> Result<Step, String> {
     Ok(match cmd {
         "click" => Step::Click(need("a label")?),
         "expect" => Step::Expect(need("text")?),
+        "expect-not" => Step::ExpectNot(need("text")?),
         "shot" => Step::Shot(need("a name")?),
-        "respond" => Step::Respond(need("a response id")?),
         "action" => Step::Action(need("an action name")?),
         "wait" => Step::Wait(
             rest.parse()
@@ -104,9 +104,9 @@ impl fmt::Display for Step {
             Step::Click(l) => write!(f, "click {l}"),
             Step::Type { widget, text } => write!(f, "type \"{widget}\" {text}"),
             Step::Expect(t) => write!(f, "expect {t}"),
+            Step::ExpectNot(t) => write!(f, "expect-not {t}"),
             Step::Wait(ms) => write!(f, "wait {ms}"),
             Step::Shot(n) => write!(f, "shot {n}"),
-            Step::Respond(id) => write!(f, "respond {id}"),
             Step::Action(a) => write!(f, "action {a}"),
         }
     }
@@ -155,21 +155,13 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
                 .await
                 .ok_or_else(|| format!("no visible label containing '{text}'"))?;
         }
+        Step::ExpectNot(text) => {
+            poll(|| (!has_label_containing(env, text)).then_some(()))
+                .await
+                .ok_or_else(|| format!("a visible label still contains '{text}'"))?;
+        }
         Step::Wait(ms) => glib::timeout_future(Duration::from_millis(*ms)).await,
         Step::Shot(name) => shot(name).await,
-        Step::Respond(id) => {
-            let dialog = env
-                .window
-                .visible_dialog()
-                .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
-                .ok_or("no visible AlertDialog")?;
-            if !dialog.has_response(id) {
-                return Err(format!("dialog has no response '{id}'"));
-            }
-            dialog.emit_by_name::<()>("response", &[id]);
-            dialog.force_close();
-            glib::timeout_future(Duration::from_millis(150)).await;
-        }
         Step::Action(name) => {
             let (_, action) = name.split_once('.').ok_or("action needs app.<name>")?;
             if !env.app.has_action(action) {
@@ -211,14 +203,14 @@ async fn shot(name: &str) {
         glib::timeout_future(SHOT_LINE_TIMEOUT).await;
         false
     };
-    let got_line = futures_lite_or(line, timeout).await;
+    let got_line = first_of(line, timeout).await;
     if !got_line {
         glib::timeout_future(SHOT_PAUSE).await;
     }
 }
 
 /// Resolve with whichever future finishes first.
-async fn futures_lite_or(
+async fn first_of(
     a: impl std::future::Future<Output = bool>,
     b: impl std::future::Future<Output = bool>,
 ) -> bool {
@@ -409,9 +401,9 @@ click Exit now (lower privacy)
 type \"Amount (BTC)\" 0.01
 type Target 0.1 extra words
 expect Fedi Alpha
+expect-not Cover traffic
 wait 250
 shot funded-moving
-respond exit
 action app.settings
 ";
         assert_eq!(
@@ -427,9 +419,9 @@ action app.settings
                     text: "0.1 extra words".into()
                 },
                 Step::Expect("Fedi Alpha".into()),
+                Step::ExpectNot("Cover traffic".into()),
                 Step::Wait(250),
                 Step::Shot("funded-moving".into()),
-                Step::Respond("exit".into()),
                 Step::Action("app.settings".into()),
             ]
         );

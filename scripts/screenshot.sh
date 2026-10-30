@@ -36,6 +36,7 @@ cleanup() {
     [[ -n "$app_pid" ]] && kill "$app_pid" 2>/dev/null || true
     [[ -n "$sway_pid" ]] && kill "$sway_pid" 2>/dev/null || true
     rm -rf "$rt"
+    return 0
 }
 trap cleanup EXIT
 
