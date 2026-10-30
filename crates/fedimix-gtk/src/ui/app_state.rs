@@ -1,6 +1,6 @@
 //! Shared application context: snapshot cache, fan-out and error toasts.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 
@@ -9,6 +9,7 @@ use fedimix_core::{OperationId, OperationState, QueueState, SavingState, Spendin
 use crate::bridge::CoreBridge;
 use crate::operations::OperationTable;
 use crate::present::user_message;
+use crate::refresh::RefreshGate;
 
 #[derive(Debug, Clone)]
 pub struct Snapshots {
@@ -24,10 +25,7 @@ struct Shared {
     operations: RefCell<OperationTable<OperationWatcher>>,
     latest: RefCell<Option<Snapshots>>,
     subscribers: RefCell<Vec<Subscriber>>,
-    /// Number of refreshes started so far.
-    started: Cell<u64>,
-    /// Sequence number of the newest refresh whose result was applied.
-    applied: Cell<u64>,
+    refresh: RefCell<RefreshGate>,
 }
 
 #[derive(Clone)]
@@ -55,8 +53,7 @@ impl AppContext {
                 operations: RefCell::new(OperationTable::new()),
                 latest: RefCell::default(),
                 subscribers: RefCell::default(),
-                started: Cell::default(),
-                applied: Cell::default(),
+                refresh: RefCell::default(),
             }),
         }
     }
@@ -113,11 +110,16 @@ impl AppContext {
         self.shared.latest.borrow().clone()
     }
 
-    /// Refetch all three snapshots. A result that arrives after a newer
-    /// refresh was already applied is discarded.
+    /// Refetch all three snapshots, unless a fetch is running: then one more
+    /// follows it, however many refreshes were asked for meanwhile.
     pub fn refresh(&self) {
-        let seq = self.shared.started.get() + 1;
-        self.shared.started.set(seq);
+        let seq = self.shared.refresh.borrow_mut().request();
+        if let Some(seq) = seq {
+            self.fetch(seq);
+        }
+    }
+
+    fn fetch(&self, seq: u64) {
         let core = self.bridge.core();
         let ctx = self.clone();
         self.bridge.call(
@@ -133,21 +135,24 @@ impl AppContext {
                     queue: queue?,
                 })
             },
-            move |res| match res {
-                Ok(snapshots) => ctx.apply(seq, snapshots),
-                Err(e) => ctx.toast(&format!(
-                    "Could not load wallet state. {}",
-                    user_message(&e)
-                )),
+            move |res| {
+                let finished = ctx.shared.refresh.borrow_mut().finished(seq);
+                match res {
+                    Ok(snapshots) if finished.apply => ctx.apply(snapshots),
+                    Ok(_) => {}
+                    Err(e) => ctx.toast(&format!(
+                        "Could not load wallet state. {}",
+                        user_message(&e)
+                    )),
+                }
+                if let Some(next) = finished.restart {
+                    ctx.fetch(next);
+                }
             },
         );
     }
 
-    fn apply(&self, seq: u64, snapshots: Snapshots) {
-        if seq <= self.shared.applied.get() {
-            return;
-        }
-        self.shared.applied.set(seq);
+    fn apply(&self, snapshots: Snapshots) {
         *self.shared.latest.borrow_mut() = Some(snapshots.clone());
         // Clone the list so subscribers may register more subscribers.
         let subscribers: Vec<Subscriber> = self.shared.subscribers.borrow().clone();
