@@ -14,6 +14,7 @@
 //! - `wait <ms>`, `shot <name>` (prints `SHOT <name>`, then waits for a line
 //!   on stdin, or 500 ms when stdin is a terminal or closed).
 //! - `expect-not <text>`: wait up to 3 s until no mapped label contains `<text>`.
+//! - `expect-absent <text>`: no label holds `<text>`, even on a hidden page.
 //! - `expect-locked`: the open dialog cannot be closed and its page cannot be
 //!   popped, which is what Escape and Back go through.
 //! - `close-dialog`: close the open dialog, as Escape does.
@@ -41,6 +42,7 @@ pub enum Step {
     Type { widget: String, text: String },
     Expect(String),
     ExpectNot(String),
+    ExpectAbsent(String),
     ExpectLocked,
     CloseDialog,
     Wait(u64),
@@ -75,6 +77,7 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "click" => Step::Click(need("a label")?),
         "expect" => Step::Expect(need("text")?),
         "expect-not" => Step::ExpectNot(need("text")?),
+        "expect-absent" => Step::ExpectAbsent(need("text")?),
         "expect-locked" => Step::ExpectLocked,
         "close-dialog" => Step::CloseDialog,
         "shot" => Step::Shot(need("a name")?),
@@ -112,6 +115,7 @@ impl fmt::Display for Step {
             Step::Type { widget, text } => write!(f, "type \"{widget}\" {text}"),
             Step::Expect(t) => write!(f, "expect {t}"),
             Step::ExpectNot(t) => write!(f, "expect-not {t}"),
+            Step::ExpectAbsent(t) => write!(f, "expect-absent {t}"),
             Step::ExpectLocked => write!(f, "expect-locked"),
             Step::CloseDialog => write!(f, "close-dialog"),
             Step::Wait(ms) => write!(f, "wait {ms}"),
@@ -168,6 +172,17 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             poll(|| (!has_label_containing(env, text)).then_some(()))
                 .await
                 .ok_or_else(|| format!("a visible label still contains '{text}'"))?;
+        }
+        Step::ExpectAbsent(text) => {
+            let held = roots(env).iter().any(|r| {
+                descendants(r).iter().any(|d| {
+                    d.downcast_ref::<gtk::Label>()
+                        .is_some_and(|l| l.text().contains(text.as_str()))
+                })
+            });
+            if held {
+                return Err(format!("a label holds '{text}'"));
+            }
         }
         Step::ExpectLocked => {
             poll(|| locked(env).then_some(()))
@@ -436,6 +451,7 @@ type \"Amount (BTC)\" 0.01
 type Target 0.1 extra words
 expect Fedi Alpha
 expect-not Cover traffic
+expect-absent bc1q
 expect-locked
 close-dialog
 wait 250
@@ -456,6 +472,7 @@ action app.settings
                 },
                 Step::Expect("Fedi Alpha".into()),
                 Step::ExpectNot("Cover traffic".into()),
+                Step::ExpectAbsent("bc1q".into()),
                 Step::ExpectLocked,
                 Step::CloseDialog,
                 Step::Wait(250),

@@ -1,5 +1,6 @@
 //! Receive dialog: Lightning invoice and on-chain address with QR.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -23,6 +24,8 @@ struct PayloadView {
     copy: gtk::Button,
     expiry: gtk::Label,
     status: gtk::Label,
+    spinner: gtk::Spinner,
+    retry: gtk::Button,
     content: gtk::Box,
 }
 
@@ -60,11 +63,21 @@ impl PayloadView {
             .xalign(0.0)
             .visible(false)
             .build();
+        let spinner = gtk::Spinner::builder()
+            .visible(false)
+            .halign(gtk::Align::Center)
+            .build();
+        let retry = gtk::Button::with_label("Retry");
+        retry.add_css_class("pill");
+        retry.set_halign(gtk::Align::Center);
+        retry.set_visible(false);
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
             .build();
+        root.append(&spinner);
         root.append(&status);
+        root.append(&retry);
         root.append(&content);
 
         copy.connect_clicked(glib::clone!(
@@ -84,11 +97,14 @@ impl PayloadView {
             copy,
             expiry,
             status,
+            spinner,
+            retry,
             content,
         }
     }
 
     fn show(&self, info: &ReceiveInfo) {
+        self.set_loading(false);
         self.text.set_label(&info.payload);
         match qr::texture(&info.uri) {
             Ok(texture) => {
@@ -118,7 +134,19 @@ impl PayloadView {
 
     fn clear(&self) {
         self.status.set_visible(false);
+        self.retry.set_visible(false);
         self.content.set_visible(false);
+    }
+
+    fn set_loading(&self, loading: bool) {
+        self.spinner.set_visible(loading);
+        self.spinner.set_spinning(loading);
+    }
+
+    fn show_failure(&self, text: &str) {
+        self.set_loading(false);
+        self.show_status(text);
+        self.retry.set_visible(true);
     }
 }
 
@@ -147,6 +175,8 @@ fn vbox() -> gtk::Box {
 
 /// Fetch the deposit address into `view`.
 fn load_address(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
+    view.clear();
+    view.set_loading(true);
     let core = ctx.bridge.core();
     let request = ReceiveRequest {
         wallet,
@@ -159,11 +189,23 @@ fn load_address(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
             view,
             move |res| match res {
                 Ok(info) => view.show(&info),
-                Err(e) =>
-                    view.show_status(&format!("Could not get an address. {}", user_message(&e))),
+                Err(e) => {
+                    view.show_failure(&format!("Could not get an address. {}", user_message(&e)));
+                }
             }
         ),
     );
+}
+
+/// Retry reloads the address after a failure.
+fn connect_retry(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
+    view.retry.connect_clicked(glib::clone!(
+        #[strong]
+        ctx,
+        #[strong]
+        view,
+        move |_| load_address(&ctx, wallet, &view)
+    ));
 }
 
 fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box {
@@ -189,14 +231,20 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
     page.append(&create);
     page.append(&view.root);
 
+    // Bumped by each request and edit; a reply for an older one is dropped.
+    let generation = Rc::new(Cell::new(0u64));
     amount.connect_changed(glib::clone!(
         #[weak]
         create,
         #[strong]
         view,
+        #[strong]
+        generation,
         move |row| {
             // An edited amount makes the shown invoice stale.
+            generation.set(generation.get() + 1);
             view.clear();
+            view.set_loading(false);
             create.set_sensitive(matches!(
                 parse_btc(&row.text()),
                 Ok(a) if a != Amount::ZERO
@@ -212,11 +260,16 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
         description,
         #[strong]
         view,
+        #[strong]
+        generation,
         move |button| {
             let Ok(sats) = parse_btc(&amount.text()) else {
                 return;
             };
+            let current = generation.get() + 1;
+            generation.set(current);
             view.clear();
+            view.set_loading(true);
             button.set_sensitive(false);
             let core = ctx.bridge.core();
             let request = ReceiveRequest {
@@ -234,8 +287,14 @@ fn lightning_page(ctx: &Rc<AppContext>, toasts: &adw::ToastOverlay) -> gtk::Box 
                     button,
                     #[strong]
                     view,
+                    #[strong]
+                    generation,
                     move |res| {
+                        if generation.get() != current {
+                            return;
+                        }
                         button.set_sensitive(true);
+                        view.set_loading(false);
                         match res {
                             Ok(info) => view.show(&info),
                             Err(e) => view.show_status(&format!(
@@ -266,6 +325,21 @@ pub fn open(ctx: &Rc<AppContext>, wallet: WalletKind) {
             let body = vbox();
             body.append(&view.root);
             stack.add_titled(&scrolled(&body), Some("onchain"), "On-chain");
+            // Addresses are finite: allocate one only for someone who looks.
+            let requested = Cell::new(false);
+            stack.connect_visible_child_name_notify(glib::clone!(
+                #[strong]
+                ctx,
+                #[strong]
+                view,
+                move |stack| {
+                    if stack.visible_child_name().as_deref() == Some("onchain")
+                        && !requested.replace(true)
+                    {
+                        load_address(&ctx, wallet, &view);
+                    }
+                }
+            ));
             let switcher = gtk::StackSwitcher::builder().stack(&stack).build();
             header.set_title_widget(Some(&switcher));
             toolbar.set_content(Some(&stack));
@@ -283,9 +357,10 @@ pub fn open(ctx: &Rc<AppContext>, wallet: WalletKind) {
             note.add_css_class("caption");
             body.append(&note);
             toolbar.set_content(Some(&scrolled(&body)));
+            load_address(ctx, wallet, &view);
         }
     }
-    load_address(ctx, wallet, &view);
+    connect_retry(ctx, wallet, &view);
     toolbar.add_top_bar(&header);
     toasts.set_child(Some(&toolbar));
     let dialog = adw::Dialog::builder()

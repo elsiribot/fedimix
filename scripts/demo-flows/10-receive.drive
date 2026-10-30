@@ -1,0 +1,17 @@
+# scenario: funded
+# Lightning first: no address is allocated until the On-chain tab opens.
+click Spending
+click Receive
+expect Create invoice
+expect-absent bc1qdemo
+type "Amount (BTC)" 0.001
+type "Description (optional)" Coffee
+click Create invoice
+expect lnbc1000000n1pdemo
+expect Expires in
+shot invoice
+type "Amount (BTC)" 0.002
+expect-not lnbc1000000n1pdemo
+click On-chain
+expect bc1qdemo
+shot address

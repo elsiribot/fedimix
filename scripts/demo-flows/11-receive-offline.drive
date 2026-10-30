@@ -1,0 +1,10 @@
+# scenario: offline
+# Spending cannot receive while the federation is unreachable; Retry stays offered.
+click Spending
+click Receive
+click On-chain
+expect Could not get an address
+expect You are offline
+shot failed
+click Retry
+expect You are offline

@@ -886,7 +886,7 @@ impl Backend for DemoBackend {
                 }
             }
             ReceiveMethod::OnChain => {
-                let payload = fixtures::address_for(0);
+                let payload = fixtures::address_for(self.state.lock().await.next_coin_index());
                 ReceiveInfo {
                     uri: format!("bitcoin:{payload}"),
                     payload,
