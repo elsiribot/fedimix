@@ -4,3 +4,6 @@
 - `scripts/screenshot.sh` builds the binary before starting sway, so the 15 s window-map timeout excludes compilation.
 - `just screenshot` writes to `target/screenshots/<name>.png`, which is already gitignored via `/target/`.
 - Screenshot harness waits for sway app_id `fedimix` (what GTK reports under headless sway), not the reverse-DNS application id.
+- `Amount::from_sat` uses plain multiplication (no saturation); max supply (2.1e15 sat) fits u64 msat, so overflow cannot occur for valid values.
+- `EventStream` derives Clone (async_channel receivers are cloneable, work-sharing) so the UI can hand it to tasks easily.
+- tokio is a dev-dependency only (features macros, rt) in core; the async API stays runtime-agnostic.

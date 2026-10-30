@@ -6,3 +6,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-channel.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
