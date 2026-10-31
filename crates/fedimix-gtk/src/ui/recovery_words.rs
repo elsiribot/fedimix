@@ -6,12 +6,9 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
+use crate::present;
 use crate::ui::app_state::AppContext;
 use crate::ui::coins_page::{nav_page, page_body};
-
-const WARNING: &str = "Write these words down and keep them offline. Anyone who has them can \
-take your bitcoin, and without them a lost device cannot be recovered. Never share or \
-photograph them.";
 
 const COPIED: &str = "Copied. Clear your clipboard when done.";
 /// How long the words may sit on the clipboard.
@@ -67,7 +64,7 @@ pub fn push(ctx: &Rc<AppContext>) {
 
 fn show(ctx: &Rc<AppContext>, words: String) {
     let warning = gtk::Label::builder()
-        .label(WARNING)
+        .label(present::RECOVERY_WARNING)
         .wrap(true)
         .xalign(0.0)
         .build();

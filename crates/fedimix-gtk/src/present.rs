@@ -149,7 +149,15 @@ pub fn connection_banner(federation: Option<&FederationInfo>) -> Option<&str> {
     }
 }
 
-pub const BACKUP_BANNER: &str = "Write down your recovery words";
+pub const BACKUP_BANNER: &str = "Write down your recovery words and keep your invite codes";
+
+/// Above the words. In this version they restore nothing on their own, and a
+/// folder copy that runs again reuses ecash nonces.
+pub const RECOVERY_WARNING: &str = "Write these words down and keep them offline. Anyone who \
+has them can take your bitcoin. Never share or photograph them. In this version Fedimix \
+cannot restore a wallet from them alone: keep your invite codes too, because the words do not \
+say which federations you joined. Never run or restore an old copy of the data folder: that \
+can lose your ecash.";
 
 /// A user can hold real funds with no backup, so ask once there is something
 /// to lose, until the words have been opened.
@@ -1172,6 +1180,15 @@ mod tests {
         let sp = spending(0.05, 0.42, 0.05, false);
         assert!(saving_banner(&sp, true).is_some());
         assert_eq!(saving_banner(&sp, false), None);
+    }
+
+    #[test]
+    fn the_recovery_warning_promises_only_what_is_true() {
+        assert!(RECOVERY_WARNING.contains("cannot restore a wallet from them alone"));
+        assert!(RECOVERY_WARNING.contains("invite codes"));
+        assert!(RECOVERY_WARNING.contains("old copy"));
+        assert!(!RECOVERY_WARNING.contains("cannot be recovered"));
+        assert!(BACKUP_BANNER.contains("invite codes"));
     }
 
     #[test]

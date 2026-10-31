@@ -961,6 +961,41 @@ async fn lost_client_db_recovers_balance() {
     backend.shutdown().await.unwrap();
 }
 
+/// The manual restore the README documents: the words in a new folder's `seed`,
+/// then a join with the invite code. The old folder is never run again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn seed_file_in_a_new_folder_recovers() {
+    let (_old, config) = folder();
+    let backend = joined_backend(&config).await;
+    let words = backend.recovery_words().await.unwrap();
+    let events = backend.subscribe();
+    pay_backend_with_lnd(&backend, 10_000).await;
+    wait_received(&backend, &events).await;
+    let balance = wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let (new, config) = folder();
+    let seed = new.path().join("seed");
+    std::fs::write(&seed, &words).unwrap();
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let backend = RealBackend::open(config).await.unwrap();
+    assert_eq!(backend.recovery_words().await.unwrap(), words);
+    let joined = backend.join_federation(invite()).await.unwrap();
+    assert!(!joined.online, "recovered, never joined afresh");
+    connected_with(&backend, balance).await;
+
+    // As after a lost client database: the wallet and the mint both work, and
+    // the next notes do not reuse a nonce.
+    address(&backend).await;
+    let events = backend.subscribe();
+    pay_backend_with_lnd(&backend, 5_000).await;
+    wait_received(&backend, &events).await;
+    wait_balance(&backend, |now| now > balance).await;
+    backend.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs devimint"]
 async fn an_empty_client_database_counts_as_lost() {

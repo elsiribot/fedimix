@@ -5,6 +5,7 @@
 action app.settings
 click Recovery words
 expect Write these words down
+expect keep your invite codes too
 expect-numbered 12
 shot words
 click Copy

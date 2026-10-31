@@ -60,9 +60,24 @@ The first launch creates a seed in the folder (`seed`, mode 0600, a plain file,
 not encrypted). Whoever can read it can spend your funds. The folder is created
 0700 and Fedimix refuses a seed or folder open to others. Spending asks you to
 write down the recovery words once you hold funds, and Settings shows them at
-any time. Back them up: they are what restores your funds, and nothing else
-does. Restoring from the words on a new device is not available yet; today the
-words are a record, and the data folder with its seed is the wallet.
+any time.
+
+In this version the words alone do not restore a wallet in the app, and they do
+not say which federations you joined. Keep your invite codes with them.
+
+Never run or restore an old copy of the data folder, and never run one folder on
+two machines: that reuses ecash nonces, and ecash spent twice is lost. Deleting
+`seed` does not make a wallet safer either: Fedimix then refuses to start until
+the file is back.
+
+To restore by hand on a new device:
+
+1. Create a new, empty data folder with mode 0700. Do not copy the old one.
+2. Write the words, separated by spaces, into a file named `seed` in that
+   folder, with mode 0600.
+3. Start Fedimix with `--data-dir` on that folder.
+4. Join each federation with its invite code. Fedimix rebuilds the balance from
+   the federation, which can take a while; the old history does not come back.
 
 ## Not yet
 
@@ -71,7 +86,7 @@ words are a record, and the data folder with its seed is the wallet.
 - Exits and cover traffic.
 - A proxy for federation traffic: fedimint has no SOCKS5 support, so setting a
   proxy keeps federations offline instead of connecting directly.
-- Restoring from the recovery words on a new device.
+- Restoring from the recovery words inside the app; see the manual steps above.
 
 ## Demo mode
 
