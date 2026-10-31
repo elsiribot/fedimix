@@ -151,6 +151,9 @@ pub struct FederationInfo {
     /// Its data is being rebuilt from the federation. Stays true across
     /// failed attempts, which keep retrying, until the client is usable.
     pub recovering: bool,
+    /// A sentence on why this federation cannot be reached, when waiting will
+    /// not cure it. `None` covers plain offline, which `online` says.
+    pub problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

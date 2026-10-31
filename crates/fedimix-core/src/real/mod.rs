@@ -103,6 +103,16 @@ fn system_clock() -> Timestamp {
         .map_or(0, |since| since.as_secs())
 }
 
+/// What to tell the user about a failed `open`. Waiting cures `Offline`, so
+/// that is no problem; every other error keeps failing until they act.
+fn problem_of(error: &FedimixError) -> Option<String> {
+    match error {
+        FedimixError::Offline => None,
+        FedimixError::Internal(sentence) => Some(sentence.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 fn saving_not_set_up() -> FedimixError {
     FedimixError::NotSetUp(SAVING_NOT_SET_UP.into())
 }
@@ -185,11 +195,13 @@ impl Core {
 
     fn info(&self, row: &FederationRow) -> FederationInfo {
         let open = *self.gate.borrow() == Gate::Open;
-        let (online, recovering) = self
+        let (online, recovering, open_error) = self
             .state()
             .live
             .get(&row.id)
-            .map_or((false, false), |live| (live.online, live.recovering));
+            .map_or((false, false, None), |live| {
+                (live.online, live.recovering, live.last_open_error.clone())
+            });
         FederationInfo {
             id: row.id.clone(),
             name: row.name.clone(),
@@ -200,6 +212,7 @@ impl Core {
             },
             // Nothing runs behind a closed gate, so say offline instead.
             recovering: open && recovering,
+            problem: open_error.filter(|_| open).and_then(|e| problem_of(&e)),
         }
     }
 

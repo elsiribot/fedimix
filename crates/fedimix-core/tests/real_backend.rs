@@ -234,6 +234,40 @@ async fn first_joined_stays_active() {
     backend.shutdown().await.unwrap();
 }
 
+const WRONG_PHRASE: &str = "This federation's data was made with a different recovery phrase.";
+
+#[tokio::test]
+async fn a_federation_that_cannot_open_says_why() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    assert_eq!(backend.federations().await.unwrap()[0].problem, None);
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness
+        .port
+        .set_open_error(Some(FedimixError::Internal(WRONG_PHRASE.into())));
+    let backend = harness.open().await.unwrap();
+    wait_until("the problem", || async {
+        let state = backend.spending_state().await.unwrap();
+        state.federation.unwrap().problem.as_deref() == Some(WRONG_PHRASE)
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // Waiting cures Offline, so that is no problem to report.
+    harness.port.set_open_error(Some(FedimixError::Offline));
+    let backend = harness.open().await.unwrap();
+    wait_until("the failed open", || async {
+        harness.port.open_failures() > 1
+    })
+    .await;
+    let federation = backend.spending_state().await.unwrap().federation.unwrap();
+    assert_eq!(federation.problem, None);
+    backend.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn spending_state_splits_at_target() {
     let harness = Harness::new();

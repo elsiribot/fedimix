@@ -58,6 +58,7 @@ pub fn federation(online: bool) -> FederationInfo {
         // The demo backend fills in the real figure.
         balance: Amount::ZERO,
         recovering: false,
+        problem: None,
     }
 }
 

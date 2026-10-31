@@ -135,9 +135,14 @@ pub fn saving_empty_state(can_set_up: bool) -> SavingEmptyState {
 pub const RECOVERING_BANNER: &str =
     "Restoring your wallet from the federation. This can take a while.";
 
-/// The banner about the connection to `federation`, if it needs one.
-pub fn connection_banner(federation: Option<&FederationInfo>) -> Option<&'static str> {
+/// The banner about the connection to `federation`, if it needs one. A problem
+/// comes first: waiting will not cure it, so the user has to hear it.
+pub fn connection_banner(federation: Option<&FederationInfo>) -> Option<&str> {
     match federation {
+        Some(FederationInfo {
+            problem: Some(problem),
+            ..
+        }) => Some(problem),
         Some(f) if f.recovering => Some(RECOVERING_BANNER),
         Some(f) if !f.online => Some("Offline"),
         _ => None,
@@ -1162,10 +1167,27 @@ mod tests {
             anonymity_estimate: 0,
             balance: Amount::ZERO,
             recovering,
+            problem: None,
         };
         assert_eq!(connection_banner(None), None);
         assert_eq!(connection_banner(Some(&fed(true, false))), None);
         assert_eq!(connection_banner(Some(&fed(false, false))), Some("Offline"));
+        let problem = FederationInfo {
+            problem: Some("This federation's data is damaged.".into()),
+            ..fed(false, false)
+        };
+        assert_eq!(
+            connection_banner(Some(&problem)),
+            Some("This federation's data is damaged.")
+        );
+        let failing_recovery = FederationInfo {
+            recovering: true,
+            ..problem
+        };
+        assert_eq!(
+            connection_banner(Some(&failing_recovery)),
+            Some("This federation's data is damaged.")
+        );
         assert_eq!(
             connection_banner(Some(&fed(false, true))),
             Some("Restoring your wallet from the federation. This can take a while.")

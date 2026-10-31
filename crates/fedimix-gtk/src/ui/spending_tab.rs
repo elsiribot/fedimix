@@ -36,6 +36,8 @@ pub struct SpendingTab {
 impl SpendingTab {
     pub fn new(ctx: Rc<AppContext>) -> Self {
         let connection = adw::Banner::new("");
+        // Core sentences can name paths.
+        connection.set_use_markup(false);
         let backup = adw::Banner::builder()
             .title(present::BACKUP_BANNER)
             .button_label("Show words \u{203a}")
