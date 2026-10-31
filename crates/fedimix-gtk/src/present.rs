@@ -16,6 +16,7 @@ pub struct Caption {
     pub shows_refill: bool,
     /// Bar fill, always within 0..=1.
     pub fraction: f64,
+    pub shows_bar: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +54,16 @@ fn fraction(num: u64, den: u64) -> f64 {
 }
 
 pub fn spending_caption(s: &SpendingState) -> Caption {
+    // With nowhere for money to go, a target would imply that it is going.
+    if !s.features.saving {
+        return Caption {
+            text: String::new(),
+            queue_link: None,
+            shows_refill: false,
+            fraction: 0.0,
+            shows_bar: false,
+        };
+    }
     let spend = format::btc_short(s.for_spending);
     let moving = format::btc_short(s.moving);
     let is_moving = s.moving > Amount::ZERO;
@@ -69,6 +80,7 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
             queue_link: (is_moving && s.saving_ready).then_some(moving_link),
             shows_refill: s.saving_ready,
             fraction: fraction(s.for_spending.msat, s.target.msat),
+            shows_bar: true,
         };
     }
     if !is_moving {
@@ -77,6 +89,7 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
             queue_link: None,
             shows_refill: false,
             fraction: 1.0,
+            shows_bar: true,
         };
     }
     let total = s.for_spending.msat.saturating_add(s.moving.msat);
@@ -87,6 +100,7 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
             queue_link: Some(format!("{spend} for spending {DOT} {moving_link}")),
             shows_refill: false,
             fraction,
+            shows_bar: true,
         }
     } else {
         Caption {
@@ -94,6 +108,7 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
             queue_link: None,
             shows_refill: false,
             fraction,
+            shows_bar: true,
         }
     }
 }
@@ -715,8 +730,8 @@ pub fn validate_server_url(electrum: bool, url: &str) -> Result<(), String> {
     }
 }
 
-/// Under the proxy row: connections made before a proxy was set can outlive it.
-pub const PROXY_CAPTION: &str = "Connections already open stay open until you restart Fedimix.";
+/// Under the proxy row: fedimint has no proxy support, so nothing connects.
+pub const PROXY_CAPTION: &str = "With a proxy set, Fedimix stays offline.";
 
 /// Empty, or `[socks5://|socks5h://]host:port`. A proxy that does not parse
 /// must never be dropped in favour of a direct connection.
@@ -813,10 +828,21 @@ mod tests {
 
     #[test]
     fn proxy_caption_states_the_limit() {
-        assert_eq!(
-            PROXY_CAPTION,
-            "Connections already open stay open until you restart Fedimix."
-        );
+        assert_eq!(PROXY_CAPTION, "With a proxy set, Fedimix stays offline.");
+    }
+
+    #[test]
+    fn without_saving_spending_shows_the_balance_alone() {
+        let state = SpendingState {
+            features: Features::NONE,
+            ..spending(0.05, 0.42, 0.05, false)
+        };
+        let caption = spending_caption(&state);
+        assert_eq!(caption.text, "");
+        assert_eq!(caption.queue_link, None);
+        assert!(!caption.shows_refill);
+        assert!(!caption.shows_bar);
+        assert!(spending_caption(&spending(0.05, 0.42, 0.05, false)).shows_bar);
     }
 
     fn sat(n: u64) -> Amount {

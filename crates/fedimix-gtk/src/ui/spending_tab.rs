@@ -18,6 +18,7 @@ struct Inner {
     federation: gtk::Label,
     balance: widgets::AmountButton,
     bar: gtk::LevelBar,
+    bar_clamp: adw::Clamp,
     caption: gtk::Label,
     caption_link: gtk::Button,
     refill: gtk::Button,
@@ -169,6 +170,7 @@ impl SpendingTab {
             federation,
             balance,
             bar,
+            bar_clamp,
             caption,
             caption_link,
             refill,
@@ -245,6 +247,7 @@ impl Inner {
 
         let caption = present::spending_caption(s);
         self.bar.set_value(caption.fraction);
+        self.bar_clamp.set_visible(caption.shows_bar);
         self.caption.set_label(&caption.text);
         self.caption.set_visible(!caption.text.is_empty());
         self.caption_link

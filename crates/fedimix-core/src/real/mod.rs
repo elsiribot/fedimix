@@ -34,6 +34,8 @@ use crate::store::{FederationRow, Store, Watch};
 
 const DB_FILE: &str = "fedimix.db";
 const SAVING_NOT_SET_UP: &str = "Saving arrives in a later version.";
+const PROXY_SET: &str =
+    "With a proxy set, Fedimix stays offline. Clear the proxy in Settings to connect.";
 const SATS_SUPPLY: u64 = 2_100_000_000_000_000;
 
 /// The time in Unix seconds. Injected so tests are deterministic.
@@ -194,7 +196,8 @@ impl Core {
     }
 
     fn info(&self, row: &FederationRow) -> FederationInfo {
-        let open = *self.gate.borrow() == Gate::Open;
+        let gate = *self.gate.borrow();
+        let open = gate == Gate::Open;
         let (online, recovering, open_error) = self
             .state()
             .live
@@ -212,7 +215,11 @@ impl Core {
             },
             // Nothing runs behind a closed gate, so say offline instead.
             recovering: open && recovering,
-            problem: open_error.filter(|_| open).and_then(|e| problem_of(&e)),
+            problem: if gate == Gate::Proxy {
+                Some(PROXY_SET.to_string())
+            } else {
+                open_error.filter(|_| open).and_then(|e| problem_of(&e))
+            },
             has_lightning: row.has_lightning,
         }
     }

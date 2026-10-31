@@ -15,11 +15,11 @@ expect-not Hardware wallet
 shot settings
 scroll-end
 shot settings-end
-# Over the target the rest waits, and nothing promises it is on its way.
+# Without Saving the balance stands alone: a target would imply money on its way.
 type "Target (BTC)" 0.001
 wait 800
 click Back
-expect-slow waiting for Saving
+expect-not waiting for Saving
 expect-not moving to Saving
 expect-not Set up Saving
 shot waiting-for-saving

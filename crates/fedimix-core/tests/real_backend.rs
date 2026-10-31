@@ -2529,6 +2529,24 @@ async fn the_snapshot_totals_every_federation() {
 }
 
 #[tokio::test]
+async fn a_set_proxy_is_the_problem_while_it_stands() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let mut settings = backend.settings().await.unwrap();
+    settings.socks5_proxy = Some("127.0.0.1:9050".into());
+    backend.set_settings(settings.clone()).await.unwrap();
+    let federation = backend.federations().await.unwrap().remove(0);
+    assert_eq!(
+        federation.problem.as_deref(),
+        Some("With a proxy set, Fedimix stays offline. Clear the proxy in Settings to connect.")
+    );
+    settings.socks5_proxy = None;
+    backend.set_settings(settings).await.unwrap();
+    assert_eq!(backend.federations().await.unwrap()[0].problem, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_higher_fee_at_confirm_expires_the_preview() {
     let harness = Harness::new();
     let backend = funded(&harness, sat(1_000)).await;

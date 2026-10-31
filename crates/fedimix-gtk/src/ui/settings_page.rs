@@ -520,6 +520,9 @@ impl Inner {
         self.exit.set_visible(features.scheduler);
         self.cover.set_visible(features.cover);
         self.hardware.set_visible(features.saving);
+        // Only Saving talks to a chain server.
+        self.backend.set_visible(features.saving);
+        self.url.set_visible(features.saving);
         match &s.saving.device {
             Some(device) => {
                 self.hw_name.set_subtitle(&device.name);
