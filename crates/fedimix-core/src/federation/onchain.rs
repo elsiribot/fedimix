@@ -32,7 +32,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::fedimint::{
-    INTENT_KEY, NO_RECORD, UNREADABLE, amount_of, failed, quote_error, read, sat_amount,
+    INTENT_KEY, NO_RECORD, amount_of, failed, quote_error, read, sat_amount, settled_send,
     submit_error, total_of, whole_sats,
 };
 use super::port::{DepositEvent, WatchUpdate, WithdrawQuote, WithdrawTerms};
@@ -428,14 +428,8 @@ async fn withdraw_v1(
         match state {
             WithdrawState::Created => {}
             WithdrawState::Succeeded(txid) => {
-                let Some((amount, fee)) = withdrawn_v1(client, op).await else {
-                    return failed(UNREADABLE);
-                };
-                return WatchUpdate::Settled {
-                    amount,
-                    fee,
-                    txid: Some(txid.to_string()),
-                };
+                let details = withdrawn_v1(client, op).await;
+                return settled_send(details, Some(txid.to_string()));
             }
             WithdrawState::Failed(_) => break,
         }
@@ -460,14 +454,7 @@ async fn withdraw_v2(
 ) -> WatchUpdate {
     match w.await_final_send_operation_state(op).await {
         Ok(FinalSendOperationState::Success(txid)) => {
-            let Some((amount, fee)) = withdrawn_v2(client, op).await else {
-                return failed(UNREADABLE);
-            };
-            WatchUpdate::Settled {
-                amount,
-                fee,
-                txid: Some(txid.to_string()),
-            }
+            settled_send(withdrawn_v2(client, op).await, Some(txid.to_string()))
         }
         Ok(FinalSendOperationState::Aborted) => {
             failed("The federation did not accept the withdrawal.")

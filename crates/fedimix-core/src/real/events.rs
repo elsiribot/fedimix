@@ -16,6 +16,8 @@ use crate::federation::FederationClient;
 
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How often a steady connection looks at sends left with no operation.
+const RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// `None` once closed, so streams end and a late subscriber sees that too.
 pub(super) struct Events {
@@ -169,6 +171,7 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
     let mut watches = core.resume_watches(&client, &id);
     let mut balances = client.balance_changes();
     let mut online = client.online_changes();
+    let mut resolve = tokio::time::interval_at(Instant::now() + RESOLVE_INTERVAL, RESOLVE_INTERVAL);
     loop {
         tokio::select! {
             balance = balances.next() => match balance {
@@ -184,6 +187,12 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
                 }
                 None => return,
             },
+            _ = resolve.tick() => {
+                let live = core.state().live.get(&id).is_some_and(|live| live.online);
+                if live {
+                    watches.resolve_unsent(&id);
+                }
+            }
             () = watches.tend() => {}
         }
     }

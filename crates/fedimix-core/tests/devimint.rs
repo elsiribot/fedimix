@@ -258,6 +258,11 @@ async fn pay(client: &dyn FederationClient, invoice: &str, amount: Amount) -> St
     client.pay_invoice(&quote, "test").await.unwrap()
 }
 
+/// Never above what was shown; at most 1 sat below it.
+fn within_shown(spent: Amount, shown: Amount) -> bool {
+    spent <= shown && shown.saturating_sub(spent) <= Amount::from_sat(1)
+}
+
 fn is_sentence(text: &str) -> bool {
     text.ends_with('.') && !text.contains("Error") && !text.contains('{')
 }
@@ -494,7 +499,7 @@ async fn withdraw_returns_txid() {
     let spent = before.saturating_sub(client.balance().await.unwrap());
     let shown = quote.amount.checked_add(quote.fee).unwrap();
     assert!(
-        spent.as_sat().abs_diff(shown.as_sat()) <= 1,
+        within_shown(spent, shown),
         "spent {spent:?}, shown {shown:?}"
     );
 
@@ -1046,11 +1051,11 @@ async fn final_row(backend: &RealBackend, id: &str) -> HistoryItem {
     .expect("the row reaches a final status")
 }
 
-/// Waits until the balance has fallen from `before` by `spent`, within 1 sat.
-async fn wait_debited(backend: &RealBackend, before: Amount, spent: Amount) {
-    let wanted = before.saturating_sub(spent).as_sat();
+/// Waits until the balance has fallen from `before` by what [`within_shown`]
+/// allows of `shown`. It waits because change can still be on its way.
+async fn wait_debited(backend: &RealBackend, before: Amount, shown: Amount) {
     let reached = tokio::time::timeout(PATIENCE, async {
-        while balance_of(backend).await.as_sat().abs_diff(wanted) > 1 {
+        while !within_shown(before.saturating_sub(balance_of(backend).await), shown) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
@@ -1058,7 +1063,7 @@ async fn wait_debited(backend: &RealBackend, before: Amount, spent: Amount) {
     let now = balance_of(backend).await;
     assert!(
         reached.is_ok(),
-        "from {before:?} by {spent:?}, and the balance is {now:?}"
+        "from {before:?} with {shown:?} shown, and the balance is {now:?}"
     );
 }
 
@@ -1111,6 +1116,26 @@ async fn pay_lightning_end_to_end() {
     wait_received(&payee, &payee_events).await;
     payee.shutdown().await.unwrap();
     payer.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn expired_invoice_is_refused_at_preview() {
+    let reply = sh("$FM_LNCLI addinvoice --amt 1000 --expiry 1").unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let expired = reply["payment_request"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (_dir, config) = folder();
+    let backend = joined_backend(&config).await;
+    let request = spending(&expired, SendAmount::FromInvoice);
+    assert_eq!(
+        backend.prepare_send(request).await,
+        Err(FedimixError::InvalidDestination(
+            "This invoice has expired.".into()
+        ))
+    );
+    backend.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -270,6 +270,7 @@ impl Core {
             store.set_cursor(&deposits_cursor(id), 0)?;
             row.invite.clone()
         };
+        self.finish_lost_intents(id)?;
         self.port.recover(&invite, &self.seed).await
     }
 
@@ -346,7 +347,9 @@ impl Watches {
     }
 
     /// Settles what a crash left of sends with no operation. Runs each time the
-    /// federation comes online, so a lookup that failed is tried again.
+    /// federation comes online and on a slow timer while it stays online, so a
+    /// lookup that failed, or an operation id that could not be saved, is tried
+    /// again.
     pub(super) fn resolve_unsent(&mut self, federation: &str) {
         for watch in self.core.unsent(federation) {
             let core = Arc::clone(&self.core);

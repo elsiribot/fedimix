@@ -79,7 +79,8 @@ pub enum WatchUpdate {
     },
     /// `amount` is what the operation moved: for a receive what reached the
     /// wallet before the ecash fee, for a send what the recipient got. `fee` is
-    /// the part on top of that (or taken from it) that the operation names.
+    /// the part on top of that (or taken from it) that the operation names. A
+    /// send whose details cannot be read reports both as zero.
     Settled {
         amount: Amount,
         fee: Amount,
@@ -172,8 +173,8 @@ pub trait FederationClient: Send + Sync {
     /// Returns the watch id. `intent` is recorded with the operation, see
     /// [`Self::find_operation`].
     async fn withdraw(&self, quote: &WithdrawQuote, intent: &str) -> Result<String>;
-    /// The watch id of the payment or withdrawal submitted under `intent`, read
-    /// from the newest 1000 operations. `None` means it was never submitted, so
+    /// The watch id of the payment or withdrawal submitted under `intent`, from
+    /// the whole operation log. `None` means it was never submitted, so
     /// a caller that recorded the intent first can tell after a crash whether
     /// to resume.
     async fn find_operation(&self, intent: &str) -> Result<Option<String>>;

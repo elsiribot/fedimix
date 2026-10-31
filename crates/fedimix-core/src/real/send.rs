@@ -24,10 +24,14 @@ use crate::store::{HistoryWrite, Watch, WatchKind};
 
 /// How long a preview can be confirmed, as in the demo.
 const PREVIEW_TTL: Timestamp = 600;
-/// Past the client's own 10 s wait for calls to let go of it.
+/// How long `shutdown` waits for submissions, after closing clients took up to
+/// their own 10 s: up to 25 s in all. GTK caps shutdown at 5 s until Task 9
+/// raises that to 30 s, and until then a submission at quit is cut off there,
+/// which a restart settles.
 const SUBMISSION_GRACE: Duration = Duration::from_secs(15);
 const CAME_BACK: &str = "The payment failed and the money came back.";
 const NEVER_SENT: &str = "This payment was never sent, so no money left your wallet.";
+const LOST_RECORD: &str = "Fedimix lost its record of this payment and cannot tell whether it was sent. Check your balance before paying again.";
 const EXPIRED: &str = "The payment expired before it went through.";
 const NO_AMOUNT: &str = "This invoice has no amount, so it cannot be paid.";
 
@@ -118,18 +122,21 @@ fn failed_with(sentence: &str) -> OperationState {
     }
 }
 
-/// Quotes once more at the shown amount, because a quote goes stale: both wallet
-/// generations reject old fee terms. Never more than was shown.
+/// Quotes once more, because the fee moves: wallets reject old fee terms, and
+/// the federation's fee follows the notes held at the moment of paying. Never
+/// more than was shown.
 async fn fresh_quote(client: &dyn FederationClient, quote: Quote) -> Result<Quote> {
-    let Quote::OnChain(shown) = quote else {
-        return Ok(quote);
+    let fresh = match &quote {
+        Quote::Lightning(shown) => Quote::Lightning(client.lightning_quote(&shown.invoice).await?),
+        Quote::OnChain(shown) => {
+            let exact = SendAmount::Exact(shown.amount);
+            Quote::OnChain(client.withdraw_quote(&shown.address, exact).await?)
+        }
     };
-    let exact = SendAmount::Exact(shown.amount);
-    let fresh = client.withdraw_quote(&shown.address, exact).await?;
-    if fresh.fee > shown.fee {
+    if fresh.fee() > quote.fee() {
         return Err(FedimixError::PreviewExpired);
     }
-    Ok(Quote::OnChain(fresh))
+    Ok(fresh)
 }
 
 impl Core {
@@ -369,6 +376,17 @@ impl Core {
             id: operation,
             ..watch.clone()
         })
+    }
+
+    /// Ends the sends with no operation, before a client database is rebuilt:
+    /// a new operation log cannot say whether they went out, so "not found"
+    /// will mean nothing. Written first, as a recovery cut off resumes through
+    /// `open` and never comes back here.
+    pub(super) fn finish_lost_intents(&self, federation: &str) -> Result<()> {
+        for watch in self.unsent(federation) {
+            self.finish_send(&watch, HistoryStatus::Failed, failed_with(LOST_RECORD))?;
+        }
+        Ok(())
     }
 
     /// The sends of `federation` with no operation that no call is working on.

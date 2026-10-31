@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fedimint_client::db::ChronologicalOperationLogKey;
 use fedimint_client::module::error::TransactionSubmitError;
 use fedimint_client::module::oplog::OperationLogEntry;
 use fedimint_client::{Client, ClientBuilder, ClientHandle, ClientHandleArc, ClientPreview};
@@ -56,8 +57,11 @@ pub(super) const UNREADABLE: &str =
     "This operation finished, but Fedimix could not read its details.";
 /// The key in an operation's custom metadata that holds the caller's intent.
 pub(super) const INTENT_KEY: &str = "fedimix_intent";
-/// How many of the newest operations `find_operation` reads.
-const FIND_LIMIT: usize = 1000;
+/// How many operations `find_operation` reads at a time.
+const FIND_PAGE: usize = 1000;
+/// Where `find_operation` starts, past the newest entry. Fedimint's own default
+/// is 30 s from now, which hides operations from before a clock set back.
+const FIND_FROM_THE_FUTURE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
 pub(super) fn failed(reason: &str) -> WatchUpdate {
     WatchUpdate::Failed {
@@ -570,14 +574,7 @@ async fn follow_ln_send(client: &Client, op: OperationId, tx: &mpsc::Sender<Watc
             SendOperationState::Funding
             | SendOperationState::Funded
             | SendOperationState::Refunding => continue,
-            SendOperationState::Success(_) => paid(client, op).await.map_or_else(
-                || failed(UNREADABLE),
-                |(amount, fee)| WatchUpdate::Settled {
-                    amount,
-                    fee,
-                    txid: None,
-                },
-            ),
+            SendOperationState::Success(_) => settled_send(paid(client, op).await, None),
             SendOperationState::Refunded => {
                 sent(client, op).await;
                 WatchUpdate::Refunded
@@ -796,14 +793,26 @@ impl FederationClient for FedimintClient {
 
     async fn find_operation(&self, intent: &str) -> Result<Option<String>> {
         let client = self.client()?;
-        let newest = client
-            .operation_log()
-            .paginate_operations_rev(FIND_LIMIT, None)
-            .await;
-        Ok(newest
-            .iter()
-            .find(|(_, entry)| intent_of(entry).as_deref() == Some(intent))
-            .map(|(key, _)| key.operation_id.fmt_full().to_string()))
+        let mut last_seen = ChronologicalOperationLogKey {
+            creation_time: std::time::SystemTime::now() + FIND_FROM_THE_FUTURE,
+            operation_id: OperationId([0; 32]),
+        };
+        loop {
+            let page = client
+                .operation_log()
+                .paginate_operations_rev(FIND_PAGE, Some(last_seen))
+                .await;
+            let found = page
+                .iter()
+                .find(|(_, entry)| intent_of(entry).as_deref() == Some(intent));
+            if let Some((key, _)) = found {
+                return Ok(Some(key.operation_id.fmt_full().to_string()));
+            }
+            match page.last() {
+                Some((key, _)) if page.len() == FIND_PAGE => last_seen = *key,
+                _ => return Ok(None),
+            }
+        }
     }
 
     fn watch(&self, watch: Watch) -> BoxStream<'static, WatchUpdate> {
@@ -849,10 +858,37 @@ impl FederationClient for FedimintClient {
     }
 }
 
+/// A send that succeeded. Details that cannot be read do not change that: the
+/// money left, and the amounts are what the row was written with.
+pub(super) fn settled_send(details: Option<(Amount, Amount)>, txid: Option<String>) -> WatchUpdate {
+    let (amount, fee) = details.unwrap_or_default();
+    WatchUpdate::Settled { amount, fee, txid }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fedimint_connectors::Connectivity;
+
+    #[test]
+    fn a_send_that_succeeded_stays_settled_with_no_details() {
+        assert_eq!(
+            settled_send(None, Some("txid".into())),
+            WatchUpdate::Settled {
+                amount: Amount::ZERO,
+                fee: Amount::ZERO,
+                txid: Some("txid".into()),
+            }
+        );
+        assert_eq!(
+            settled_send(Some((Amount::from_sat(2), Amount::from_sat(1))), None),
+            WatchUpdate::Settled {
+                amount: Amount::from_sat(2),
+                fee: Amount::from_sat(1),
+                txid: None,
+            }
+        );
+    }
 
     fn peers(connected: u16, total: u16) -> BTreeMap<PeerId, PeerStatus> {
         (0..total)

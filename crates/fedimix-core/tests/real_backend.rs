@@ -2376,3 +2376,102 @@ async fn a_receive_is_not_an_operation_to_cancel() {
     assert!(backend.operations().await.unwrap().is_empty());
     backend.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_higher_lightning_fee_at_confirm_expires_the_preview() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    harness.first.set_lightning_fee(sat(11));
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    assert_eq!(harness.first.pay_calls(), 0);
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lower_lightning_fee_at_confirm_is_the_one_paid() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    harness.first.set_lightning_fee(sat(4));
+    backend.confirm_send(preview.id).await.unwrap();
+    wait_balance(&*backend, sat(796)).await;
+    backend.shutdown().await.unwrap();
+}
+
+const LOST_RECORD: &str = "Fedimix lost its record of this payment and cannot tell whether it was sent. Check your balance before paying again.";
+
+/// The sentence is written before `recover`, so it holds with recovery cut off.
+#[tokio::test]
+async fn a_lost_client_database_does_not_claim_an_intent_was_never_sent() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem("one".into())));
+    harness.port.set_recover_held(true);
+    let backend = harness.open().await.unwrap();
+    let events = backend.subscribe();
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states, [failed_with(LOST_RECORD)]);
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(harness.port.recovers(), 1);
+    assert_eq!(watches_left(&harness), 0);
+    assert_eq!(harness.first.pay_calls(), 0);
+    harness.port.set_recover_held(false);
+    backend.shutdown().await.unwrap();
+}
+
+/// On a connection that stays up, no online change will come to try again.
+#[tokio::test(start_paused = true)]
+async fn a_failed_lookup_is_tried_again_on_a_steady_connection() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.first.fail_next_find(FedimixError::Offline);
+    let backend = harness.open().await.unwrap();
+    wait_online(&*backend, true).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        row_of(&rows(&*backend).await, &id).status,
+        HistoryStatus::Pending
+    );
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(
+        row_of(&rows(&*backend).await, &id).status,
+        HistoryStatus::Failed
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_settled_send_keeps_the_amount_of_its_row() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    harness.first.push_update(&op, settled(0));
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(states.last(), Some(&OperationState::Done));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, &id).amount, sat(200));
+    backend.shutdown().await.unwrap();
+}
