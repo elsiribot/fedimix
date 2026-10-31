@@ -4,8 +4,9 @@ default:
 build:
     cargo build --workspace
 
-# Phase 1 only runs on the demo backend
-run: demo
+# The real wallet; --data-dir and --network go to the app
+run *args:
+    cargo run -p fedimix-gtk -- {{args}}
 
 demo:
     cargo run -p fedimix-gtk -- --demo
@@ -16,6 +17,10 @@ test:
 # Smoke tests against devimint federations, once per module generation (slow)
 test-integration:
     nix develop .#integration --accept-flake-config -c scripts/test-integration.sh
+
+# The real binary through Join, receive, send and restart, on devimint under headless sway (slow)
+test-real-ui:
+    nix develop .#integration --accept-flake-config -c scripts/test-real-ui.sh
 
 check:
     cargo check --workspace --all-targets

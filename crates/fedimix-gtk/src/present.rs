@@ -96,13 +96,70 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
     }
 }
 
-pub fn saving_banner(s: &SpendingState) -> Option<String> {
-    (!s.saving_ready && s.moving > Amount::ZERO).then(|| {
+pub fn saving_banner(s: &SpendingState, can_set_up: bool) -> Option<String> {
+    (can_set_up && !s.saving_ready && s.moving > Amount::ZERO).then(|| {
         format!(
             "Set up Saving to move {} BTC to cold storage",
             format::btc_short(s.moving)
         )
     })
+}
+
+/// What the Saving tab shows while Saving is not set up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavingEmptyState {
+    pub title: &'static str,
+    pub button: &'static str,
+    pub button_enabled: bool,
+    pub caption: Option<&'static str>,
+}
+
+pub fn saving_empty_state(can_set_up: bool) -> SavingEmptyState {
+    if can_set_up {
+        SavingEmptyState {
+            title: "Connect a hardware wallet",
+            button: "Set up",
+            button_enabled: true,
+            caption: None,
+        }
+    } else {
+        SavingEmptyState {
+            title: "Saving",
+            button: "Connect a hardware wallet",
+            button_enabled: false,
+            caption: Some("Available in a later version"),
+        }
+    }
+}
+
+pub const RECOVERING_BANNER: &str =
+    "Restoring your wallet from the federation. This can take a while.";
+
+/// The banner about the connection to `federation`, if it needs one.
+pub fn connection_banner(federation: Option<&FederationInfo>) -> Option<&'static str> {
+    match federation {
+        Some(f) if f.recovering => Some(RECOVERING_BANNER),
+        Some(f) if !f.online => Some("Offline"),
+        _ => None,
+    }
+}
+
+pub const BACKUP_BANNER: &str = "Write down your recovery words";
+
+/// A user can hold real funds with no backup, so ask once there is something
+/// to lose, until the words have been opened.
+pub fn backup_banner(balance: Amount, words_shown: bool) -> bool {
+    balance > Amount::ZERO && !words_shown
+}
+
+/// The Join page's text. Without suggestions the invite is the only way in.
+pub fn join_description(has_suggestions: bool) -> &'static str {
+    if has_suggestions {
+        "Fedimix keeps your spending money as ecash in a federation."
+    } else {
+        "Fedimix keeps your spending money as ecash in a federation. Paste an invite code from \
+         one to join it."
+    }
 }
 
 /// Saving tab status line. An unplugged device stays named, so the user
@@ -275,7 +332,22 @@ pub fn queue_summary(q: &QueueState) -> String {
     )
 }
 
-/// The text shown to the user for any core error.
+/// A complete sentence, as the core writes them, rather than a bare reason.
+fn is_sentence(text: &str) -> bool {
+    text.ends_with('.') && text.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// `why` if it can stand alone, otherwise `lead` in front of it.
+fn sentence_or(lead: &str, why: &str) -> String {
+    if is_sentence(why) {
+        why.to_string()
+    } else {
+        format!("{lead}: {why}")
+    }
+}
+
+/// The text shown to the user for any core error. The core's sentences say
+/// what happened and what to do, so they go through unchanged.
 pub fn user_message(e: &fedimix_core::FedimixError) -> String {
     use fedimix_core::FedimixError as E;
     match e {
@@ -283,7 +355,7 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::InsufficientFunds { available, needed } => {
             format!("Not enough funds: {available} available, {needed} needed including the fee")
         }
-        E::InvalidInvite(why) => format!("Invalid invite code: {why}"),
+        E::InvalidInvite(why) => sentence_or("Invalid invite code", why),
         E::UnknownItem(_) => "This item is no longer available".to_string(),
         E::DeviceNotConnected(device) => format!("Connect your {device}"),
         E::Offline => "You are offline. Reconnect and try again".to_string(),
@@ -292,7 +364,7 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::DeviceRejected => "The device rejected the transaction".to_string(),
         E::Cancelled => "Cancelled".to_string(),
         E::GracePeriod => "Exits wait until the app has been online for a while.".to_string(),
-        E::Internal(why) => format!("Something went wrong: {why}"),
+        E::Internal(why) => sentence_or("Something went wrong", why),
     }
 }
 
@@ -611,6 +683,8 @@ pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
             }
         },
         socks5_proxy: (!proxy.is_empty()).then(|| proxy.to_string()),
+        // Not on the form; the page keeps what it loaded.
+        recovery_words_shown: false,
     })
 }
 
@@ -732,11 +806,11 @@ mod tests {
     #[test]
     fn banner_only_when_no_saving_and_moving() {
         assert_eq!(
-            saving_banner(&spending(0.05, 0.42, 0.05, false)),
+            saving_banner(&spending(0.05, 0.42, 0.05, false), true),
             Some("Set up Saving to move 0.42 BTC to cold storage".to_string())
         );
-        assert_eq!(saving_banner(&spending(0.05, 0.42, 0.05, true)), None);
-        assert_eq!(saving_banner(&spending(0.05, 0.0, 0.05, false)), None);
+        assert_eq!(saving_banner(&spending(0.05, 0.42, 0.05, true), true), None);
+        assert_eq!(saving_banner(&spending(0.05, 0.0, 0.05, false), true), None);
     }
 
     #[test]
@@ -760,6 +834,7 @@ mod tests {
             in_flight: btc(0.42),
             coins: vec![],
             history: vec![],
+            can_set_up: true,
         };
         assert_eq!(
             in_flight_line(&s),
@@ -1022,6 +1097,95 @@ mod tests {
     }
 
     #[test]
+    fn core_sentences_reach_the_user_unchanged() {
+        use fedimix_core::FedimixError as E;
+        let lost = "Fedimix lost its record of this payment and cannot tell whether it was sent. \
+                    Check your balance before paying again.";
+        for sentence in [
+            lost,
+            "The Lightning gateway did not take the payment.",
+            "Fedimix is already running with this data folder.",
+        ] {
+            assert_eq!(user_message(&E::Internal(sentence.into())), sentence);
+        }
+        assert_eq!(
+            user_message(&E::InvalidInvite(
+                "This federation runs on a different Bitcoin network.".into()
+            )),
+            "This federation runs on a different Bitcoin network."
+        );
+        assert_eq!(
+            user_message(&E::ProxyUnsupported),
+            "Fedimix cannot reach federations through a proxy yet. Clear the proxy in Settings to connect."
+        );
+        assert_eq!(
+            user_message(&E::WrongNetwork {
+                folder: "regtest".into(),
+                wanted: "bitcoin".into()
+            }),
+            "This data folder is for regtest, but Fedimix was started for bitcoin. Start it for regtest, or choose another data folder."
+        );
+        assert_eq!(
+            user_message(&E::GracePeriod),
+            "Exits wait until the app has been online for a while."
+        );
+    }
+
+    #[test]
+    fn saving_empty_state_without_setup() {
+        let real = saving_empty_state(false);
+        assert_eq!(real.button, "Connect a hardware wallet");
+        assert!(!real.button_enabled);
+        assert_eq!(real.caption, Some("Available in a later version"));
+        assert_ne!(real.title, real.button, "the page must not say it twice");
+
+        let demo = saving_empty_state(true);
+        assert_eq!(demo.title, "Connect a hardware wallet");
+        assert_eq!(demo.button, "Set up");
+        assert!(demo.button_enabled);
+        assert_eq!(demo.caption, None);
+    }
+
+    #[test]
+    fn no_setup_banner_while_setup_is_unavailable() {
+        let sp = spending(0.05, 0.42, 0.05, false);
+        assert!(saving_banner(&sp, true).is_some());
+        assert_eq!(saving_banner(&sp, false), None);
+    }
+
+    #[test]
+    fn restoring_replaces_the_offline_banner() {
+        let fed = |online, recovering| FederationInfo {
+            id: "f".into(),
+            name: "F".into(),
+            online,
+            anonymity_estimate: 0,
+            balance: Amount::ZERO,
+            recovering,
+        };
+        assert_eq!(connection_banner(None), None);
+        assert_eq!(connection_banner(Some(&fed(true, false))), None);
+        assert_eq!(connection_banner(Some(&fed(false, false))), Some("Offline"));
+        assert_eq!(
+            connection_banner(Some(&fed(false, true))),
+            Some("Restoring your wallet from the federation. This can take a while.")
+        );
+    }
+
+    #[test]
+    fn backup_prompt_waits_for_funds_and_stops_once_opened() {
+        assert!(!backup_banner(Amount::ZERO, false));
+        assert!(backup_banner(Amount::from_sat(1), false));
+        assert!(!backup_banner(Amount::from_sat(1), true));
+    }
+
+    #[test]
+    fn join_page_points_at_the_invite_when_nothing_is_suggested() {
+        assert!(join_description(false).contains("invite code"));
+        assert!(!join_description(true).contains("invite code"));
+    }
+
+    #[test]
     fn send_form_helpers() {
         use fedimix_core::{ChangeDestination as C, WalletKind as W};
         assert!(destination_has_amount("lnbc1200u1x"));
@@ -1271,7 +1435,7 @@ mod tests {
         let device = core.detect_devices().await.unwrap().remove(0);
         core.setup_saving(device.id).await.unwrap();
         let sp = core.spending_state().await.unwrap();
-        assert_eq!(saving_banner(&sp), None);
+        assert_eq!(saving_banner(&sp, true), None);
         assert!(sp.federation.is_some());
 
         // Funded: caption, send review, history rows, exit now.

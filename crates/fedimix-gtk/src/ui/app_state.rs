@@ -17,6 +17,7 @@ pub struct Snapshots {
     pub saving: SavingState,
     pub spending: SpendingState,
     pub queue: QueueState,
+    pub recovery_words_shown: bool,
 }
 
 type Subscriber = Rc<dyn Fn(&Snapshots) -> bool>;
@@ -189,15 +190,17 @@ impl AppContext {
         let ctx = self.clone();
         self.bridge.call(
             async move {
-                let (saving, spending, queue) = tokio::join!(
+                let (saving, spending, queue, settings) = tokio::join!(
                     core.saving_state(),
                     core.spending_state(),
-                    core.queue_state()
+                    core.queue_state(),
+                    core.settings()
                 );
                 Ok::<_, fedimix_core::FedimixError>(Snapshots {
                     saving: saving?,
                     spending: spending?,
                     queue: queue?,
+                    recovery_words_shown: settings?.recovery_words_shown,
                 })
             },
             move |res| {

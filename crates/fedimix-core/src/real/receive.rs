@@ -32,6 +32,11 @@ fn deposits_cursor(federation: &str) -> String {
     format!("deposits:{federation}")
 }
 
+/// Not zero from the start of a federation's recovery until a client is usable.
+fn recovery_mark(federation: &str) -> String {
+    format!("recovering:{federation}")
+}
+
 fn incoming(
     id: &str,
     kind: HistoryKind,
@@ -257,19 +262,48 @@ impl Core {
     /// Opens the client of `id`, or recovers it if this device holds no data for
     /// it. A new client database starts a new deposit log, so the position in
     /// the old one is cleared before anything can be logged there.
+    ///
+    /// A recovery is marked in the store, because `open` resumes one that was
+    /// cut off with no sign that it is one. The mark goes when a client is
+    /// usable, so a recovery that keeps failing keeps being reported.
     pub(super) async fn connect(&self, id: &str) -> Result<Arc<dyn FederationClient>> {
-        match self.port.open(id, &self.seed).await {
-            Err(FedimixError::UnknownItem(_)) => {}
-            opened => return opened,
+        let mark = recovery_mark(id);
+        if self.store().cursor(&mark)?.is_some_and(|set| set != 0) {
+            self.set_recovering(id, true);
         }
+        let client = match self.port.open(id, &self.seed).await {
+            Err(FedimixError::UnknownItem(_)) => self.recover(id).await?,
+            opened => opened?,
+        };
+        if let Err(e) = self.store().set_cursor(&mark, 0) {
+            eprintln!("fedimix: clearing the recovery mark of federation {id}: {e}");
+        }
+        self.set_recovering(id, false);
+        Ok(client)
+    }
+
+    fn set_recovering(&self, id: &str, recovering: bool) {
+        let was = {
+            let mut state = self.state();
+            let live = state.live.entry(id.to_string()).or_default();
+            std::mem::replace(&mut live.recovering, recovering)
+        };
+        if was != recovering {
+            self.events.emit(&Event::FederationChanged);
+        }
+    }
+
+    async fn recover(&self, id: &str) -> Result<Arc<dyn FederationClient>> {
         let invite = {
             let store = self.store();
             let rows = store.federations()?;
             let row = rows.iter().find(|row| row.id == id);
             let row = row.ok_or_else(|| FedimixError::UnknownItem(id.to_string()))?;
+            store.set_cursor(&recovery_mark(id), 1)?;
             store.set_cursor(&deposits_cursor(id), 0)?;
             row.invite.clone()
         };
+        self.set_recovering(id, true);
         self.finish_lost_intents(id)?;
         self.port.recover(&invite, &self.seed).await
     }

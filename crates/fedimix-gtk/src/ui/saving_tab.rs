@@ -13,6 +13,9 @@ use crate::ui::{coins_page, setup_saving, widgets};
 
 struct Inner {
     pages: gtk::Stack,
+    empty: adw::StatusPage,
+    setup: gtk::Button,
+    setup_note: gtk::Label,
     device_label: gtk::Label,
     balance: widgets::AmountButton,
     in_flight: gtk::Button,
@@ -84,11 +87,18 @@ impl SavingTab {
             let ctx = ctx.clone();
             move |_| setup_saving::open(&ctx)
         });
+        let setup_note = gtk::Label::builder().visible(false).build();
+        setup_note.add_css_class("dim-label");
+        let setup_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        setup_box.append(&setup);
+        setup_box.append(&setup_note);
         let empty = adw::StatusPage::builder()
             .icon_name("media-removable-symbolic")
-            .title("Connect a hardware wallet")
             .description("Saving is your cold storage. Spending works without it.")
-            .child(&setup)
+            .child(&setup_box)
             .vexpand(true)
             .build();
 
@@ -107,6 +117,9 @@ impl SavingTab {
 
         let inner = Rc::new(Inner {
             pages,
+            empty,
+            setup,
+            setup_note,
             device_label,
             balance,
             in_flight,
@@ -143,7 +156,15 @@ impl Inner {
         }
         let saving = &s.saving;
         match &saving.device {
-            None => self.pages.set_visible_child_name("empty"),
+            None => {
+                let empty = present::saving_empty_state(saving.can_set_up);
+                self.empty.set_title(empty.title);
+                self.setup.set_label(empty.button);
+                self.setup.set_sensitive(empty.button_enabled);
+                self.setup_note.set_label(empty.caption.unwrap_or(""));
+                self.setup_note.set_visible(empty.caption.is_some());
+                self.pages.set_visible_child_name("empty");
+            }
             Some(device) => {
                 self.pages.set_visible_child_name("content");
                 self.device_label.set_label(&present::device_line(device));

@@ -1,6 +1,8 @@
 //! Command-line flags. Parsed before GApplication sees any arguments.
 
-use fedimix_core::DemoScenario;
+use std::path::{Path, PathBuf};
+
+use fedimix_core::{DemoScenario, Network};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartPage {
@@ -51,6 +53,26 @@ pub struct Args {
     pub page: Option<StartPage>,
     /// Script for the in-app demo driver.
     pub drive: Option<std::path::PathBuf>,
+    /// `None` picks the network's default folder.
+    pub data_dir: Option<PathBuf>,
+    pub network: Network,
+}
+
+/// Where `network` keeps its data unless `--data-dir` says otherwise.
+pub fn default_data_dir(
+    network: Network,
+    xdg_data_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let base = match xdg_data_home.filter(|path| path.is_absolute()) {
+        Some(path) => path.to_path_buf(),
+        None => home?.join(".local/share"),
+    };
+    Some(base.join(match network {
+        Network::Bitcoin => "fedimix",
+        Network::Signet => "fedimix-signet",
+        Network::Regtest => "fedimix-regtest",
+    }))
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -59,6 +81,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut scenario = None;
     let mut page = None;
     let mut drive = None;
+    let mut data_dir = None;
+    let mut network = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--demo" => demo = true,
@@ -74,17 +98,30 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let v = args.next().ok_or("--demo-drive needs a file")?;
                 drive = Some(std::path::PathBuf::from(v));
             }
+            "--data-dir" => {
+                let v = args.next().ok_or("--data-dir needs a folder")?;
+                data_dir = Some(PathBuf::from(v));
+            }
+            "--network" => {
+                let v = args.next().ok_or("--network needs a value")?;
+                network = Some(v.parse::<Network>()?);
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
-    if !demo && (scenario.is_some() || page.is_some() || drive.is_some()) {
-        return Err("--demo-scenario, --demo-page and --demo-drive require --demo".to_string());
+    if !demo && (scenario.is_some() || page.is_some()) {
+        return Err("--demo-scenario and --demo-page require --demo".to_string());
+    }
+    if demo && (data_dir.is_some() || network.is_some()) {
+        return Err("--data-dir and --network do not apply to --demo".to_string());
     }
     Ok(Args {
         demo,
         scenario: scenario.unwrap_or(DemoScenario::Funded),
         page,
         drive,
+        data_dir,
+        network: network.unwrap_or(Network::Bitcoin),
     })
 }
 
@@ -132,11 +169,72 @@ mod tests {
     }
 
     #[test]
-    fn parses_drive_file_and_requires_demo() {
+    fn parses_drive_file_with_or_without_demo() {
         let a = p(&["--demo", "--demo-drive", "flow.drive"]).unwrap();
         assert_eq!(a.drive, Some("flow.drive".into()));
-        assert!(p(&["--demo-drive", "flow.drive"]).is_err());
+        let a = p(&["--demo-drive", "flow.drive"]).unwrap();
+        assert!(!a.demo);
+        assert_eq!(a.drive, Some("flow.drive".into()));
         assert!(p(&["--demo", "--demo-drive"]).is_err());
+    }
+
+    #[test]
+    fn real_is_the_default() {
+        let a = p(&[]).unwrap();
+        assert!(!a.demo);
+        assert_eq!(a.network, Network::Bitcoin);
+        assert_eq!(a.data_dir, None);
+    }
+
+    #[test]
+    fn data_dir_and_network_parse() {
+        let a = p(&["--data-dir", "/tmp/wallet", "--network", "regtest"]).unwrap();
+        assert_eq!(a.data_dir, Some("/tmp/wallet".into()));
+        assert_eq!(a.network, Network::Regtest);
+        assert_eq!(
+            p(&["--network", "signet"]).unwrap().network,
+            Network::Signet
+        );
+        assert!(p(&["--network", "testnet"]).is_err());
+        assert!(p(&["--network"]).is_err());
+        assert!(p(&["--data-dir"]).is_err());
+    }
+
+    #[test]
+    fn real_flags_do_nothing_in_the_demo_so_they_are_refused() {
+        assert!(p(&["--demo", "--network", "regtest"]).is_err());
+        assert!(p(&["--demo", "--data-dir", "/tmp/wallet"]).is_err());
+    }
+
+    #[test]
+    fn test_networks_never_share_a_folder() {
+        let xdg = Some(Path::new("/xdg"));
+        let home = Some(Path::new("/home/u"));
+        let dir = default_data_dir;
+        assert_eq!(
+            dir(Network::Bitcoin, xdg, home),
+            Some("/xdg/fedimix".into())
+        );
+        assert_eq!(
+            dir(Network::Signet, xdg, home),
+            Some("/xdg/fedimix-signet".into())
+        );
+        assert_eq!(
+            dir(Network::Regtest, xdg, home),
+            Some("/xdg/fedimix-regtest".into())
+        );
+        assert_eq!(
+            dir(Network::Bitcoin, None, home),
+            Some("/home/u/.local/share/fedimix".into())
+        );
+        // The XDG spec ignores a relative path, which an empty value is too.
+        for ignored in ["", "relative/path"] {
+            assert_eq!(
+                dir(Network::Regtest, Some(Path::new(ignored)), home),
+                Some("/home/u/.local/share/fedimix-regtest".into())
+            );
+        }
+        assert_eq!(dir(Network::Bitcoin, None, None), None);
     }
 
     #[test]

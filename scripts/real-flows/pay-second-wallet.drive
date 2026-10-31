@@ -1,0 +1,12 @@
+# A real Lightning payment through the UI, to another wallet of the federation.
+expect-slow 0.0019 BTC
+click Send
+type-env "Lightning invoice or on-chain address" FEDIMIX_SECOND_INVOICE
+click Review
+expect-slow Network fee
+shot review
+click Send
+expect-slow Payment sent
+expect −0.0005
+expect-slow 0.0014 BTC
+shot sent

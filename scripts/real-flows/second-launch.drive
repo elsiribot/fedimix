@@ -1,0 +1,5 @@
+# A launch while another runs: the sentence, and nothing to use.
+expect Fedimix cannot start
+expect Fedimix is already running with this data folder.
+shot lock-alert
+click Close

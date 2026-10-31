@@ -12,6 +12,14 @@
 //!   or spin row by title.
 //! - `expect <text>`: wait up to 3 s for a mapped label or entry containing
 //!   `<text>`.
+//! - `type-env <title> <VAR>` (title quoted as for `type`): as `type`, with the
+//!   value of the environment variable `VAR`.
+//! - `save-text <text> <path>` (text quoted as for `type`): write the whole text
+//!   of the mapped label containing `<text>` to `<path>`, relative to the
+//!   working directory. Polls up to 3 s.
+//! - `expect-slow <text>`: as `expect`, for a real federation: up to 180 s.
+//! - `expect-clipboard <text>`: the clipboard holds `<text>`.
+//! - `expect-clipboard-empty`: the clipboard holds no text.
 //! - `wait <ms>`, `shot <name>` (prints `SHOT <name>`, then waits for a line
 //!   on stdin, or 500 ms when stdin is a terminal or closed).
 //! - `expect-not <text>`: wait up to 3 s until no mapped label contains `<text>`.
@@ -41,6 +49,8 @@ use gtk::glib;
 
 const POLL: Duration = Duration::from_millis(100);
 const POLL_LIMIT: u32 = 30;
+/// `expect-slow`: at this interval, 180 s in all.
+const SLOW_POLL_LIMIT: u32 = 1800;
 const SHOT_PAUSE: Duration = Duration::from_millis(500);
 const SHOT_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -48,7 +58,12 @@ const SHOT_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Step {
     Click(String),
     Type { widget: String, text: String },
+    TypeEnv { widget: String, var: String },
+    SaveText { text: String, path: String },
     Expect(String),
+    ExpectSlow(String),
+    ExpectClipboard(String),
+    ExpectClipboardEmpty,
     ExpectNot(String),
     ExpectAbsent(String),
     ExpectLocked,
@@ -90,6 +105,9 @@ fn parse_line(line: &str) -> Result<Step, String> {
     Ok(match cmd {
         "click" => Step::Click(need("a label")?),
         "expect" => Step::Expect(need("text")?),
+        "expect-slow" => Step::ExpectSlow(need("text")?),
+        "expect-clipboard" => Step::ExpectClipboard(need("text")?),
+        "expect-clipboard-empty" => Step::ExpectClipboardEmpty,
         "expect-not" => Step::ExpectNot(need("text")?),
         "expect-absent" => Step::ExpectAbsent(need("text")?),
         "expect-disabled" => Step::ExpectRowControls {
@@ -117,25 +135,36 @@ fn parse_line(line: &str) -> Result<Step, String> {
                 .map_err(|_| format!("'wait' needs milliseconds, got '{rest}'"))?,
         ),
         "type" => {
-            let (widget, text) = if let Some(quoted) = rest.strip_prefix('"') {
-                quoted
-                    .split_once('"')
-                    .ok_or("unterminated quote in widget title")?
-            } else {
-                rest.split_once(char::is_whitespace)
-                    .ok_or("'type' needs a widget title and text")?
-            };
-            let text = text.trim();
-            if widget.is_empty() || text.is_empty() {
-                return Err("'type' needs a widget title and text".to_string());
-            }
-            Step::Type {
-                widget: widget.to_string(),
-                text: text.to_string(),
-            }
+            let (widget, text) = two_args(cmd, rest)?;
+            Step::Type { widget, text }
+        }
+        "type-env" => {
+            let (widget, var) = two_args(cmd, rest)?;
+            Step::TypeEnv { widget, var }
+        }
+        "save-text" => {
+            let (text, path) = two_args(cmd, rest)?;
+            Step::SaveText { text, path }
         }
         other => return Err(format!("unknown step '{other}'")),
     })
+}
+
+/// `<first> <rest>`, where `<first>` may be in double quotes.
+fn two_args(cmd: &str, rest: &str) -> Result<(String, String), String> {
+    let (first, second) = if let Some(quoted) = rest.strip_prefix('"') {
+        quoted
+            .split_once('"')
+            .ok_or("unterminated quote in widget title")?
+    } else {
+        rest.split_once(char::is_whitespace)
+            .ok_or_else(|| format!("'{cmd}' needs two arguments"))?
+    };
+    let second = second.trim();
+    if first.is_empty() || second.is_empty() {
+        return Err(format!("'{cmd}' needs two arguments"));
+    }
+    Ok((first.to_string(), second.to_string()))
 }
 
 impl fmt::Display for Step {
@@ -143,7 +172,13 @@ impl fmt::Display for Step {
         match self {
             Step::Click(l) => write!(f, "click {l}"),
             Step::Type { widget, text } => write!(f, "type \"{widget}\" {text}"),
+            // The name only: the value may be long, and is the caller's.
+            Step::TypeEnv { widget, var } => write!(f, "type-env \"{widget}\" {var}"),
+            Step::SaveText { text, path } => write!(f, "save-text \"{text}\" {path}"),
             Step::Expect(t) => write!(f, "expect {t}"),
+            Step::ExpectSlow(t) => write!(f, "expect-slow {t}"),
+            Step::ExpectClipboard(t) => write!(f, "expect-clipboard {t}"),
+            Step::ExpectClipboardEmpty => write!(f, "expect-clipboard-empty"),
             Step::ExpectNot(t) => write!(f, "expect-not {t}"),
             Step::ExpectAbsent(t) => write!(f, "expect-absent {t}"),
             Step::ExpectLocked => write!(f, "expect-locked"),
@@ -202,6 +237,37 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
                 .await
                 .ok_or_else(|| format!("no entry titled '{widget}'"))?;
             glib::timeout_future(Duration::from_millis(150)).await;
+        }
+        Step::TypeEnv { widget, var } => {
+            let text = std::env::var(var).map_err(|_| format!("{var} is not set"))?;
+            poll(|| type_into(env, widget, &text).then_some(()))
+                .await
+                .ok_or_else(|| format!("no entry titled '{widget}'"))?;
+            glib::timeout_future(Duration::from_millis(150)).await;
+        }
+        Step::SaveText { text, path } => {
+            let found = poll(|| label_containing(env, text))
+                .await
+                .ok_or_else(|| format!("no visible label containing '{text}'"))?;
+            std::fs::write(path, found).map_err(|e| format!("{path}: {e}"))?;
+        }
+        Step::ExpectSlow(text) => {
+            poll_up_to(SLOW_POLL_LIMIT, || {
+                has_label_containing(env, text).then_some(())
+            })
+            .await
+            .ok_or_else(|| format!("no visible label containing '{text}'"))?;
+        }
+        Step::ExpectClipboard(text) => {
+            let held = clipboard_text(env).await;
+            if !held.as_deref().is_some_and(|t| t.contains(text.as_str())) {
+                return Err(format!("the clipboard does not hold '{text}'"));
+            }
+        }
+        Step::ExpectClipboardEmpty => {
+            if clipboard_text(env).await.is_some() {
+                return Err("the clipboard still holds text".to_string());
+            }
         }
         Step::Expect(text) => {
             poll(|| has_label_containing(env, text).then_some(()))
@@ -292,8 +358,12 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
     Ok(())
 }
 
-async fn poll<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
-    for _ in 0..POLL_LIMIT {
+async fn poll<T>(f: impl FnMut() -> Option<T>) -> Option<T> {
+    poll_up_to(POLL_LIMIT, f).await
+}
+
+async fn poll_up_to<T>(limit: u32, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    for _ in 0..limit {
         if let Some(v) = f() {
             return Some(v);
         }
@@ -466,6 +536,22 @@ fn has_label_containing(env: &Env, text: &str) -> bool {
     })
 }
 
+/// The whole text of the first mapped label containing `text`.
+fn label_containing(env: &Env, text: &str) -> Option<String> {
+    roots(env).iter().find_map(|r| {
+        descendants(r).iter().find_map(|d| {
+            let label = d.downcast_ref::<gtk::Label>()?;
+            (d.is_mapped() && label.text().contains(text)).then(|| label.text().to_string())
+        })
+    })
+}
+
+/// What a paste would give, as this process sees it; `None` for no text.
+async fn clipboard_text(env: &Env) -> Option<String> {
+    let text = env.window.clipboard().read_text_future().await;
+    text.ok().flatten().map(|t| t.to_string())
+}
+
 fn title_matches(w: &gtk::Widget, label: &str) -> bool {
     w.downcast_ref::<adw::PreferencesRow>()
         .is_some_and(|r| r.title() == label)
@@ -592,7 +678,13 @@ click Exit now (lower privacy)
 
 type \"Amount (BTC)\" 0.01
 type Target 0.1 extra words
+type-env \"Paste an invite code\" FM_INVITE_CODE
+save-text lnbcrt invoice.txt
+save-text \"two words\" /tmp/out.txt
 expect Fedi Alpha
+expect-slow Fedi Beta
+expect-clipboard demo
+expect-clipboard-empty
 expect-not Cover traffic
 expect-absent bc1q
 expect-locked
@@ -620,7 +712,22 @@ action app.settings
                     widget: "Target".into(),
                     text: "0.1 extra words".into()
                 },
+                Step::TypeEnv {
+                    widget: "Paste an invite code".into(),
+                    var: "FM_INVITE_CODE".into()
+                },
+                Step::SaveText {
+                    text: "lnbcrt".into(),
+                    path: "invoice.txt".into()
+                },
+                Step::SaveText {
+                    text: "two words".into(),
+                    path: "/tmp/out.txt".into()
+                },
                 Step::Expect("Fedi Alpha".into()),
+                Step::ExpectSlow("Fedi Beta".into()),
+                Step::ExpectClipboard("demo".into()),
+                Step::ExpectClipboardEmpty,
                 Step::ExpectNot("Cover traffic".into()),
                 Step::ExpectAbsent("bc1q".into()),
                 Step::ExpectLocked,
@@ -652,6 +759,10 @@ action app.settings
             "click",
             "wait soon",
             "type onlywidget",
+            "type-env onlywidget",
+            "save-text onlytext",
+            "expect-slow",
+            "expect-clipboard",
             "shot",
             "type \"open",
         ] {

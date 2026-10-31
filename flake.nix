@@ -95,12 +95,13 @@
             postInstall = ''
               patchelf --add-rpath ${pkgs.lib.makeLibraryPath (buildInputs ++ [ pkgs.stdenv.cc.cc.lib ])} $out/bin/fedimix
             '';
-            # Exits 2 before touching a display; 127 means libraries are missing.
+            # A bad flag exits 2 before touching a display or a data folder; 127
+            # means libraries are missing.
             doInstallCheck = true;
             installCheckPhase = ''
               runHook preInstallCheck
               status=0
-              $out/bin/fedimix || status=$?
+              $out/bin/fedimix --install-check || status=$?
               [ "$status" -eq 2 ]
               runHook postInstallCheck
             '';
@@ -184,6 +185,8 @@
               # the `cargo test` step only, so devimint's daemons, built from
               # another nixpkgs, never load it.
               FEDIMIX_TEST_LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
+              # The same for the app itself, in `scripts/test-real-ui.sh`.
+              FEDIMIX_UI_LD_LIBRARY_PATH = default.LD_LIBRARY_PATH;
             };
         };
       }

@@ -47,5 +47,6 @@ pub(super) fn saving_state(history: Vec<HistoryItem>) -> SavingState {
         in_flight: Amount::ZERO,
         coins: Vec::new(),
         history,
+        can_set_up: false,
     }
 }

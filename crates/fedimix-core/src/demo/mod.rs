@@ -80,6 +80,8 @@ pub enum DemoScenario {
     SendStuck,
     /// Funded, with far more history than a snapshot carries.
     LongHistory,
+    /// Without Saving, its data being rebuilt from the federation.
+    Recovering,
 }
 
 /// How fast the demo moves.
@@ -133,8 +135,9 @@ impl FromStr for DemoScenario {
             "device-disconnected" => Ok(Self::DeviceDisconnected),
             "preview-expiry" => Ok(Self::PreviewExpiry),
             "device-rejects" => Ok(Self::DeviceRejects),
+            "recovering" => Ok(Self::Recovering),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, long-history)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, long-history, recovering)"
             )),
         }
     }
@@ -369,7 +372,11 @@ impl State {
             spending_history: f.spending_history,
             queue: f.queue,
             waiting_for_saving: f.waiting_for_saving,
-            settings: Settings::default(),
+            // The demo has no seed to back up, so it never prompts.
+            settings: Settings {
+                recovery_words_shown: true,
+                ..Settings::default()
+            },
             sends: HashMap::new(),
             refills: HashMap::new(),
             exits: HashMap::new(),
@@ -817,6 +824,7 @@ impl Backend for DemoBackend {
             in_flight: st.in_flight,
             coins: st.coins.clone(),
             history: newest(&st.saving_history),
+            can_set_up: true,
         })
     }
 
@@ -850,7 +858,11 @@ impl Backend for DemoBackend {
     }
 
     async fn set_settings(&self, settings: Settings) -> Result<()> {
-        self.state.lock().await.settings = settings;
+        let mut state = self.state.lock().await;
+        let shown = state.settings.recovery_words_shown;
+        state.settings = settings;
+        state.settings.recovery_words_shown |= shown;
+        drop(state);
         self.emit(Event::SettingsChanged);
         Ok(())
     }
@@ -1290,7 +1302,7 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 12] = [
+    const ALL: [DemoScenario; 13] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
@@ -1303,6 +1315,7 @@ mod tests {
         DemoScenario::DeviceRejects,
         DemoScenario::SendStuck,
         DemoScenario::LongHistory,
+        DemoScenario::Recovering,
     ];
 
     fn btc(v: f64) -> Amount {

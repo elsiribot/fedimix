@@ -1,12 +1,22 @@
 # scenario: funded
 # size: 360x640
-# Settings > Recovery words: the warning, the words, and Copy.
+# Settings > Recovery words: the warning, the words, and Copy, whose words leave
+# the clipboard after 60 s.
 action app.settings
 click Recovery words
 expect Write these words down
 expect 12. demo
 shot words
 click Copy
-expect Copied
+expect Copied. Clear your clipboard when done.
+shot copied
+expect-clipboard demo
 click Back
 expect Backup
+# The page goes when its transition ends.
+wait 1000
+expect-absent 12. demo
+wait 57000
+expect-clipboard demo
+wait 3000
+expect-clipboard-empty

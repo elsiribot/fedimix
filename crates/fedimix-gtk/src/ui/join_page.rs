@@ -13,6 +13,7 @@ type JoinedCallback = Box<dyn Fn()>;
 
 struct Inner {
     ctx: Rc<AppContext>,
+    page: gtk::glib::WeakRef<adw::StatusPage>,
     form: gtk::Box,
     suggested: gtk::ListBox,
     entry: adw::EntryRow,
@@ -78,13 +79,14 @@ impl JoinPage {
         let root = adw::StatusPage::builder()
             .icon_name("network-workgroup-symbolic")
             .title("Join a federation")
-            .description("Fedimix keeps your spending money as ecash in a federation.")
+            .description(present::join_description(false))
             .child(&clamp)
             .vexpand(true)
             .build();
 
         let inner = Rc::new(Inner {
             ctx: ctx.clone(),
+            page: root.downgrade(),
             form,
             suggested,
             entry,
@@ -171,9 +173,11 @@ impl Inner {
                     row.add_suffix(&button);
                     inner.suggested.append(&row);
                 }
-                inner
-                    .suggested
-                    .set_visible(inner.suggested.first_child().is_some());
+                let any = inner.suggested.first_child().is_some();
+                inner.suggested.set_visible(any);
+                if let Some(page) = inner.page.upgrade() {
+                    page.set_description(Some(present::join_description(any)));
+                }
             },
         );
     }

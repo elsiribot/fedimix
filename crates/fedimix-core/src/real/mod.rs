@@ -72,6 +72,8 @@ struct Live {
     wake: Arc<Notify>,
     /// Reaches the connection's watches with one that started after them.
     new_watches: Option<mpsc::UnboundedSender<Watch>>,
+    /// The client's data is being rebuilt from the federation.
+    recovering: bool,
 }
 
 /// A preview is consumed under this lock, so it pays at most once.
@@ -183,7 +185,11 @@ impl Core {
 
     fn info(&self, row: &FederationRow) -> FederationInfo {
         let open = *self.gate.borrow() == Gate::Open;
-        let online = self.state().live.get(&row.id).is_some_and(|l| l.online);
+        let (online, recovering) = self
+            .state()
+            .live
+            .get(&row.id)
+            .map_or((false, false), |live| (live.online, live.recovering));
         FederationInfo {
             id: row.id.clone(),
             name: row.name.clone(),
@@ -192,6 +198,8 @@ impl Core {
             balance: Amount {
                 msat: row.balance_msat,
             },
+            // Nothing runs behind a closed gate, so say offline instead.
+            recovering: open && recovering,
         }
     }
 
@@ -304,7 +312,11 @@ impl Core {
         self.ensure_running()?;
         // Under the store's lock, so the gate ends up matching the last write.
         let store = self.store();
-        store.set_settings(settings)?;
+        let shown = store.settings()?.recovery_words_shown;
+        store.set_settings(&Settings {
+            recovery_words_shown: settings.recovery_words_shown || shown,
+            ..settings.clone()
+        })?;
         self.gate.send_if_modified(|gate| {
             let next = if *gate == Gate::Stopped {
                 Gate::Stopped

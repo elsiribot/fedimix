@@ -1,6 +1,6 @@
 //! The Spending tab: ecash balance, refill/queue links and history.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
@@ -9,11 +9,13 @@ use fedimix_core::{SpendingState, WalletKind};
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::{moving_page, notes_page, refill_dialog, setup_saving, widgets};
+use crate::ui::{moving_page, notes_page, recovery_words, refill_dialog, setup_saving, widgets};
 
 struct Inner {
-    offline: adw::Banner,
+    connection: adw::Banner,
+    backup: adw::Banner,
     nudge: adw::Banner,
+    can_set_up: Cell<bool>,
     federation: gtk::Label,
     balance: widgets::AmountButton,
     bar: gtk::LevelBar,
@@ -34,7 +36,15 @@ pub struct SpendingTab {
 
 impl SpendingTab {
     pub fn new(ctx: Rc<AppContext>) -> Self {
-        let offline = adw::Banner::builder().title("Offline").build();
+        let connection = adw::Banner::new("");
+        let backup = adw::Banner::builder()
+            .title(present::BACKUP_BANNER)
+            .button_label("Show words \u{203a}")
+            .build();
+        backup.connect_button_clicked({
+            let ctx = ctx.clone();
+            move |_| recovery_words::push(&ctx)
+        });
         let nudge = adw::Banner::builder()
             .button_label("Set up \u{203a}")
             .build();
@@ -146,13 +156,16 @@ impl SpendingTab {
             .build();
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.append(&offline);
+        root.append(&connection);
+        root.append(&backup);
         root.append(&nudge);
         root.append(&scroller);
 
         let inner = Rc::new(Inner {
-            offline,
+            connection,
+            backup,
             nudge,
+            can_set_up: Cell::new(false),
             federation,
             balance,
             bar,
@@ -197,7 +210,12 @@ impl Inner {
         let hint = present::spending_hint(&s.queue);
         self.hint.set_visible(hint.is_some());
         self.hint.set_label(hint.as_deref().unwrap_or(""));
-        if self.last.borrow().as_ref() == Some(&s.spending) {
+        self.backup.set_revealed(present::backup_banner(
+            s.spending.balance,
+            s.recovery_words_shown,
+        ));
+        let setup_changed = self.can_set_up.replace(s.saving.can_set_up) != s.saving.can_set_up;
+        if !setup_changed && self.last.borrow().as_ref() == Some(&s.spending) {
             return;
         }
         *self.last.borrow_mut() = Some(s.spending.clone());
@@ -208,9 +226,10 @@ impl Inner {
         let last = self.last.borrow();
         let Some(s) = last.as_ref() else { return };
         // Without a federation the window shows the Join page instead.
-        let offline = matches!(&s.federation, Some(f) if !f.online);
-        self.offline.set_revealed(offline);
-        match present::saving_banner(s) {
+        let connection = present::connection_banner(s.federation.as_ref());
+        self.connection.set_title(connection.unwrap_or(""));
+        self.connection.set_revealed(connection.is_some());
+        match present::saving_banner(s, self.can_set_up.get()) {
             Some(text) => {
                 self.nudge.set_title(&text);
                 self.nudge.set_revealed(true);

@@ -1,0 +1,8 @@
+# The second launch on the same folder: federation and balance are back, and the
+# prompt for the words stays gone. A launch during `shot reopened` must fail.
+expect-slow Devimint Federation
+expect-slow 0.0019 BTC
+expect +0.0019
+expect-not Join a federation
+expect-not Write down your recovery words
+shot reopened

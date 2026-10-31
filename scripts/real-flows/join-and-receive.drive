@@ -1,0 +1,63 @@
+# The first run: Join from the invite alone, the Saving empty state, then an
+# invoice LND pays, and the prompt to write the words down.
+expect-slow Join a federation
+expect Paste an invite code
+expect-not Suggested
+shot join
+type-env "Paste an invite code" FM_INVITE_CODE
+click Join
+expect-slow Devimint Federation
+expect No activity yet
+shot joined
+expect-not Write down your recovery words
+click Saving
+expect Connect a hardware wallet
+expect Available in a later version
+shot saving
+click Spending
+click Receive
+expect Create invoice
+type "Amount (BTC)" 0.002
+# LND cannot pay its own gateway's invoice, and the wallet picks one at random.
+type "Description (optional)" try 1
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice-1.txt
+shot invoice-1
+# LND cannot pay its own gateway's invoice, and the wallet picks one at random.
+type "Description (optional)" try 2
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice-2.txt
+shot invoice-2
+# LND cannot pay its own gateway's invoice, and the wallet picks one at random.
+type "Description (optional)" try 3
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice-3.txt
+shot invoice-3
+# LND cannot pay its own gateway's invoice, and the wallet picks one at random.
+type "Description (optional)" try 4
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice-4.txt
+shot invoice-4
+# LND cannot pay its own gateway's invoice, and the wallet picks one at random.
+type "Description (optional)" try 5
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice-5.txt
+shot invoice-5
+close-dialog
+# Only the invoice that was paid gives this; the others stay pending at +0.0020.
+expect-slow +0.0019
+expect 0.0019 BTC
+expect-slow Write down your recovery words
+shot received
+click Show words ›
+expect Write these words down
+expect 12.
+shot words
+click Back
+expect-not Write down your recovery words
+shot words-seen

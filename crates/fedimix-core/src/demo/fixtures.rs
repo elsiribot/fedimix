@@ -57,6 +57,7 @@ pub fn federation(online: bool) -> FederationInfo {
         anonymity_estimate: 60,
         // The demo backend fills in the real figure.
         balance: Amount::ZERO,
+        recovering: false,
     }
 }
 
@@ -472,6 +473,13 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
                 })
                 .collect(),
             ..funded()
+        },
+        DemoScenario::Recovering => Fixture {
+            federation: Some(FederationInfo {
+                recovering: true,
+                ..federation(false)
+            }),
+            ..fixture(DemoScenario::NoSaving)
         },
         DemoScenario::ExitDeferred => exit_deferred(),
         DemoScenario::LongNames => long_names(),

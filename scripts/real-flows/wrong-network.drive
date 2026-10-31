@@ -1,0 +1,5 @@
+# A data folder stays with its network, also through --data-dir.
+expect Fedimix cannot start
+expect This data folder is for regtest, but Fedimix was started for signet.
+shot refused
+click Close

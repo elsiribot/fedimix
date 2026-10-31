@@ -3,14 +3,14 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use fedimix_core::{Backend, Event, Fedimix, FedimixError};
+use fedimix_core::{Backend, CoreConfig, Event, Fedimix, FedimixError, RealBackend};
 
 /// Why a call ended without a result. `user_message` puts "Something went
 /// wrong:" in front, so this must not say it too.
 const PANIC_WHY: &str = "a background task stopped.";
 
 /// Most a clean shutdown may take; a hung backend must not block quitting.
-pub const SHUTDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+pub const SHUTDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `fut`, or an error once `cap` has passed.
 pub async fn capped<Fut>(fut: Fut, cap: std::time::Duration) -> Result<(), FedimixError>
@@ -24,6 +24,34 @@ where
     })
 }
 
+/// Start the multi-thread runtime, parked on its own thread named
+/// "fedimix-core". The real backend needs worker threads: fedimint uses
+/// `block_in_place`, which panics on a current-thread runtime.
+pub fn start_runtime() -> tokio::runtime::Handle {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let handle = rt.handle().clone();
+    std::thread::Builder::new()
+        .name("fedimix-core".to_string())
+        .spawn(move || rt.block_on(std::future::pending::<()>()))
+        .expect("failed to spawn core thread");
+    handle
+}
+
+/// Open the real backend on the core runtime and wait for it. It only reads
+/// the data folder, so this is quick and needs no network.
+pub fn open_real(
+    handle: &tokio::runtime::Handle,
+    config: CoreConfig,
+) -> Result<Arc<RealBackend>, FedimixError> {
+    let task = handle.spawn(RealBackend::open(config));
+    handle
+        .block_on(task)
+        .unwrap_or_else(|_| Err(FedimixError::Internal(PANIC_WHY.to_string())))
+}
+
 #[derive(Clone)]
 pub struct CoreBridge {
     core: Fedimix,
@@ -32,20 +60,14 @@ pub struct CoreBridge {
 }
 
 impl CoreBridge {
-    /// Start the multi-thread runtime, parked on its own thread named
-    /// "fedimix-core". The real backend needs worker threads: fedimint uses
-    /// `block_in_place`, which panics on a current-thread runtime.
+    /// Run `backend` on a new runtime.
+    #[cfg(test)]
     pub fn start(backend: Arc<dyn Backend>) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime");
-        let handle = rt.handle().clone();
-        std::thread::Builder::new()
-            .name("fedimix-core".to_string())
-            .spawn(move || rt.block_on(std::future::pending::<()>()))
-            .expect("failed to spawn core thread");
+        Self::on(start_runtime(), backend)
+    }
 
+    /// Run `backend` on the runtime of `handle`.
+    pub fn on(handle: tokio::runtime::Handle, backend: Arc<dyn Backend>) -> Self {
         let core = Fedimix::new(backend);
         let (tx, events) = async_channel::unbounded();
         let stream = core.subscribe();
@@ -177,11 +199,13 @@ mod tests {
         .await;
         assert!(matches!(res, Err(FedimixError::Internal(_))));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        let ok = capped(
-            async { Ok::<_, FedimixError>(()) },
-            std::time::Duration::from_secs(5),
-        )
-        .await;
+        let ok = capped(async { Ok::<_, FedimixError>(()) }, SHUTDOWN_CAP).await;
         assert_eq!(ok, Ok(()));
+    }
+
+    /// `RealBackend::shutdown` takes up to 25 s, and GTK must not cut it off.
+    #[test]
+    fn the_cap_outlasts_the_backends_own_limits() {
+        assert_eq!(SHUTDOWN_CAP, std::time::Duration::from_secs(30));
     }
 }

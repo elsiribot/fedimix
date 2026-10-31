@@ -148,6 +148,9 @@ pub struct FederationInfo {
     pub anonymity_estimate: u32,
     /// What this federation holds for the user.
     pub balance: Amount,
+    /// Its data is being rebuilt from the federation. Stays true across
+    /// failed attempts, which keep retrying, until the client is usable.
+    pub recovering: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +231,8 @@ pub struct SavingState {
     pub in_flight: Amount,
     pub coins: Vec<Coin>,
     pub history: Vec<HistoryItem>,
+    /// Whether Saving can be set up in this build.
+    pub can_set_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,6 +412,21 @@ impl Network {
     }
 }
 
+impl std::str::FromStr for Network {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "bitcoin" => Ok(Self::Bitcoin),
+            "signet" => Ok(Self::Signet),
+            "regtest" => Ok(Self::Regtest),
+            other => Err(format!(
+                "unknown network '{other}' (expected bitcoin, signet, regtest)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SuggestedFederation {
     pub name: String,
@@ -432,6 +452,10 @@ pub struct Settings {
     pub cover_budget_sat_per_month: u64,
     pub chain_backend: ChainBackend,
     pub socks5_proxy: Option<String>,
+    /// The user has opened the recovery words page. Once set, a write of
+    /// `false` does not clear it: a Settings page holds an older copy.
+    #[serde(default)]
+    pub recovery_words_shown: bool,
 }
 
 impl Default for Settings {
@@ -447,6 +471,7 @@ impl Default for Settings {
                 url: "https://blockstream.info/api".to_string(),
             },
             socks5_proxy: None,
+            recovery_words_shown: false,
         }
     }
 }
@@ -503,5 +528,22 @@ mod tests {
         assert_eq!(s.cover_budget_sat_per_month, 20_000);
         assert!(matches!(s.chain_backend, ChainBackend::Esplora { .. }));
         assert_eq!(s.socks5_proxy, None);
+        assert!(!s.recovery_words_shown);
+    }
+
+    #[test]
+    fn a_stored_row_without_the_new_setting_loads() {
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("recovery_words_shown");
+        let loaded: Settings = serde_json::from_value(old).unwrap();
+        assert!(!loaded.recovery_words_shown);
+    }
+
+    #[test]
+    fn networks_parse_by_the_name_they_are_stored_under() {
+        for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+            assert_eq!(network.name().parse(), Ok(network));
+        }
+        assert!("testnet".parse::<Network>().is_err());
     }
 }

@@ -194,7 +194,10 @@ fn build_error(error: &fedimint_client::error::ClientBuildError) -> FedimixError
             "This federation's data was made with a different recovery phrase.".into(),
         ),
         E::ConfigDownload(_) => FedimixError::Offline,
-        _ => FedimixError::Internal("Fedimix could not open this federation's data.".into()),
+        other => {
+            eprintln!("fedimix: building a client: {other:#}");
+            FedimixError::Internal("Fedimix could not open this federation's data.".into())
+        }
     }
 }
 
@@ -317,7 +320,8 @@ impl FedimintPort {
         client: ClientHandle,
         root: &Seed,
     ) -> Result<Arc<dyn FederationClient>> {
-        client.wait_for_all_recoveries().await.map_err(|_| {
+        client.wait_for_all_recoveries().await.map_err(|e| {
+            eprintln!("fedimix: recovering federation {id}: {e:#}");
             FedimixError::Internal("Fedimix could not recover this federation's data.".into())
         })?;
         if client.all_modules_usable() {

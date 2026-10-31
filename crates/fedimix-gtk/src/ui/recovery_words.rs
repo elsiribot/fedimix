@@ -1,9 +1,10 @@
 //! Recovery words page: the seed, shown on request, with a warning.
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use crate::ui::app_state::AppContext;
 use crate::ui::coins_page::{nav_page, page_body};
@@ -11,6 +12,49 @@ use crate::ui::coins_page::{nav_page, page_body};
 const WARNING: &str = "Write these words down and keep them offline. Anyone who has them can \
 take your bitcoin, and without them a lost device cannot be recovered. Never share or \
 photograph them.";
+
+const COPIED: &str = "Copied. Clear your clipboard when done.";
+/// How long the words may sit on the clipboard.
+const CLIPBOARD_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Put `words` on the clipboard and take them off after `CLIPBOARD_LIFETIME`.
+/// Only a weak reference waits for that, so whatever replaces them frees the
+/// words at once and stays where it is.
+fn copy_words(ctx: &AppContext, clipboard: gdk::Clipboard, words: &str) {
+    let content = gdk::ContentProvider::for_value(&words.to_value());
+    if clipboard.set_content(Some(&content)).is_err() {
+        ctx.toast("Could not copy.");
+        return;
+    }
+    ctx.toast(COPIED);
+    let content = content.downgrade();
+    glib::timeout_add_local_once(CLIPBOARD_LIFETIME, move || {
+        if let Some(content) = content.upgrade()
+            && clipboard.content().as_ref() == Some(&content)
+        {
+            let _ = clipboard.set_content(gdk::ContentProvider::NONE);
+        }
+    });
+}
+
+/// Remember that the words were opened, which ends the prompt on Spending.
+fn mark_shown(ctx: &Rc<AppContext>) {
+    if ctx.latest().is_some_and(|s| s.recovery_words_shown) {
+        return;
+    }
+    let core = ctx.bridge.core();
+    ctx.run(
+        async move {
+            let settings = core.settings().await?;
+            core.set_settings(fedimix_core::Settings {
+                recovery_words_shown: true,
+                ..settings
+            })
+            .await
+        },
+        |()| {},
+    );
+}
 
 /// Fetch the words and show them on a pushed page.
 pub fn push(ctx: &Rc<AppContext>) {
@@ -62,8 +106,7 @@ fn show(ctx: &Rc<AppContext>, words: String) {
         #[strong]
         secret,
         move |button| {
-            button.clipboard().set_text(&secret.borrow());
-            ctx.toast("Copied");
+            copy_words(&ctx, button.clipboard(), &secret.borrow());
         }
     ));
 
@@ -84,4 +127,5 @@ fn show(ctx: &Rc<AppContext>, words: String) {
         }
     });
     ctx.nav.push(&page);
+    mark_shown(ctx);
 }

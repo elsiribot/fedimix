@@ -463,7 +463,8 @@ impl Inner {
         }
     }
 
-    fn write(self: &Rc<Self>, settings: Settings) {
+    fn write(self: &Rc<Self>, mut settings: Settings) {
+        settings.recovery_words_shown = self.current.borrow().recovery_words_shown;
         if *self.current.borrow() == settings {
             return;
         }

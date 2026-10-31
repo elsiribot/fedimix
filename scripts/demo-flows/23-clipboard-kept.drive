@@ -1,0 +1,16 @@
+# scenario: funded
+# Something copied after the words stays on the clipboard past their 60 s.
+action app.settings
+click Recovery words
+expect 12. demo
+click Copy
+click Back
+click Back
+click Spending
+click Receive
+click On-chain
+expect bc1qdemo
+click Copy
+expect-clipboard bc1qdemo
+wait 61000
+expect-clipboard bc1qdemo

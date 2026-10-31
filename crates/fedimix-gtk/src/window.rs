@@ -59,12 +59,19 @@ fn load_css() {
     }
 }
 
-/// Let the backend shut down, for at most `SHUTDOWN_CAP`, then quit. A
-/// second request while that runs does nothing.
-fn quit_gracefully(app: &adw::Application, ctx: &AppContext, quitting: &Cell<bool>) {
+/// Hide the window, let the backend shut down, for at most `SHUTDOWN_CAP`,
+/// then quit. A second request while that runs does nothing.
+fn quit_gracefully(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    ctx: &AppContext,
+    quitting: &Cell<bool>,
+) {
     if quitting.replace(true) {
         return;
     }
+    // Nothing on it answers any more, so it must not look as if it does.
+    window.set_visible(false);
     let core = ctx.bridge.core();
     let app = app.clone();
     ctx.bridge.call(
@@ -221,16 +228,16 @@ impl FedimixWindow {
             switcher_bar,
         };
         let quitting = Rc::new(Cell::new(false));
-        Self::install_actions(app, &ctx, &quitting);
+        Self::install_actions(app, &window, &ctx, &quitting);
         // The window's close button takes the same road as Quit.
         window.connect_close_request({
             let app = app.clone();
             let ctx = ctx.clone();
-            move |_| {
+            move |window| {
                 if quitting.get() {
                     return gtk::glib::Propagation::Proceed;
                 }
-                quit_gracefully(&app, &ctx, &quitting);
+                quit_gracefully(&app, window, &ctx, &quitting);
                 gtk::glib::Propagation::Stop
             }
         });
@@ -244,12 +251,18 @@ impl FedimixWindow {
         }
     }
 
-    fn install_actions(app: &adw::Application, ctx: &Rc<AppContext>, quitting: &Rc<Cell<bool>>) {
+    fn install_actions(
+        app: &adw::Application,
+        window: &adw::ApplicationWindow,
+        ctx: &Rc<AppContext>,
+        quitting: &Rc<Cell<bool>>,
+    ) {
         let quit = gio::ActionEntry::builder("quit")
             .activate({
                 let ctx = ctx.clone();
                 let quitting = quitting.clone();
-                move |app: &adw::Application, _, _| quit_gracefully(app, &ctx, &quitting)
+                let window = window.clone();
+                move |app: &adw::Application, _, _| quit_gracefully(app, &window, &ctx, &quitting)
             })
             .build();
         let settings = gio::ActionEntry::builder("settings")

@@ -1332,6 +1332,119 @@ async fn a_lost_client_database_recovers_in_the_background() {
     assert_eq!(harness.port.recovers(), 1);
 }
 
+async fn recovering(backend: &fedimix_core::RealBackend) -> bool {
+    backend.federations().await.unwrap()[0].recovering
+}
+
+#[tokio::test]
+async fn a_recovery_is_reported_until_the_client_is_usable() {
+    let harness = Harness::new();
+    harness.port.set_recover_held(true);
+    let backend = lost_client_database(&harness).await;
+    wait_until("the mark", || async { recovering(&backend).await }).await;
+    let state = backend.spending_state().await.unwrap();
+    assert!(state.federation.unwrap().recovering);
+
+    harness.port.set_recover_held(false);
+    wait_online(&*backend, true).await;
+    assert!(!recovering(&backend).await);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_normal_connection_never_reports_a_recovery() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    assert!(!recovering(&backend).await);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_recovery_still_reports_recovering_while_it_retries() {
+    let harness = Harness::new();
+    harness
+        .port
+        .set_recover_error(Some(FedimixError::Internal("It failed.".into())));
+    let backend = lost_client_database(&harness).await;
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(harness.port.recovers() > 1);
+    assert!(recovering(&backend).await);
+    harness.port.set_recover_error(None);
+    harness.port.set_open_error(None);
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert!(!recovering(&backend).await);
+    backend.shutdown().await.unwrap();
+}
+
+/// A restart cut the recovery off, and `open` resumes it with no sign that it is
+/// one: only what the store remembers can say so.
+#[tokio::test]
+async fn a_recovery_cut_off_by_a_restart_is_still_reported() {
+    let harness = Harness::new();
+    harness.port.set_recover_held(true);
+    let backend = lost_client_database(&harness).await;
+    wait_until("the mark", || async { recovering(&backend).await }).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.port.set_held(true);
+    let backend = harness.open().await.unwrap();
+    wait_until("the report", || async { recovering(&backend).await }).await;
+    harness.port.set_recover_held(false);
+    harness.port.set_held(false);
+    wait_online(&*backend, true).await;
+    assert!(!recovering(&backend).await);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_proxy_shows_offline_rather_than_a_recovery_that_cannot_run() {
+    let harness = Harness::new();
+    harness.port.set_recover_held(true);
+    let backend = lost_client_database(&harness).await;
+    wait_until("the mark", || async { recovering(&backend).await }).await;
+    backend.set_settings(with_proxy()).await.unwrap();
+    assert!(!recovering(&backend).await);
+    harness.port.set_recover_held(false);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn saving_cannot_be_set_up_on_the_real_backend() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    assert!(!backend.saving_state().await.unwrap().can_set_up);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_older_settings_copy_does_not_bring_the_backup_prompt_back() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    let older = backend.settings().await.unwrap();
+    backend
+        .set_settings(Settings {
+            recovery_words_shown: true,
+            ..older.clone()
+        })
+        .await
+        .unwrap();
+    backend
+        .set_settings(Settings {
+            anonymity_target: 7,
+            ..older
+        })
+        .await
+        .unwrap();
+    let now = backend.settings().await.unwrap();
+    assert!(now.recovery_words_shown);
+    assert_eq!(now.anonymity_target, 7);
+    backend.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_cut_off_recovery_starts_again_on_the_next_connect() {
     let harness = Harness::new();

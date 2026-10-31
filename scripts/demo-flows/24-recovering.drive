@@ -1,0 +1,7 @@
+# scenario: recovering
+# page: spending
+# size: 360x640
+# Restoring is not Offline: the info banner stands in for it.
+expect Restoring your wallet from the federation. This can take a while.
+expect-not Offline
+shot restoring
