@@ -33,6 +33,7 @@ impl Harness {
         let first = port.add_federation(INVITE, "one", Network::Regtest);
         let second = port.add_federation(SECOND_INVITE, "two", Network::Regtest);
         port.add_federation("fed1main", "main", Network::Bitcoin);
+        port.add_federation_on("fed1unknown", "unknown", None);
         Self {
             dir,
             port,
@@ -42,9 +43,13 @@ impl Harness {
     }
 
     async fn open(&self) -> Result<Arc<fedimix_core::RealBackend>> {
+        self.open_on(Network::Regtest).await
+    }
+
+    async fn open_on(&self, network: Network) -> Result<Arc<fedimix_core::RealBackend>> {
         let config = CoreConfig {
             data_dir: self.dir.path().to_str().unwrap().to_string(),
-            network: Network::Regtest,
+            network,
         };
         real_backend(config, self.port.clone(), Arc::new(|| 1_000)).await
     }
@@ -568,9 +573,272 @@ async fn shutdown_stops_every_task() {
 async fn dropping_the_backend_stops_its_tasks() {
     let harness = Harness::new();
     let backend = harness.joined().await;
+    let events = backend.subscribe();
     drop(backend);
     wait_until("the client to close", || async {
         harness.first.shutdowns() == 1
     })
     .await;
+    within("the stream to end", async {
+        while events.next().await.is_some() {}
+    })
+    .await;
+    // The stream ends as the last task lets go, and the lock goes with it.
+    let reopened = harness.open().await.unwrap();
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reopening_with_another_network_is_refused() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let connects = harness.port.connects();
+    let refused = harness.open_on(Network::Bitcoin).await;
+    let error = refused.err().unwrap();
+    assert_eq!(
+        error,
+        FedimixError::WrongNetwork {
+            folder: "regtest".into(),
+            wanted: "bitcoin".into(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "This data folder is for regtest, but Fedimix was started for bitcoin. Start it for regtest, or choose another data folder."
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(harness.port.connects(), connects, "no supervisor started");
+    // The refusal let go of the folder, and did not change what it is for.
+    let backend = harness.open().await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_folder_binds_on_first_open() {
+    let harness = Harness::new();
+    let backend = harness.open_on(Network::Signet).await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    assert!(matches!(
+        harness.open().await.err(),
+        Some(FedimixError::WrongNetwork { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_federation_of_unknown_network_is_refused_as_such() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    assert_eq!(
+        backend.join_federation("fed1unknown".into()).await,
+        Err(FedimixError::InvalidInvite(
+            "Fedimix cannot tell which network this federation runs on.".into()
+        ))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn joining_a_known_federation_needs_no_network() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    harness.port.set_unreachable(true);
+    let connects = harness.port.connects();
+    let again = backend.join_federation(INVITE.into()).await.unwrap();
+    assert_eq!(again.id, "one");
+    assert_eq!(harness.port.connects(), connects);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn join_reports_the_balance_of_an_existing_client_database() {
+    let harness = Harness::new();
+    harness.first.set_balance(Amount::from_sat(4_000));
+    let backend = harness.open().await.unwrap();
+    let joined = backend.join_federation(INVITE.into()).await.unwrap();
+    assert_eq!(joined.balance, Amount::from_sat(4_000));
+    assert_eq!(
+        backend.federations().await.unwrap()[0].balance,
+        Amount::from_sat(4_000)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn join_repairs_a_federation_that_will_not_open() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem("one".into())));
+    let backend = harness.open().await.unwrap();
+    wait_until("the open to fail", || async {
+        harness.port.open_failures() > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    harness.port.set_open_error(None);
+    let joins = harness.port.joins();
+    harness.first.set_balance(Amount::from_sat(5));
+    let joined = backend.join_federation(INVITE.into()).await.unwrap();
+    assert_eq!(joined.id, "one");
+    assert_eq!(harness.port.joins(), joins + 1);
+    assert_eq!(backend.federations().await.unwrap().len(), 1);
+    // The supervisor takes it at once, not at the end of its backoff.
+    tokio::time::timeout(Duration::from_millis(500), wait_online(&*backend, true))
+        .await
+        .unwrap();
+    wait_balance(&*backend, Amount::from_sat(5)).await;
+    backend.shutdown().await.unwrap();
+    assert_eq!(harness.first.shutdowns(), 2);
+}
+
+#[tokio::test]
+async fn an_offline_federation_is_not_rejoined() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.port.set_open_error(Some(FedimixError::Offline));
+    let backend = harness.open().await.unwrap();
+    wait_until("the open to fail", || async {
+        harness.port.open_failures() > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let joins = harness.port.joins();
+    backend.join_federation(INVITE.into()).await.unwrap();
+    assert_eq!(harness.port.joins(), joins);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancelled_shutdown_leaves_its_work_to_the_next_call() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    harness.first.set_close_held(true);
+    let brief = Duration::from_millis(50);
+    assert!(
+        tokio::time::timeout(brief, backend.shutdown())
+            .await
+            .is_err(),
+        "the client is still closing"
+    );
+    assert!(
+        tokio::time::timeout(brief, backend.shutdown())
+            .await
+            .is_err(),
+        "a repeated call waits for the same work"
+    );
+    assert_eq!(
+        harness.open().await.err(),
+        Some(FedimixError::Internal(
+            "Fedimix is already running with this data folder.".into()
+        )),
+        "the lock outlives the closing client"
+    );
+    harness.first.set_close_held(false);
+    within("the shutdown", backend.shutdown()).await.unwrap();
+    let reopened = harness.open().await.unwrap();
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_during_a_join_closes_the_joined_client() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    harness.first.set_balance_held(true);
+    let joining = Arc::clone(&backend);
+    let join = tokio::spawn(async move { joining.join_federation(INVITE.into()).await });
+    wait_until("port.join to return", || async {
+        harness.first.balance_reads() > 0
+    })
+    .await;
+    let stopping = Arc::clone(&backend);
+    let stop = tokio::spawn(async move { stopping.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!stop.is_finished(), "shutdown waits for the join");
+    harness.first.set_balance_held(false);
+    within("the join", join).await.unwrap().unwrap();
+    within("the shutdown", stop).await.unwrap().unwrap();
+    assert_eq!(harness.first.shutdowns(), 1);
+    let reopened = harness.open().await.unwrap();
+    assert_eq!(reopened.federations().await.unwrap().len(), 1);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_the_store_refuses_closes_its_client() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    let db = rusqlite::Connection::open(harness.dir.path().join("fedimix.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_rows BEFORE INSERT ON federations
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    let reply = backend.join_federation(INVITE.into()).await;
+    assert!(matches!(reply, Err(FedimixError::Internal(_))), "{reply:?}");
+    assert_eq!(harness.first.shutdowns(), 1);
+    assert!(backend.federations().await.unwrap().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+/// Seconds between one attempt and the next.
+fn gaps(port: &FakePort) -> Vec<u64> {
+    let attempts = port.attempts();
+    attempts
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).as_secs())
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn attempts_back_off_to_a_minute() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    harness.port.set_unreachable(true);
+    let before = harness.port.attempts().len();
+    let backend = harness.open().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    let attempts = harness.port.attempts()[before..].to_vec();
+    let seconds: Vec<u64> = attempts
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).as_secs())
+        .collect();
+    assert_eq!(seconds[..8], [1, 2, 4, 8, 16, 32, 60, 60], "{seconds:?}");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_a_lasting_connection_resets_the_backoff() {
+    let harness = Harness::new();
+    let port = &harness.port;
+    let backend = harness.joined().await;
+    let client: Arc<dyn FederationClient> = harness.first.clone();
+
+    // A connection that ends at once: attempts keep backing off.
+    client.clone().shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    client.clone().shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let short = gaps(port);
+    assert_eq!(short[short.len() - 1], 2, "{short:?}");
+
+    // One that lasted a minute starts over.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    client.clone().shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let attempts = port.attempts();
+    assert_eq!(attempts.len(), short.len() + 2, "{:?}", gaps(port));
+    backend.shutdown().await.unwrap();
 }

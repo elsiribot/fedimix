@@ -287,7 +287,7 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::UnknownItem(_) => "This item is no longer available".to_string(),
         E::DeviceNotConnected(device) => format!("Connect your {device}"),
         E::Offline => "You are offline. Reconnect and try again".to_string(),
-        E::ProxyUnsupported => e.to_string(),
+        E::ProxyUnsupported | E::WrongNetwork { .. } => e.to_string(),
         E::PreviewExpired => "This review expired. Check the details and try again".to_string(),
         E::DeviceRejected => "The device rejected the transaction".to_string(),
         E::Cancelled => "Cancelled".to_string(),
@@ -564,6 +564,9 @@ pub fn validate_server_url(electrum: bool, url: &str) -> Result<(), String> {
     }
 }
 
+/// Under the proxy row: connections made before a proxy was set can outlive it.
+pub const PROXY_CAPTION: &str = "Connections already open stay open until you restart Fedimix.";
+
 /// Empty, or `[socks5://|socks5h://]host:port`. A proxy that does not parse
 /// must never be dropped in favour of a direct connection.
 pub fn validate_proxy(proxy: &str) -> Result<(), String> {
@@ -614,6 +617,14 @@ pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_caption_states_the_limit() {
+        assert_eq!(
+            PROXY_CAPTION,
+            "Connections already open stay open until you restart Fedimix."
+        );
+    }
 
     fn sat(n: u64) -> Amount {
         Amount::from_sat(n)

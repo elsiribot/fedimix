@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use self::events::{Events, left_open, supervise};
@@ -62,6 +62,10 @@ struct Live {
     client: Option<Arc<dyn FederationClient>>,
     online: bool,
     notes: Vec<NoteBucket>,
+    /// Why the last `open` failed, until one works.
+    last_open_error: Option<FedimixError>,
+    /// Ends the supervisor's backoff: a join gave it a client.
+    wake: Arc<Notify>,
 }
 
 /// Task 8 consumes its previews under this lock.
@@ -73,6 +77,8 @@ struct State {
 enum Reached {
     Known(String),
     Joined(FederationPreview, Arc<dyn FederationClient>),
+    /// A known federation that could not open, joined again.
+    Repaired(String, Arc<dyn FederationClient>),
 }
 
 /// A panic can happen with a lock held. The data stays valid, as nothing
@@ -128,9 +134,10 @@ struct Core {
     state: Mutex<State>,
     events: Events,
     gate: watch::Sender<Gate>,
-    /// Held through a join, so joins run one at a time, and through shutdown.
-    joining: tokio::sync::Mutex<()>,
-    tasks: Mutex<Vec<JoinHandle<Result<()>>>>,
+    /// One per federation. Held through a join, so joins run one at a time, and
+    /// through shutdown, which removes a handle only once its task has ended:
+    /// a call that is cancelled leaves the rest to the next one.
+    supervisors: tokio::sync::Mutex<Vec<JoinHandle<Result<()>>>>,
     lock: Mutex<Option<DataDirLock>>,
 }
 
@@ -162,12 +169,6 @@ impl Core {
         }
     }
 
-    /// One supervised task per federation.
-    fn supervise(self: &Arc<Self>, id: String) {
-        let task = tokio::spawn(supervise(Arc::clone(self), id));
-        held(&self.tasks).push(task);
-    }
-
     /// Follows the operations the store still lists for this federation, once
     /// `client` is connected. A stream that ends with no final update must keep
     /// its watch: the next connection comes back here.
@@ -196,26 +197,51 @@ impl Core {
         Ok(self.info(row))
     }
 
-    /// Preview, network check, join. Nothing but port calls, so it can be
-    /// dropped halfway.
+    /// Whether `id` cannot open for a reason that waiting will not cure.
+    fn needs_repair(&self, id: &str) -> bool {
+        self.state().live.get(id).is_some_and(|live| {
+            live.client.is_none()
+                && !matches!(live.last_open_error, None | Some(FedimixError::Offline))
+        })
+    }
+
+    /// Preview, network check, join; a known federation needs none of them
+    /// unless it will not open. Nothing but port calls, so it can be dropped
+    /// halfway.
     async fn reach(&self, invite: &str) -> Result<Reached> {
+        let id = self.port.federation_id_of(invite)?;
+        let known = self.store().federations()?.iter().any(|row| row.id == id);
+        let repair = known && self.needs_repair(&id);
+        if known && !repair {
+            return Ok(Reached::Known(id));
+        }
         let preview = self.port.preview(invite).await?;
-        if preview.network != Some(self.config.network) {
-            return Err(FedimixError::InvalidInvite(
-                "This federation runs on a different Bitcoin network.".into(),
-            ));
+        match preview.network {
+            Some(network) if network == self.config.network => {}
+            Some(_) => {
+                return Err(FedimixError::InvalidInvite(
+                    "This federation runs on a different Bitcoin network.".into(),
+                ));
+            }
+            None => {
+                return Err(FedimixError::InvalidInvite(
+                    "Fedimix cannot tell which network this federation runs on.".into(),
+                ));
+            }
         }
-        let known = self.store().federations()?;
-        if known.iter().any(|row| row.id == preview.id) {
-            return Ok(Reached::Known(preview.id));
-        }
+        // A supervisor's `open` cannot succeed alongside this: both need the
+        // client database, which one process at a time can hold.
         let client = self.port.join(invite, &self.seed).await?;
-        Ok(Reached::Joined(preview, client))
+        Ok(if repair {
+            Reached::Repaired(id, client)
+        } else {
+            Reached::Joined(preview, client)
+        })
     }
 
     async fn join(self: &Arc<Self>, invite: &str) -> Result<FederationInfo> {
         self.ensure_open()?;
-        let _one_at_a_time = self.joining.lock().await;
+        let mut supervisors = self.supervisors.lock().await;
         self.ensure_open()?;
         let mut gate = self.gate.subscribe();
         let reached = tokio::select! {
@@ -227,17 +253,27 @@ impl Core {
         };
         let (preview, client) = match reached {
             Reached::Known(id) => return self.federation(&id),
+            Reached::Repaired(id, client) => {
+                let mut state = self.state();
+                let live = state.live.entry(id.clone()).or_default();
+                live.client = Some(client);
+                live.last_open_error = None;
+                live.wake.notify_one();
+                drop(state);
+                self.events.emit(&Event::FederationChanged);
+                return self.federation(&id);
+            }
             Reached::Joined(preview, client) => (preview, client),
         };
-        // No await from here until the supervisor owns the client, unless the
-        // client is being closed: dropped unclosed, it keeps its database open.
+        // A client database from an earlier join can already hold money.
+        let balance = client.balance().await.unwrap_or(Amount::ZERO);
         let id = client.id();
         let row = FederationRow {
             id: id.clone(),
             name: preview.name,
             invite: invite.to_string(),
             online_at: Some((self.clock)()),
-            balance_msat: 0,
+            balance_msat: balance.msat,
         };
         let added = self.store().add_federation(&row);
         if let Err(e) = added {
@@ -251,7 +287,7 @@ impl Core {
                 ..Live::default()
             },
         );
-        self.supervise(id);
+        supervisors.push(tokio::spawn(supervise(Arc::clone(self), id)));
         self.events.emit(&Event::FederationChanged);
         Ok(self.info(&row))
     }
@@ -282,15 +318,15 @@ impl Core {
     async fn shutdown(&self) -> Result<()> {
         self.gate.send_replace(Gate::Stopped);
         // A join gives up at the gate, or has handed its client to a task.
-        let _no_join = self.joining.lock().await;
-        let tasks = std::mem::take(&mut *held(&self.tasks));
+        let mut supervisors = self.supervisors.lock().await;
         let mut outcome = Ok(());
-        for task in tasks {
+        while let Some(task) = supervisors.last_mut() {
             let closed = task.await.unwrap_or_else(|e| {
                 Err(FedimixError::Internal(format!(
                     "A background task stopped: {e}."
                 )))
             });
+            supervisors.pop();
             outcome = outcome.and(closed);
         }
         drop(held(&self.lock).take());
@@ -321,6 +357,7 @@ impl RealBackend {
         let lock = DataDirLock::acquire(&dir)?;
         let seed = Seed::load_or_create(&dir, &lock)?;
         let store = Store::open(&dir.join(DB_FILE))?;
+        store.bind_network(config.network)?;
         let gate = Gate::of(&store.settings()?);
         let rows = store.federations()?;
         let core = Arc::new(Core {
@@ -332,13 +369,14 @@ impl RealBackend {
             state: Mutex::default(),
             events: Events::default(),
             gate: watch::Sender::new(gate),
-            joining: tokio::sync::Mutex::new(()),
-            tasks: Mutex::default(),
+            supervisors: tokio::sync::Mutex::default(),
             lock: Mutex::new(Some(lock)),
         });
-        for row in rows {
-            core.supervise(row.id);
-        }
+        let supervisors = rows
+            .into_iter()
+            .map(|row| tokio::spawn(supervise(Arc::clone(&core), row.id)))
+            .collect();
+        *core.supervisors.lock().await = supervisors;
         Ok(Arc::new(RealBackend { core }))
     }
 }

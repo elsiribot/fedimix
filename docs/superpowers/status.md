@@ -27,4 +27,5 @@ Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 
 Phase 2 Task 7 (receive). `RealBackend` answers `receive` and `prepare_send` with `Internal("Not available yet.")` until Tasks 7-8; watches left in the store are not resumed yet (`Core::resume_watches` is the place). Still open from the re-review: O1-O4 (not in Task 1) and N8 (accepted).
 
 ## Needs user
-Nothing.
+- SOCKS5 for federation traffic: fedimint 0.13 connectors have no such option, so a set proxy keeps federations offline.
+  - A proxy set while running closes clients, but connectors already built stay until restart, and Settings says so. See `decisions.md`.

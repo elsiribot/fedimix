@@ -62,11 +62,13 @@ fn next_backoff(backoff: Duration) -> Duration {
 
 /// Keeps one federation connected until the gate stops it, and returns how
 /// closing its client went. The connection runs as its own task, so a panic
-/// ends only that. The client stays with `Core`: a client dropped unclosed
-/// keeps its database open, and the next `open` would fail.
+/// ends only that. The client stays with `Core`, so the panic does not lose it:
+/// fedimint closes a dropped client on its own, but nothing could wait for that
+/// before opening the database again.
 pub(super) async fn supervise(core: Arc<Core>, id: String) -> Result<()> {
     let mut gate = core.gate.subscribe();
     let mut backoff = FIRST_BACKOFF;
+    let wake = Arc::clone(&core.state().live.entry(id.clone()).or_default().wake);
     loop {
         let started = Instant::now();
         if *gate.borrow_and_update() == Gate::Open {
@@ -110,10 +112,10 @@ pub(super) async fn supervise(core: Arc<Core>, id: String) -> Result<()> {
             backoff = FIRST_BACKOFF;
         }
         tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(backoff) => backoff = next_backoff(backoff),
             () = left_open(&mut gate) => {}
+            () = wake.notified() => backoff = FIRST_BACKOFF,
         }
-        backoff = next_backoff(backoff);
     }
 }
 
@@ -148,12 +150,16 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
         None => match core.port.open(&id, &core.seed).await {
             Ok(client) => {
                 let mut state = core.state();
-                state.live.entry(id.clone()).or_default().client = Some(Arc::clone(&client));
+                let live = state.live.entry(id.clone()).or_default();
+                live.client = Some(Arc::clone(&client));
+                live.last_open_error = None;
                 client
             }
-            Err(FedimixError::Offline) => return,
             Err(e) => {
-                eprintln!("fedimix: opening federation {id}: {e}");
+                if e != FedimixError::Offline {
+                    eprintln!("fedimix: opening federation {id}: {e}");
+                }
+                core.state().live.entry(id).or_default().last_open_error = Some(e);
                 return;
             }
         },

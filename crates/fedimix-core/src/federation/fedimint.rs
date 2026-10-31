@@ -314,6 +314,10 @@ async fn builder() -> ClientBuilder {
 
 #[async_trait]
 impl FederationPort for FedimintPort {
+    fn federation_id_of(&self, invite: &str) -> Result<String> {
+        Ok(parse_invite(invite)?.federation_id().to_string())
+    }
+
     async fn preview(&self, invite: &str) -> Result<FederationPreview> {
         let code = parse_invite(invite)?;
         let preview = self.download(&code).await?;

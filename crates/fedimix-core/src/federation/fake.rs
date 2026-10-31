@@ -89,6 +89,11 @@ pub struct FakeClient {
     shutdowns: AtomicU32,
     /// The next balance stream panics when polled.
     panic_next_stream: AtomicBool,
+    /// While set, `balance` hangs, as a client too busy to answer does.
+    balance_held: watch::Sender<bool>,
+    balance_reads: AtomicU32,
+    /// While set, `shutdown` hangs, as it does for a payment in flight.
+    close_held: watch::Sender<bool>,
 }
 
 impl FakeClient {
@@ -117,6 +122,9 @@ impl FakeClient {
             deposits: Log::new(),
             shutdowns: AtomicU32::new(0),
             panic_next_stream: AtomicBool::new(false),
+            balance_held: watch::Sender::new(false),
+            balance_reads: AtomicU32::new(0),
+            close_held: watch::Sender::new(false),
         })
     }
 
@@ -188,6 +196,19 @@ impl FakeClient {
         self.panic_next_stream.store(true, Ordering::SeqCst);
     }
 
+    pub fn set_balance_held(&self, held: bool) {
+        self.balance_held.send_replace(held);
+    }
+
+    /// Calls of `balance`, also those still hanging.
+    pub fn balance_reads(&self) -> u32 {
+        self.balance_reads.load(Ordering::SeqCst)
+    }
+
+    pub fn set_close_held(&self, held: bool) {
+        self.close_held.send_replace(held);
+    }
+
     /// Invoices paid, in order.
     pub fn paid(&self) -> Vec<String> {
         self.paid.lock().unwrap().clone()
@@ -251,6 +272,9 @@ impl FederationClient for FakeClient {
     }
 
     async fn balance(&self) -> Result<Amount> {
+        self.balance_reads.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.balance_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         Ok(*self.balance.borrow())
     }
 
@@ -370,6 +394,8 @@ impl FederationClient for FakeClient {
     async fn shutdown(self: Arc<Self>) -> Result<()> {
         self.shutdowns.fetch_add(1, Ordering::SeqCst);
         self.alive.send_replace(false);
+        let mut held = self.close_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         Ok(())
     }
 }
@@ -406,17 +432,32 @@ pub struct FakePort {
     /// Calls that would have opened a connection.
     connects: AtomicU32,
     joins: AtomicU32,
+    /// When each connecting call came, for tests with paused time.
+    attempts: Mutex<Vec<tokio::time::Instant>>,
+    /// While set, `open` fails with this after connecting.
+    open_error: Mutex<Option<FedimixError>>,
+    open_failures: AtomicU32,
 }
 
 impl FakePort {
     /// Adds a federation on `network` with Lightning; returns its client.
     pub fn add_federation(&self, invite: &str, id: &str, network: Network) -> Arc<FakeClient> {
+        self.add_federation_on(invite, id, Some(network))
+    }
+
+    /// `None` is a federation that names no network Fedimix knows.
+    pub fn add_federation_on(
+        &self,
+        invite: &str,
+        id: &str,
+        network: Option<Network>,
+    ) -> Arc<FakeClient> {
         let name = format!("Federation {id}");
         let client = FakeClient::new(id, &name);
         let preview = FederationPreview {
             id: id.to_string(),
             name,
-            network: Some(network),
+            network,
             has_lightning: true,
         };
         self.invites
@@ -428,6 +469,19 @@ impl FakePort {
 
     pub fn set_unreachable(&self, unreachable: bool) {
         *self.unreachable.lock().unwrap() = unreachable;
+    }
+
+    pub fn set_open_error(&self, error: Option<FedimixError>) {
+        *self.open_error.lock().unwrap() = error;
+    }
+
+    /// Calls of `open` that hit [`Self::set_open_error`].
+    pub fn open_failures(&self) -> u32 {
+        self.open_failures.load(Ordering::SeqCst)
+    }
+
+    pub fn attempts(&self) -> Vec<tokio::time::Instant> {
+        self.attempts.lock().unwrap().clone()
     }
 
     /// Calls hang until this is set back to `false`.
@@ -446,6 +500,10 @@ impl FakePort {
 
     async fn connect(&self) -> Result<()> {
         self.connects.fetch_add(1, Ordering::SeqCst);
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
         let mut held = self.held.subscribe();
         let _ = held.wait_for(|held| !*held).await;
         if *self.unreachable.lock().unwrap() {
@@ -472,6 +530,10 @@ fn reopened(client: Arc<FakeClient>) -> Arc<dyn FederationClient> {
 
 #[async_trait]
 impl FederationPort for FakePort {
+    fn federation_id_of(&self, invite: &str) -> Result<String> {
+        Ok(self.by_invite(invite)?.0.id)
+    }
+
     async fn preview(&self, invite: &str) -> Result<FederationPreview> {
         self.connect().await?;
         Ok(self.by_invite(invite)?.0)
@@ -486,6 +548,11 @@ impl FederationPort for FakePort {
 
     async fn open(&self, id: &str, _root: &Seed) -> Result<Arc<dyn FederationClient>> {
         self.connect().await?;
+        let open_error = self.open_error.lock().unwrap().clone();
+        if let Some(error) = open_error {
+            self.open_failures.fetch_add(1, Ordering::SeqCst);
+            return Err(error);
+        }
         let invites = self.invites.lock().unwrap();
         let (_, client) = invites
             .values()

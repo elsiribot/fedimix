@@ -119,6 +119,8 @@ pub struct DepositEvent {
 
 #[async_trait]
 pub trait FederationPort: Send + Sync {
+    /// The federation id an invite names. Connects to nothing.
+    fn federation_id_of(&self, invite: &str) -> Result<String>;
     async fn preview(&self, invite: &str) -> Result<FederationPreview>;
     async fn join(&self, invite: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;
     async fn open(&self, id: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;

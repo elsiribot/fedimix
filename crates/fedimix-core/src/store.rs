@@ -6,7 +6,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::api::{HistoryItem, Settings, Timestamp, WalletKind};
+use crate::api::{HistoryItem, Network, Settings, Timestamp, WalletKind};
 use crate::error::{FedimixError, Result};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -39,6 +39,7 @@ CREATE TABLE watches (
     finished INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE cursors (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 /// A write transaction that takes the write lock up front, so it waits for the
@@ -480,6 +481,31 @@ impl Store {
         Ok(())
     }
 
+    /// Ties the data folder to `network` on first use. Later uses must name
+    /// the same one: federations of two networks must not share a folder.
+    pub(crate) fn bind_network(&self, network: Network) -> Result<()> {
+        let wanted = network.name();
+        let tx = begin(&self.conn)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('network', ?1)",
+            [wanted],
+        )
+        .map_err(db_err)?;
+        let folder: String = tx
+            .query_row("SELECT value FROM meta WHERE key = 'network'", [], |r| {
+                r.get(0)
+            })
+            .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        if folder != wanted {
+            return Err(FedimixError::WrongNetwork {
+                folder,
+                wanted: wanted.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn cursor(&self, name: &str) -> Result<Option<u64>> {
         Ok(self
             .conn
@@ -697,6 +723,20 @@ mod tests {
         store.set_online_at("a", 9).unwrap();
         let rows = store.federations().unwrap();
         assert_eq!((rows[0].balance_msat, rows[0].online_at), (5, Some(9)));
+    }
+
+    #[test]
+    fn a_store_binds_to_the_first_network() {
+        let (_d, store) = open();
+        store.bind_network(Network::Signet).unwrap();
+        store.bind_network(Network::Signet).unwrap();
+        assert_eq!(
+            store.bind_network(Network::Bitcoin),
+            Err(FedimixError::WrongNetwork {
+                folder: "signet".into(),
+                wanted: "bitcoin".into(),
+            })
+        );
     }
 
     #[test]

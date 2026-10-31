@@ -2407,6 +2407,7 @@ dependencies = [
  "fedimint-wallet-common",
  "fedimint-walletv2-client",
  "fedimint-walletv2-common",
+ "fedimix-core",
  "futures",
  "lightning-invoice",
  "rand 0.8.8",

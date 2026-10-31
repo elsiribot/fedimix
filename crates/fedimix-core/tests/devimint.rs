@@ -264,6 +264,7 @@ async fn join_reopen_keeps_identity() {
     let wallet = Wallet::new();
     let preview = wallet.port.preview(&invite()).await.unwrap();
     assert_eq!(preview.network, Some(Network::Regtest));
+    assert_eq!(wallet.port.federation_id_of(&invite()).unwrap(), preview.id);
     assert!(preview.has_lightning);
     assert!(!preview.name.is_empty());
 

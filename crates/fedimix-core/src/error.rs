@@ -26,6 +26,12 @@ pub enum FedimixError {
     ProxyUnsupported,
     #[error("not set up: {0}")]
     NotSetUp(String),
+    /// The data folder belongs to the network `folder`; Fedimix was started for
+    /// `wanted`. Both are lowercase network names, as `--network` takes them.
+    #[error(
+        "This data folder is for {folder}, but Fedimix was started for {wanted}. Start it for {folder}, or choose another data folder."
+    )]
+    WrongNetwork { folder: String, wanted: String },
     #[error("preview expired")]
     PreviewExpired,
     #[error("device rejected the transaction")]

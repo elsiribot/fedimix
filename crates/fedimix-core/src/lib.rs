@@ -31,27 +31,29 @@ pub use handle::Fedimix;
 pub use real::RealBackend;
 
 /// For the integration tests only, which cannot reach crate-private items and
-/// do not see `cfg(test)` code. Not an API: nothing here may name a fedimint or
-/// bitcoin type.
+/// do not see `cfg(test)` code. The fake and the backend constructor need the
+/// `testing` feature, which only this crate's dev-dependency on itself turns
+/// on. Not an API: nothing here may name a fedimint or bitcoin type.
 #[doc(hidden)]
 pub mod testing {
-    use std::sync::Arc;
-
+    #[cfg(feature = "testing")]
     pub use crate::federation::fake::{FakeClient, FakePort};
     pub use crate::federation::{
         DepositEvent, FederationClient, FederationPort, FederationPreview, FedimintPort,
         LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
+    #[cfg(feature = "testing")]
     pub use crate::real::Clock;
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 
     /// [`crate::RealBackend`] over `port`, reading the time from `clock`.
+    #[cfg(feature = "testing")]
     pub async fn real_backend(
         config: crate::CoreConfig,
-        port: Arc<dyn FederationPort>,
+        port: std::sync::Arc<dyn FederationPort>,
         clock: Clock,
-    ) -> crate::Result<Arc<crate::RealBackend>> {
+    ) -> crate::Result<std::sync::Arc<crate::RealBackend>> {
         crate::RealBackend::with_port(config, port, clock).await
     }
 }

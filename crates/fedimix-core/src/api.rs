@@ -395,6 +395,17 @@ pub enum Network {
     Regtest,
 }
 
+impl Network {
+    /// Lowercase, as the data folder stores it and `--network` takes it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Bitcoin => "bitcoin",
+            Self::Signet => "signet",
+            Self::Regtest => "regtest",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SuggestedFederation {
     pub name: String,

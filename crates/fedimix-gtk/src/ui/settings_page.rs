@@ -264,7 +264,10 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
     backup.add(&words);
     page.add(&backup);
 
-    let network = adw::PreferencesGroup::builder().title("Network").build();
+    let network = adw::PreferencesGroup::builder()
+        .title("Network")
+        .description(present::PROXY_CAPTION)
+        .build();
     network.add(&inner.backend);
     network.add(&inner.url);
     network.add(&inner.proxy);

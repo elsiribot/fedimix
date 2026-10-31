@@ -33,6 +33,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 
+[features]
+# The scripted federation, for this crate's tests. Only the self dev-dependency
+# below turns it on, so no normal build has it.
+testing = []
+
 [dev-dependencies]
-tokio.workspace = true
+fedimix-core = { path = ".", features = ["testing"] }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
