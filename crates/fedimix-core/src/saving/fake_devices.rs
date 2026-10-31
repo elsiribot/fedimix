@@ -12,6 +12,7 @@ use crate::error::{FedimixError, Result};
 struct State {
     devices: Vec<(DeviceInfo, Arc<dyn Signer>)>,
     connects: usize,
+    lists: usize,
 }
 
 /// Lists what was added. `connect` hands back the signer added with that id.
@@ -49,17 +50,19 @@ impl FakeDevices {
     pub fn connects(&self) -> usize {
         self.state().connects
     }
+
+    /// How many `list` calls were made.
+    pub fn lists(&self) -> usize {
+        self.state().lists
+    }
 }
 
 #[async_trait]
 impl DevicePort for FakeDevices {
     async fn list(&self) -> Result<Vec<DeviceInfo>> {
-        Ok(self
-            .state()
-            .devices
-            .iter()
-            .map(|(info, _)| info.clone())
-            .collect())
+        let mut state = self.state();
+        state.lists += 1;
+        Ok(state.devices.iter().map(|(info, _)| info.clone()).collect())
     }
 
     async fn connect(&self, id: &str, _account: Option<&DeviceAccount>) -> Result<Arc<dyn Signer>> {

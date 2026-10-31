@@ -35,19 +35,19 @@ pub use real::RealBackend;
 #[doc(hidden)]
 pub mod testing {
     #[cfg(feature = "testing")]
-    pub use crate::federation::fake::{FakeClient, FakePort};
+    pub use crate::federation::fake::{FakeClient, FakePort, regtest_address};
     pub use crate::federation::{
         DepositEvent, FederationClient, FederationPort, FederationPreview, FedimintPort,
         LightningInvoice, LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
     #[cfg(feature = "testing")]
     pub use crate::real::{ChainFactory, Clock, SendHalt, halt_sends, sync_saving_now};
+    #[cfg(feature = "testing")]
+    pub use crate::saving::{BroadcastGoes, FakeChain, FakeDevices, SoftSigner};
     pub use crate::saving::{
         ChainClient, DeviceAccount, DevicePort, HwiPort, Label, Labels, SavingWallet, SentRecord,
         Signer, SyncSummary, Tag, connect_chain,
     };
-    #[cfg(feature = "testing")]
-    pub use crate::saving::{FakeChain, FakeDevices, SoftSigner};
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 

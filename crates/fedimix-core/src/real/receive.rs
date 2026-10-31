@@ -163,7 +163,7 @@ impl Core {
         Ok(())
     }
 
-    fn add_deposit_watch(&self, federation: &str, id: String) -> Result<()> {
+    pub(super) fn add_deposit_watch(&self, federation: &str, id: String) -> Result<()> {
         let watch = Watch {
             id,
             federation_id: federation.to_string(),

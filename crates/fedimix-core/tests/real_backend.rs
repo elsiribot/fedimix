@@ -14,9 +14,9 @@ use bdk_wallet::bitcoin::{
 use bdk_wallet::chain::spk_client::{FullScanResponse, SyncResponse};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use fedimix_core::testing::{
-    ChainClient, ChainFactory, DepositEvent, FakeChain, FakeClient, FakeDevices, FakePort,
-    FederationClient, SendHalt, Signer, SoftSigner, WatchUpdate, halt_sends, real_backend,
-    sync_saving_now,
+    BroadcastGoes, ChainClient, ChainFactory, DepositEvent, FakeChain, FakeClient, FakeDevices,
+    FakePort, FederationClient, SendHalt, Signer, SoftSigner, WatchUpdate, halt_sends,
+    real_backend, regtest_address, sync_saving_now,
 };
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
@@ -2374,13 +2374,11 @@ async fn sends_need_spending_and_a_federation() {
     assert!(matches!(reply, Err(FedimixError::NotSetUp(_))), "{reply:?}");
     let saving = SendRequest {
         wallet: WalletKind::Saving,
-        ..pay_request()
+        ..to(ADDRESS, SendAmount::Exact(sat(500)))
     };
     assert_eq!(
         backend.prepare_send(saving).await,
-        Err(FedimixError::NotSetUp(
-            "Saving arrives in a later version.".into()
-        ))
+        Err(FedimixError::NotSetUp(SET_UP_FIRST.into()))
     );
     backend.shutdown().await.unwrap();
 }
@@ -3998,5 +3996,1021 @@ async fn saving_history_pages_over_the_wallet() {
             .await,
         Err(FedimixError::UnknownItem("gone".into()))
     );
+    backend.shutdown().await.unwrap();
+}
+
+// ---- Sending from Saving ----
+
+const SAME_ADDRESS: &str =
+    "Your last change is still reaching Spending. Try again in a few minutes.";
+const ONE_AT_A_TIME: &str =
+    "Another Saving payment is still running. Wait for it to end, then try again.";
+
+fn payee() -> String {
+    regtest_address("payee")
+}
+
+fn saving_send(amount: SendAmount) -> SendRequest {
+    SendRequest {
+        wallet: WalletKind::Saving,
+        destination: payee(),
+        amount,
+        fee_rate_sat_vb: Some(2),
+    }
+}
+
+fn saving_sat(sat_amount: u64) -> SendRequest {
+    saving_send(SendAmount::Exact(sat(sat_amount)))
+}
+
+fn script_of(address: &str) -> ScriptBuf {
+    bitcoin::Address::from_str(address)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+}
+
+fn paid_to(tx: &Transaction, address: &str) -> Option<u64> {
+    let script = script_of(address);
+    let out = tx.output.iter().find(|o| o.script_pubkey == script);
+    out.map(|o| o.value.to_sat())
+}
+
+async fn saving_rows(backend: &Real) -> Vec<HistoryItem> {
+    backend
+        .history(WalletKind::Saving, None, 50)
+        .await
+        .unwrap()
+        .items
+}
+
+async fn coin_at(backend: &Real, outpoint: &str) -> Option<fedimix_core::Coin> {
+    let state = backend.saving_state().await.unwrap();
+    state.coins.into_iter().find(|c| c.outpoint == outpoint)
+}
+
+async fn wait_no_saving_operation(backend: &Real) {
+    wait_until("the operation to end", || async {
+        backend.operations().await.unwrap().is_empty()
+    })
+    .await;
+}
+
+async fn wait_state(backend: &Real, id: &str, state: OperationState) {
+    wait_until("the operation's state", || async {
+        let running = backend.operations().await.unwrap();
+        running.iter().any(|op| op.id == id && op.state == state)
+    })
+    .await;
+}
+
+impl SavingHarness {
+    /// Set up and joined. The federation hands out addresses that parse.
+    async fn joined(&self) -> Real {
+        self.harness.first.use_valid_addresses();
+        let backend = self.ready().await;
+        backend.join_federation(INVITE.into()).await.unwrap();
+        wait_online(&*backend, true).await;
+        backend
+    }
+
+    /// Confirms `preview` and waits for its end.
+    async fn send(&self, backend: &Real, preview: SendPreview) -> (String, OperationState) {
+        let events = backend.subscribe();
+        let id = backend.confirm_send(preview.id).await.unwrap();
+        let (mut states, history_id) = run_of(&events, &id).await;
+        let last = states.pop().unwrap();
+        if last == OperationState::Done {
+            let txid = self.chain.broadcasts().last().unwrap().compute_txid();
+            assert_eq!(history_id, Some(txid.to_string()));
+        }
+        (id, last)
+    }
+
+    /// A send of `sat_amount` that ends well, and its transaction.
+    async fn sent(&self, backend: &Real, sat_amount: u64) -> Transaction {
+        let preview = backend.prepare_send(saving_sat(sat_amount)).await.unwrap();
+        let (_, state) = self.send(backend, preview).await;
+        assert_eq!(state, OperationState::Done);
+        self.chain.broadcasts().last().unwrap().clone()
+    }
+
+    /// The next sync, and the one after it, have ended.
+    async fn synced(&self, backend: &Real) {
+        let start = self.chain.scans_made();
+        wait_until("two syncs", || async {
+            sync_saving_now(backend);
+            self.chain.scans_made() >= start + 2
+        })
+        .await;
+    }
+
+    /// Replaces the device with one running `signer`.
+    fn plug_in(&self, signer: Arc<dyn Signer>) {
+        self.devices.remove(DEVICE);
+        self.devices
+            .add(DEVICE, "Test device", DeviceKind::Software, signer);
+    }
+}
+
+#[tokio::test]
+async fn change_goes_to_a_fresh_federation_address() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let first = saving.fund(&backend, 100_000, 0).await;
+    let second = saving.fund(&backend, 90_000, 1).await;
+    let client = &saving.harness.first;
+    let address = regtest_address("first change");
+    client.set_deposit_address(Some(address.clone()));
+
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    assert_eq!(preview.wallet, WalletKind::Saving);
+    assert_eq!(preview.destination, payee());
+    assert_eq!(preview.amount, sat(30_000));
+    assert_eq!(preview.federation, None);
+    let ChangeDestination::Spending { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    assert_eq!(preview.inputs.len(), 1);
+    let input = &preview.inputs[0];
+    assert!([&first, &second].contains(&&input.outpoint_or_note));
+    assert_eq!(input.tag, Some(PrivacyTag::Unmixed));
+    assert_eq!(
+        input.amount.as_sat(),
+        30_000 + change.as_sat() + preview.fee.as_sat()
+    );
+    assert!(preview.fee >= sat(2 * 110), "{:?}", preview.fee);
+
+    let (fee, spent_input) = (preview.fee, input.outpoint_or_note.clone());
+    let tx = {
+        let (_, state) = saving.send(&backend, preview).await;
+        assert_eq!(state, OperationState::Done);
+        saving.chain.broadcasts()[0].clone()
+    };
+    assert_eq!(paid_to(&tx, &payee()), Some(30_000));
+    assert_eq!(paid_to(&tx, &address), Some(change.as_sat()));
+    assert_eq!(tx.output.len(), 2);
+
+    let rows = saving_rows(&backend).await;
+    let row = rows.iter().find(|r| r.id == tx.compute_txid().to_string());
+    let row = row.unwrap();
+    assert_eq!(row.amount, sat(30_000));
+    assert_eq!(row.fee, Some(fee));
+    assert_eq!(row.status, HistoryStatus::Pending);
+    assert_eq!(
+        row.kind,
+        HistoryKind::Sent {
+            change: Some(fedimix_core::SentChange {
+                amount: change,
+                to_spending: true
+            })
+        }
+    );
+    assert_eq!(coin_at(&backend, &spent_input).await, None);
+
+    client.set_deposit_address(None);
+    let next = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let (_, state) = saving.send(&backend, next).await;
+    assert_eq!(state, OperationState::Done);
+    let tx = saving.chain.broadcasts()[1].clone();
+    assert_eq!(paid_to(&tx, &address), None, "a fresh address");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn small_change_stays_and_is_labelled() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let probe = backend.prepare_send(saving_sat(50_000)).await.unwrap();
+    let amount = 100_000 - probe.fee.as_sat() - 1_500;
+    let preview = backend.prepare_send(saving_sat(amount)).await.unwrap();
+    let ChangeDestination::SmallChange { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    assert!(change <= sat(2_000), "{change:?}");
+    let tx = {
+        let (_, state) = saving.send(&backend, preview).await;
+        assert_eq!(state, OperationState::Done);
+        saving.chain.broadcasts()[0].clone()
+    };
+    let vout = tx
+        .output
+        .iter()
+        .position(|o| o.value.to_sat() == change.as_sat())
+        .unwrap();
+    let outpoint = format!("{}:{vout}", tx.compute_txid());
+    let coin = coin_at(&backend, &outpoint).await.unwrap();
+    assert_eq!(coin.tag, PrivacyTag::SmallChange);
+    assert!(!coin.confirmed);
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.balance, change, "own change counts as yours");
+    assert_eq!(state.in_flight, Amount::ZERO);
+    let rows = saving_rows(&backend).await;
+    assert_eq!(rows[0].amount, sat(amount));
+    assert_eq!(
+        rows[0].kind,
+        HistoryKind::Sent {
+            change: Some(fedimix_core::SentChange {
+                amount: change,
+                to_spending: false
+            })
+        }
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_margin_is_twice_the_minimum_deposit() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let probe = backend.prepare_send(saving_sat(50_000)).await.unwrap();
+    let at_margin = 100_000 - probe.fee.as_sat() - 2_000;
+    let preview = backend.prepare_send(saving_sat(at_margin)).await.unwrap();
+    assert!(
+        matches!(preview.change, ChangeDestination::SmallChange { .. }),
+        "at the margin it stays: {:?}",
+        preview.change
+    );
+    let above = backend
+        .prepare_send(saving_sat(at_margin - 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        above.change,
+        ChangeDestination::Spending { amount: sat(2_001) }
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_v2_address_is_refused() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    let client = &saving.harness.first;
+    client.set_deposit_watches(false);
+    client.set_deposit_address(Some(regtest_address("repeats")));
+    saving.sent(&backend, 30_000).await;
+    assert_eq!(
+        backend.prepare_send(saving_sat(30_000)).await,
+        Err(FedimixError::NotSetUp(SAME_ADDRESS.into()))
+    );
+    // The scanner moved on: the change was seen.
+    client.set_deposit_address(Some(regtest_address("next")));
+    saving.sent(&backend, 30_000).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_rejected_send_uses_up_no_address() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving
+        .harness
+        .first
+        .set_deposit_address(Some(regtest_address("repeats")));
+    saving.plug_in(Arc::new(
+        SoftSigner::from_seed(&SEED, bitcoin::Network::Regtest).rejecting(),
+    ));
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    saving.send(&backend, preview).await;
+    backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn federation_offline_refuses_before_signing() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let connects = saving.devices.connects();
+    saving.harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    assert_eq!(
+        backend.prepare_send(saving_sat(30_000)).await,
+        Err(FedimixError::Offline)
+    );
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::Offline)
+    );
+    assert_eq!(saving.devices.connects(), connects, "the device stayed out");
+    assert!(saving.chain.broadcasts().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_proxy_keeps_the_change_address_out_of_reach() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    backend
+        .set_settings(Settings {
+            socks5_proxy: Some("127.0.0.1:9050".into()),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.prepare_send(saving_sat(30_000)).await,
+        Err(FedimixError::ProxyUnsupported)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_federation_keeps_change() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let ChangeDestination::SmallChange { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    assert!(change > sat(60_000));
+    assert!(
+        preview.notes.iter().any(|note| note.contains("federation")),
+        "{:?}",
+        preview.notes
+    );
+    saving.send(&backend, preview).await;
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.coins.len(), 1);
+    assert_eq!(state.coins[0].tag, PrivacyTag::SmallChange);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_changed_active_federation_expires_the_preview() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.harness.second.use_valid_addresses();
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    backend
+        .set_active_federation(saving.harness.second.id())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn device_rejects_nothing_broadcasts() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    saving.plug_in(Arc::new(
+        SoftSigner::from_seed(&SEED, bitcoin::Network::Regtest).rejecting(),
+    ));
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(
+        states,
+        [
+            OperationState::AwaitingDevice,
+            OperationState::Signing,
+            OperationState::Failed {
+                error: FedimixError::DeviceRejected
+            }
+        ]
+    );
+    assert!(saving.chain.broadcasts().is_empty());
+    assert!(backend.operations().await.unwrap().is_empty());
+    assert!(coin_at(&backend, &coin).await.is_some());
+    // Usable again.
+    saving.plug_in(soft_signer(bitcoin::Network::Regtest));
+    saving.sent(&backend, 30_000).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn device_missing_stops_at_awaiting_device_and_cancels() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    saving.devices.remove(DEVICE);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::AwaitingDevice).await;
+    backend.cancel_operation(id.clone()).await.unwrap();
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(
+        states,
+        [OperationState::AwaitingDevice, OperationState::Cancelled]
+    );
+    assert!(backend.operations().await.unwrap().is_empty());
+    assert!(saving.chain.broadcasts().is_empty());
+    assert!(coin_at(&backend, &coin).await.is_some());
+    backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_device_plugged_in_later_carries_on() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.devices.remove(DEVICE);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::AwaitingDevice).await;
+    saving.plug_in(soft_signer(bitcoin::Network::Regtest));
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(states.last(), Some(&OperationState::Done));
+    backend.shutdown().await.unwrap();
+}
+
+/// Signs, then hands back something else.
+struct TamperingSigner {
+    inner: SoftSigner,
+    tamper: fn(&mut bitcoin::psbt::Psbt),
+}
+
+#[async_trait]
+impl Signer for TamperingSigner {
+    fn kind(&self) -> DeviceKind {
+        DeviceKind::Software
+    }
+
+    async fn fingerprint(&self) -> Result<String> {
+        self.inner.fingerprint().await
+    }
+
+    async fn xpub(&self, path: &str) -> Result<String> {
+        self.inner.xpub(path).await
+    }
+
+    async fn sign(&self, psbt: &mut bitcoin::psbt::Psbt) -> Result<()> {
+        self.inner.sign(psbt).await?;
+        (self.tamper)(psbt);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn tampered_psbt_is_refused() {
+    let tampers: [fn(&mut bitcoin::psbt::Psbt); 3] = [
+        |psbt| psbt.unsigned_tx.output[0].value -= bitcoin::Amount::from_sat(1),
+        |psbt| psbt.unsigned_tx.output[0].script_pubkey = script_of(&regtest_address("thief")),
+        |psbt| {
+            let utxo = psbt.inputs[0].witness_utxo.as_mut().unwrap();
+            utxo.value += bitcoin::Amount::from_sat(1);
+        },
+    ];
+    for tamper in tampers {
+        let saving = SavingHarness::new();
+        let backend = saving.joined().await;
+        let coin = saving.fund(&backend, 100_000, 0).await;
+        saving.plug_in(Arc::new(TamperingSigner {
+            inner: SoftSigner::from_seed(&SEED, bitcoin::Network::Regtest),
+            tamper,
+        }));
+        let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+        let (_, state) = saving.send(&backend, preview).await;
+        assert_eq!(
+            state,
+            failed_with(
+                "Your device handed back a different transaction from the one you reviewed, so Fedimix did not send it."
+            )
+        );
+        assert!(saving.chain.broadcasts().is_empty());
+        assert!(coin_at(&backend, &coin).await.is_some());
+        assert_eq!(saving_rows(&backend).await.len(), 1);
+        backend.prepare_send(saving_sat(30_000)).await.unwrap();
+        backend.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn restart_rebroadcasts_a_signed_tx() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::Broadcasting).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    assert!(saving.chain.broadcasts().is_empty());
+
+    let backend = saving.open().await.unwrap();
+    wait_no_saving_operation(&backend).await;
+    let broadcasts = saving.chain.broadcasts();
+    assert_eq!(broadcasts.len(), 1);
+    assert_eq!(paid_to(&broadcasts[0], &payee()), Some(30_000));
+    assert_eq!(coin_at(&backend, &coin).await, None);
+    assert!(
+        saving_rows(&backend)
+            .await
+            .iter()
+            .any(|row| row.txid == Some(broadcasts[0].compute_txid().to_string()))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_recognises_a_seen_tx() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    halt_sends(&backend, SendHalt::AfterSubmit);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_until("the broadcast", || async {
+        saving.chain.broadcasts().len() == 1
+    })
+    .await;
+    wait_state(&backend, &id, OperationState::Broadcasting).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = saving.open().await.unwrap();
+    wait_no_saving_operation(&backend).await;
+    assert_eq!(saving.chain.broadcasts().len(), 1, "never sent twice");
+    assert_eq!(coin_at(&backend, &coin).await, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_saving_operation_at_a_time() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    let later = backend.prepare_send(saving_sat(1_000)).await.unwrap();
+    saving.devices.remove(DEVICE);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::AwaitingDevice).await;
+    let busy = Err(FedimixError::NotSetUp(ONE_AT_A_TIME.into()));
+    assert_eq!(
+        backend.prepare_send(saving_sat(30_000)).await,
+        busy.clone().map(|()| unreachable!())
+    );
+    assert_eq!(
+        backend.confirm_send(later.id).await,
+        busy.map(|()| unreachable!())
+    );
+    backend.cancel_operation(id).await.unwrap();
+    wait_no_saving_operation(&backend).await;
+    backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+/// The rule rests on the stored transaction: it needs no memory of the send.
+#[tokio::test]
+async fn a_stored_tx_keeps_the_rule_across_a_restart() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    saving.chain.set_offline(true);
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::Broadcasting).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = saving.open().await.unwrap();
+    wait_state(&backend, &id, OperationState::Broadcasting).await;
+    saving.chain.set_offline(false);
+    wait_no_saving_operation(&backend).await;
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_coins_are_not_spent() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let kept = saving.fund(&backend, 50_000, 0).await;
+    let frozen = saving.fund(&backend, 60_000, 1).await;
+    backend.set_coin_frozen(frozen.clone(), true).await.unwrap();
+    let preview = backend.prepare_send(saving_sat(40_000)).await.unwrap();
+    let spent: Vec<_> = preview.inputs.iter().map(|i| &i.outpoint_or_note).collect();
+    assert_eq!(spent, [&kept]);
+    let (_, state) = saving.send(&backend, preview).await;
+    assert_eq!(state, OperationState::Done);
+    assert!(coin_at(&backend, &frozen).await.is_some());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn freezing_a_coin_expires_a_preview_that_spends_it() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 50_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(40_000)).await.unwrap();
+    backend.set_coin_frozen(coin, true).await.unwrap();
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn above_spendable_is_insufficient() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 50_000, 0).await;
+    let frozen = saving.fund(&backend, 60_000, 1).await;
+    backend.set_coin_frozen(frozen, true).await.unwrap();
+    let reply = backend.prepare_send(saving_sat(55_000)).await;
+    let Err(FedimixError::InsufficientFunds { available, needed }) = reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(available, sat(50_000), "what can be spent, not the balance");
+    assert!(needed > sat(55_000), "with the fee: {needed:?}");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_preview_explains_a_balance_above_spendable() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 50_000, 0).await;
+    let plain = backend.prepare_send(saving_sat(1_000)).await.unwrap();
+    assert_eq!(plain.notes, Vec::<String>::new());
+    let frozen = saving.fund(&backend, 60_000, 1).await;
+    backend.set_coin_frozen(frozen, true).await.unwrap();
+    let preview = backend.prepare_send(saving_sat(1_000)).await.unwrap();
+    assert_eq!(
+        preview.notes,
+        ["60000 sat of your balance cannot be sent yet: it is frozen or still unconfirmed."]
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn max_sends_everything_minus_fee_without_change() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 50_000, 0).await;
+    saving.fund(&backend, 60_000, 1).await;
+    let frozen = saving.fund(&backend, 7_000, 2).await;
+    backend.set_coin_frozen(frozen, true).await.unwrap();
+    let preview = backend
+        .prepare_send(saving_send(SendAmount::Max))
+        .await
+        .unwrap();
+    assert_eq!(preview.change, ChangeDestination::None);
+    assert_eq!(preview.inputs.len(), 2);
+    assert_eq!(preview.amount.as_sat() + preview.fee.as_sat(), 110_000);
+    let (amount, _) = (preview.amount, saving.send(&backend, preview).await);
+    let tx = saving.chain.broadcasts()[0].clone();
+    assert_eq!(tx.output.len(), 1);
+    assert_eq!(paid_to(&tx, &payee()), Some(amount.as_sat()));
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.balance, sat(7_000));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn max_with_nothing_spendable_is_insufficient() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let reply = backend.prepare_send(saving_send(SendAmount::Max)).await;
+    assert!(
+        matches!(
+            reply,
+            Err(FedimixError::InsufficientFunds { available, .. }) if available == Amount::ZERO
+        ),
+        "{reply:?}"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn two_previews_second_fails() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let first = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let second = backend.prepare_send(saving_sat(20_000)).await.unwrap();
+    let (_, state) = saving.send(&backend, first).await;
+    assert_eq!(state, OperationState::Done);
+    assert_eq!(
+        backend.confirm_send(second.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_send_shows_once_and_enters_the_wallet_at_once() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let tx = saving.sent(&backend, 30_000).await;
+    let txid = tx.compute_txid().to_string();
+    let rows = saving_rows(&backend).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.txid.as_ref() == Some(&txid))
+            .count(),
+        1
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.balance, Amount::ZERO, "the change went to Spending");
+    let in_store: i64 = raw_store(&saving.harness)
+        .query_row(
+            "SELECT COUNT(*) FROM history WHERE wallet = 'saving'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(in_store, 0, "the wallet's view is the only list");
+
+    // Mined: the row is final and nothing is left to look after.
+    saving.chain.push_sync(confirmed(tx.clone(), 9));
+    wait_until("the confirmation", || async {
+        sync_saving_now(&backend);
+        saving_rows(&backend).await[0].status == HistoryStatus::Complete
+    })
+    .await;
+    saving.synced(&backend).await;
+    let open: i64 = raw_store(&saving.harness)
+        .query_row(
+            "SELECT COUNT(*) FROM saving_signed WHERE state IN ('signed', 'seen')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(open, 0);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn broadcast_retries_after_a_dropped_connection() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving
+        .chain
+        .script_broadcasts([BroadcastGoes::Offline, BroadcastGoes::Offline]);
+    saving.sent(&backend, 30_000).await;
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+/// The first attempt reached the server and only its answer was lost: the send
+/// has gone out, and saying otherwise would invite a second payment.
+#[tokio::test]
+async fn a_lost_answer_is_not_a_failure() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.chain.script_broadcasts([BroadcastGoes::AnswerLost]);
+    saving.sent(&backend, 30_000).await;
+    assert_eq!(
+        saving.chain.broadcasts().len(),
+        1,
+        "seen, so not sent again"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refusal_ends_the_send_and_frees_what_it_held() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    saving
+        .harness
+        .first
+        .set_deposit_address(Some(regtest_address("repeats")));
+    saving.chain.script_broadcasts([BroadcastGoes::Refused]);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let (_, state) = saving.send(&backend, preview).await;
+    assert_eq!(
+        state,
+        failed_with("The chain server refused the request: bad-txns-inputs-missingorspent.")
+    );
+    assert!(coin_at(&backend, &coin).await.is_some());
+    assert_eq!(saving_rows(&backend).await.len(), 1);
+    // The address was never paid, so it may be used.
+    backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+/// A refusal after an attempt with no answer can be the server refusing what
+/// it was just given, so it does not end the send at once.
+#[tokio::test]
+async fn a_refusal_after_a_silent_attempt_waits_for_the_chain() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving
+        .chain
+        .script_broadcasts([BroadcastGoes::Offline, BroadcastGoes::Refused]);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let (_, state) = saving.send(&backend, preview).await;
+    assert_eq!(state, OperationState::Done);
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lagging_server_cannot_free_a_signed_send() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let tx = saving.sent(&backend, 30_000).await;
+    let txid = tx.compute_txid();
+
+    // The server forgets it, and refuses it once before it takes it back.
+    saving.chain.script_broadcasts([BroadcastGoes::Refused]);
+    saving.chain.lose(txid);
+    wait_until("the rebroadcast", || async {
+        sync_saving_now(&backend);
+        saving.chain.broadcasts().len() == 2
+    })
+    .await;
+    assert_eq!(saving.chain.broadcasts()[1].compute_txid(), txid);
+    wait_until("the send to return", || async {
+        saving_rows(&backend)
+            .await
+            .iter()
+            .any(|r| r.txid == Some(txid.to_string()))
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_coin_stays_signed_away_while_the_wallet_says_otherwise() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    let tx = saving.sent(&backend, 30_000).await;
+    saving.chain.script_broadcasts([
+        BroadcastGoes::Refused,
+        BroadcastGoes::Refused,
+        BroadcastGoes::Refused,
+    ]);
+    saving.chain.lose(tx.compute_txid());
+    wait_until("the wallet to let go of the send", || async {
+        sync_saving_now(&backend);
+        coin_at(&backend, &coin).await.is_some()
+    })
+    .await;
+    let reply = backend.prepare_send(saving_sat(30_000)).await;
+    assert!(
+        matches!(reply, Err(FedimixError::InsufficientFunds { available, .. }) if available == Amount::ZERO),
+        "{reply:?}"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_send_the_server_keeps_refusing_gives_its_coin_back() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    saving
+        .harness
+        .first
+        .set_deposit_address(Some(regtest_address("repeats")));
+    let tx = saving.sent(&backend, 30_000).await;
+    saving.chain.script_broadcasts([BroadcastGoes::Refused; 64]);
+    saving.chain.lose(tx.compute_txid());
+    wait_until("the coin to be spendable", || async {
+        sync_saving_now(&backend);
+        backend.prepare_send(saving_sat(30_000)).await.is_ok()
+    })
+    .await;
+    assert!(coin_at(&backend, &coin).await.is_some());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn change_reaches_spending_as_a_deposit_row() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let client = &saving.harness.first;
+    let tx = saving.sent(&backend, 30_000).await;
+    let txid = tx.compute_txid().to_string();
+    let watch = client.last_deposit().unwrap();
+    client.push_update(
+        &watch,
+        WatchUpdate::Settled {
+            amount: sat(60_000),
+            fee: sat(100),
+            txid: Some(txid.clone()),
+        },
+    );
+    wait_until("the deposit's row", || async {
+        rows(&*backend)
+            .await
+            .iter()
+            .any(|row| row.kind == HistoryKind::Deposit && row.txid.as_ref() == Some(&txid))
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn saving_sends_go_on_chain() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.harness.first.add_invoice("lnbcrt1x", sat(100));
+    let reply = backend
+        .prepare_send(SendRequest {
+            wallet: WalletKind::Saving,
+            destination: "lnbcrt1x".into(),
+            amount: SendAmount::Exact(sat(100)),
+            fee_rate_sat_vb: None,
+        })
+        .await;
+    assert!(reply.is_err(), "{reply:?}");
+    let msat = backend
+        .prepare_send(saving_send(SendAmount::Exact(Amount { msat: 30_000_500 })))
+        .await;
+    assert!(
+        matches!(msat, Err(FedimixError::InvalidAmount(_))),
+        "{msat:?}"
+    );
+    let dust = backend.prepare_send(saving_sat(10)).await;
+    assert!(
+        matches!(dust, Err(FedimixError::InvalidAmount(_))),
+        "{dust:?}"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_send_needs_the_first_scan() {
+    let saving = SavingHarness::new();
+    let backend = saving.with_server().await;
+    saving.chain.set_stalled(true);
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    assert_eq!(
+        backend.prepare_send(saving_sat(1_000)).await,
+        Err(FedimixError::NotSetUp(SCANNING.into()))
+    );
+    saving.chain.set_stalled(false);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_estimate_sets_the_fee_and_regtest_has_a_default() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let estimated = SendRequest {
+        fee_rate_sat_vb: None,
+        ..saving_sat(30_000)
+    };
+    saving.chain.set_offline(true);
+    assert_eq!(
+        backend.prepare_send(estimated.clone()).await,
+        Err(FedimixError::Offline),
+        "no estimate to go on"
+    );
+    saving.chain.set_offline(false);
+    let two = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let default = backend.prepare_send(estimated.clone()).await.unwrap();
+    assert_eq!(default.fee, two.fee, "regtest has no estimate: 2 sat/vB");
+    saving.chain.set_fee_rate(Some(20.0));
+    let high = backend.prepare_send(estimated).await.unwrap();
+    assert!(high.fee.as_sat() >= two.fee.as_sat() * 9, "{high:?}");
+    backend.shutdown().await.unwrap();
+}
+
+/// Polling asks the USB stack, so it happens only while a device can matter.
+#[tokio::test]
+async fn a_review_polls_the_device_and_nothing_else_does() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let idle = saving.devices.lists();
+    tokio::time::sleep(Duration::from_millis(5_200)).await;
+    assert_eq!(saving.devices.lists(), idle, "no review, no polling");
+    let preview = backend.prepare_send(saving_sat(1_000)).await.unwrap();
+    wait_until("a poll", || async { saving.devices.lists() > idle }).await;
+    backend.discard_preview(preview.id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let reviewed = saving.devices.lists();
+    tokio::time::sleep(Duration::from_millis(5_200)).await;
+    assert_eq!(saving.devices.lists(), reviewed, "the review closed");
     backend.shutdown().await.unwrap();
 }

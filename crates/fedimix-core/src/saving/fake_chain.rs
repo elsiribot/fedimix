@@ -10,7 +10,19 @@ use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncReque
 use tokio::sync::watch;
 
 use super::ChainClient;
+use super::chain::refused;
 use crate::error::{FedimixError, Result};
+
+/// How the next `broadcast` goes, when it is not plainly accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastGoes {
+    /// Never reached the server.
+    Offline,
+    /// Reached the server, and the connection dropped before the answer.
+    AnswerLost,
+    /// The server said no.
+    Refused,
+}
 
 #[derive(Default)]
 struct State {
@@ -21,6 +33,12 @@ struct State {
     syncs: VecDeque<SyncResponse>,
     known: HashSet<Txid>,
     broadcasts: Vec<Transaction>,
+    broadcast_script: VecDeque<BroadcastGoes>,
+    /// Transactions the server no longer has: a sync that was told to expect
+    /// one reports it evicted, as bdk_esplora and bdk_electrum do.
+    missing: HashSet<Txid>,
+    /// What the last sync was told to expect.
+    expected: Vec<Txid>,
     scans_made: usize,
     full_scans_made: usize,
 }
@@ -87,6 +105,23 @@ impl FakeChain {
         self.state().known.insert(txid);
     }
 
+    /// The next `broadcast`s go like this, in order.
+    pub fn script_broadcasts(&self, script: impl IntoIterator<Item = BroadcastGoes>) {
+        self.state().broadcast_script.extend(script);
+    }
+
+    /// The server lost `txid`: it forgets it, and stops listing it.
+    pub fn lose(&self, txid: Txid) {
+        let mut state = self.state();
+        state.known.remove(&txid);
+        state.missing.insert(txid);
+    }
+
+    /// The transactions the last sync's request expected the server to list.
+    pub fn expected(&self) -> Vec<Txid> {
+        self.state().expected.clone()
+    }
+
     /// Every transaction handed to `broadcast`, in order, repeats included.
     pub fn broadcasts(&self) -> Vec<Transaction> {
         self.state().broadcasts.clone()
@@ -117,18 +152,42 @@ impl ChainClient for FakeChain {
         Ok(state.full_scans.pop_front().unwrap_or_default())
     }
 
-    async fn sync(&self, _request: SyncRequest<(KeychainKind, u32)>) -> Result<SyncResponse> {
+    async fn sync(&self, mut request: SyncRequest<(KeychainKind, u32)>) -> Result<SyncResponse> {
         self.check_online().await?;
+        let started = request.start_time();
+        let expected: Vec<Txid> = request
+            .iter_spks_with_expected_txids()
+            .flat_map(|spk| spk.expected_txids)
+            .collect();
         let mut state = self.state();
         state.scans_made += 1;
-        Ok(state.syncs.pop_front().unwrap_or_default())
+        let mut response = state.syncs.pop_front().unwrap_or_default();
+        for txid in &expected {
+            if state.missing.contains(txid) {
+                response.tx_update.evicted_ats.insert((*txid, started));
+            }
+        }
+        state.expected = expected;
+        Ok(response)
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.check_online().await?;
         let mut state = self.state();
+        let txid = tx.compute_txid();
+        let goes = state.broadcast_script.pop_front();
+        if goes == Some(BroadcastGoes::Offline) {
+            return Err(FedimixError::Offline);
+        }
+        if goes == Some(BroadcastGoes::Refused) {
+            return Err(refused("bad-txns-inputs-missingorspent"));
+        }
         state.broadcasts.push(tx.clone());
-        state.known.insert(tx.compute_txid());
+        state.known.insert(txid);
+        state.missing.remove(&txid);
+        if goes == Some(BroadcastGoes::AnswerLost) {
+            return Err(FedimixError::Offline);
+        }
         Ok(())
     }
 

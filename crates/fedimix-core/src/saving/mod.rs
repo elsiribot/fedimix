@@ -14,15 +14,15 @@ mod signer;
 mod soft_signer;
 mod wallet;
 
-pub use chain::{ChainClient, connect_chain, require_server};
+pub use chain::{ChainClient, connect_chain, is_refusal, require_server};
 pub use devices::HwiPort;
 #[cfg(feature = "testing")]
-pub use fake_chain::FakeChain;
+pub use fake_chain::{BroadcastGoes, FakeChain};
 #[cfg(feature = "testing")]
 pub use fake_devices::FakeDevices;
 pub use labels::{Label, Labels, SentRecord, Tag};
 pub use signer::{DevicePort, Signer};
 #[cfg(feature = "testing")]
 pub use soft_signer::SoftSigner;
-pub(crate) use wallet::ALREADY_SET_UP;
+pub(crate) use wallet::{ALREADY_SET_UP, SendPlan, TxPosition};
 pub use wallet::{DeviceAccount, SavingWallet, SyncSummary};

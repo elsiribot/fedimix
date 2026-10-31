@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::Core;
 #[cfg(feature = "testing")]
 use super::held;
 use super::receive::paid_fee;
-use super::{Core, saving_not_set_up};
 use crate::api::*;
 use crate::destination::{DestinationKind, parse_destination, requested_amount, validate_address};
 use crate::error::{FedimixError, Result};
@@ -24,7 +24,7 @@ use crate::federation::{FederationClient, LightningQuote, WatchUpdate, WithdrawQ
 use crate::store::{HistoryWrite, Watch, WatchKind};
 
 /// How long a preview can be confirmed, as in the demo.
-const PREVIEW_TTL: Timestamp = 600;
+pub(super) const PREVIEW_TTL: Timestamp = 600;
 /// How long `shutdown` waits for submissions, after closing clients took up to
 /// their own 10 s: up to 25 s in all, inside GTK's cap of 30 s.
 const SUBMISSION_GRACE: Duration = Duration::from_secs(15);
@@ -94,7 +94,7 @@ pub(super) struct HeldSend {
 pub(super) type Submitting = HashMap<String, (String, Amount)>;
 
 /// Keeps a send in [`Core::submitting`], also through a panic.
-struct Reservation {
+pub(super) struct Reservation {
     core: Arc<Core>,
     intent: String,
 }
@@ -107,7 +107,7 @@ impl Drop for Reservation {
     }
 }
 
-fn fresh_id(prefix: &str) -> String {
+pub(super) fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{:032x}", rand::random::<u128>())
 }
 
@@ -115,7 +115,7 @@ fn insufficient(available: Amount, needed: Amount) -> FedimixError {
     FedimixError::InsufficientFunds { available, needed }
 }
 
-fn failed_with(sentence: &str) -> OperationState {
+pub(super) fn failed_with(sentence: &str) -> OperationState {
     OperationState::Failed {
         error: FedimixError::Internal(sentence.to_string()),
     }
@@ -141,7 +141,7 @@ async fn fresh_quote(client: &dyn FederationClient, quote: Quote) -> Result<Quot
 impl Core {
     pub(super) async fn prepare_send(&self, request: SendRequest) -> Result<SendPreview> {
         if request.wallet == WalletKind::Saving {
-            return Err(saving_not_set_up());
+            return self.prepare_saving_send(request).await;
         }
         let destination = parse_destination(&request.destination)?;
         let federation = self
@@ -180,6 +180,7 @@ impl Core {
             federation: Some(federation.clone()),
             inputs: Vec::new(),
             change: ChangeDestination::None,
+            notes: Vec::new(),
             expires_at: (self.clock)() + PREVIEW_TTL,
         };
         let held = HeldSend {
@@ -205,7 +206,7 @@ impl Core {
     /// Books `needed` against what `available` leaves after the sends still being
     /// submitted, whose debit the balance may not show yet. One that has just
     /// debited can count twice for a moment: that refuses, and pays nothing.
-    fn reserve(
+    pub(super) fn reserve(
         self: &Arc<Self>,
         federation: &str,
         intent: &str,
@@ -235,6 +236,10 @@ impl Core {
     /// An `Err` here means no row and no payment. From `Ok` on, the outcome
     /// arrives as [`Event::Operation`].
     pub(super) async fn confirm_send(self: &Arc<Self>, preview_id: &str) -> Result<OperationId> {
+        let saving = self.state().saving_previews.remove(preview_id);
+        if let Some(held) = saving {
+            return self.confirm_saving_send(held);
+        }
         let HeldSend {
             federation, quote, ..
         } = self.consume(preview_id)?;
@@ -352,7 +357,7 @@ impl Core {
         Ok(())
     }
 
-    fn report(&self, id: &str, state: OperationState, history_id: Option<String>) {
+    pub(super) fn report(&self, id: &str, state: OperationState, history_id: Option<String>) {
         self.events.emit(&Event::Operation {
             id: id.to_string(),
             kind: OperationKind::Send,
@@ -433,14 +438,16 @@ impl Core {
 
     pub(super) fn running_sends(&self) -> Result<Vec<RunningOperation>> {
         let sends = self.store().sends()?;
-        Ok(sends
+        let mut running: Vec<_> = sends
             .into_iter()
             .map(|(watch, _)| RunningOperation {
                 id: watch.id,
                 kind: OperationKind::Send,
                 state: OperationState::Broadcasting,
             })
-            .collect())
+            .collect();
+        running.extend(self.running_saving()?);
+        Ok(running)
     }
 
     /// Whether every submission ended in time.

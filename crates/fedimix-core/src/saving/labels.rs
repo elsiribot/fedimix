@@ -38,10 +38,6 @@ impl Tag {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Saving send of Task 6 uses it")
-    )]
     /// The stored name and estimate.
     pub(crate) fn to_parts(self) -> (&'static str, Option<u32>) {
         match self {
@@ -117,10 +113,6 @@ impl Labels {
         self.sent.get(txid)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Saving send of Task 6 uses it")
-    )]
     pub(crate) fn set_tag(
         &mut self,
         store: &Store,
@@ -141,12 +133,8 @@ impl Labels {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Saving send of Task 6 uses it")
-    )]
     /// Notes that the transaction `txid` is a send Fedimix built, with where
-    /// its change went. Task 6 calls this before it broadcasts.
+    /// its change went, before it can reach anyone.
     pub(crate) fn record_sent(
         &mut self,
         store: &Store,

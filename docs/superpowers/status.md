@@ -5,7 +5,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## What works (commands run in `nix develop`)
 - `just run [--data-dir PATH] [--network bitcoin|signet|regtest]`: the real wallet. `just demo`: the complete UI over the demo backend.
 - `just clippy`, `just fmt`, `just test` (includes `tests/real_backend.rs` over a fake port).
-- `just test-integration`: devimint, both module sets, 30 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
+- `just test-integration`: devimint, both module sets, 34 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
 - `just test-real-ui`: the real binary through Join, Lightning receive and send, restart, lock, wrong network, under headless sway.
 - `just interact-demo`, `just screenshot-all`: scripted demo flows and screenshots at 480 and 360 px.
 - `nix build` / `just build-nix`: wrapped release binary plus flake checks. Release build from clean: 7 min 16 s, 88 MiB, 64 MiB stripped.
@@ -13,20 +13,18 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## Not verified
 - Mainnet and signet: every real run was regtest.
 - A real on-chain receive or send through the UI (covered below the UI by `devimint.rs`); a real recovery on screen.
-- Real pointer and keyboard input, dark theme, accessibility, a real desktop (sway only), hardware.
-- The clipboard against another Wayland client or a clipboard manager.
+- Real pointer and keyboard input, dark theme, accessibility, a real desktop (sway only), hardware; the clipboard against another Wayland client or a clipboard manager.
 - Guardians gone for good: `a_stopped_federation_leaves_the_wallet_readable` stops them with SIGSTOP and brings them back.
 - A hung backend at shutdown (30 s cap) in the UI; `NON_UNIQUE` launcher behavior on a desktop.
 - That no Electrum traffic follows a proxy change beyond the one request in flight (at most 10 scripts, its answer read up to 30 s; `decisions.md`, Task 5 fix I1): tested against a stub server, not through a proxy. A Jade PIN step already under way cannot be stopped.
-- Details: `decisions.md`.
+- A send against real hardware or a public server; a dropped send is exercised with fakes only. Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-4 done: the dependencies and Phase 2 residuals, chain access (`saving::ChainClient` over Esplora or Electrum, `FakeChain` under `testing`), and the watch-only wallet (`saving::SavingWallet`: create/open from a `DeviceAccount`, sync, balance, coins, history, fresh receive addresses; `Labels` per outpoint; schema 5). Task 4: `saving::HwiPort` (Ledger, Coldcard, Jade, BitBox02 through async-hwi; compile-only, never run against a device) behind `DevicePort`/`Signer`, and `SoftSigner` under `testing` only (`scripts/check-no-soft-signer.sh`, in `just test`). Task 5: `RealBackend` runs Saving: `setup_saving`, `detect_devices` (no Jade through a proxy), a sync task (60 s, 10 s while money moves, backoff to 5 min, reconnect on a Settings change), `saving_state` with `chain_online` and `problem`, Saving Receive after the first scan, `set_coin_frozen`, paged Saving history. `features.saving` is on, so the real UI shows the Saving tab and server rows ahead of Task 8. No sending yet. Next: Task 6 of the Phase 3 plan. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause is from reading.
+Phase 3 (Saving, hardware wallet), Tasks 1-6 done: chain access, the watch-only wallet, devices (`HwiPort`, compile-only; `SoftSigner` under `testing`), `RealBackend` Saving state and sync, and Task 6: `prepare_send`/`confirm_send`/`cancel_operation` for Saving, with change to a federation deposit address, small change kept, and the signed transaction stored before broadcast (`saving_signed`, schema 6), rebroadcast until settled. The core sends; GTK's Send and Refill arrive in Task 8. Next: Task 7 (refill). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.
 - Decide restore-from-words in the app: today the words alone do nothing there. The README has the manual path (new folder, words in `seed` mode 0600, join with invite codes). Settings now shows each invite with Copy.
-- v2 reuses its deposit address until a payment to it is seen, and Receive says so. Phase 3's fresh change address needs either an upstream `next_receive_address` or a refusal of concurrent sends: decide before the Phase 3 design is final.
 - SOCKS5 for federation traffic: fedimint 0.13 has no upstream support, so a set proxy blocks federation connections (a sentence says so).
 - The seed sits in a plain 0600 file in the data folder; decide whether that is enough or it needs encryption.
 - Hardware wallet testing needs a device and you. Untested by construction: Ledger signing (`Ledger::with_wallet` with the default `wpkh(@0/**)` policy, `hmac = None`: whether the Ledger app accepts it), BitBox02 pairing and PSBT pruning, Coldcard, Jade, and the sentences for "open the Bitcoin app" and a locked Ledger (matched from the client's status text). Jade's PIN step talks to Blockstream's PIN server outside any proxy.

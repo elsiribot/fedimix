@@ -157,10 +157,36 @@ fn proxy_host_port(proxy: &str) -> Result<String> {
     }
 }
 
+const REFUSED: &str = "The chain server refused the request:";
+
+/// How servers say they already have a transaction: bitcoind's mempool and
+/// chain answers, and electrs' and Esplora's wrappings of them.
+const ALREADY_KNOWN: [&str; 5] = [
+    "already known",
+    "txn-already-in-mempool",
+    "txn-already-known",
+    "already in block chain",
+    "already in utxo set",
+];
+
 /// A sentence for a refusal the server explained.
-fn refused(reason: &str) -> FedimixError {
+pub(super) fn refused(reason: &str) -> FedimixError {
     let reason = reason.trim().trim_end_matches('.');
-    FedimixError::Internal(format!("The chain server refused the request: {reason}."))
+    FedimixError::Internal(format!("{REFUSED} {reason}."))
+}
+
+/// Whether the server answered and said no. Everything else leaves open
+/// whether a broadcast got through.
+pub fn is_refusal(error: &FedimixError) -> bool {
+    matches!(error, FedimixError::Internal(sentence) if sentence.starts_with(REFUSED))
+}
+
+fn says_already_known(error: &FedimixError) -> bool {
+    let FedimixError::Internal(sentence) = error else {
+        return false;
+    };
+    let sentence = sentence.to_lowercase();
+    is_refusal(error) && ALREADY_KNOWN.iter().any(|known| sentence.contains(known))
 }
 
 fn bad_setup() -> FedimixError {
@@ -174,12 +200,17 @@ fn unreadable() -> FedimixError {
 }
 
 /// The shared tail of both `broadcast`s: a failure is fine when the server
-/// already knows the transaction, as then it is the same transaction again.
+/// already knows the transaction, as then it is the same transaction again. Its
+/// word counts too: a server's index can lag behind what its node just took, so
+/// `tx_seen` alone could call an earlier attempt that got through a failure.
 async fn already_known(
     chain: &dyn ChainClient,
     tx: &Transaction,
     error: FedimixError,
 ) -> Result<()> {
+    if says_already_known(&error) {
+        return Ok(());
+    }
     match chain.tx_seen(tx.compute_txid()).await {
         Ok(true) => Ok(()),
         _ => Err(error),
@@ -250,7 +281,10 @@ fn esplora_error(error: &esplora_client::Error) -> FedimixError {
     match error {
         Error::Reqwest(e) if e.is_builder() => bad_setup(),
         Error::Reqwest(e) if !e.is_decode() => FedimixError::Offline,
-        Error::HttpResponse { status, .. } if matches!(*status, 502..=504) => FedimixError::Offline,
+        // Not a verdict on the request: the server is struggling or busy.
+        Error::HttpResponse { status, .. } if matches!(*status, 408 | 429 | 500..=599) => {
+            FedimixError::Offline
+        }
         Error::HttpResponse { message, .. } => refused(message),
         _ => unreadable(),
     }
@@ -631,6 +665,51 @@ mod tests {
         // The stub's answer is no fee rate; the point is that it was asked.
         let _ = client.fee_rate_sat_vb(6).await;
         assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_the_server_already_has_counts_as_sent() {
+        use crate::saving::FakeChain;
+        use bdk_wallet::bitcoin::{absolute::LockTime, transaction::Version};
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let chain = FakeChain::new();
+        for known in [
+            "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}",
+            "txn-already-in-mempool",
+            "Transaction outputs already in utxo set",
+            "txn-already-known",
+            "Transaction already known",
+        ] {
+            assert_eq!(
+                already_known(&chain, &tx, refused(known)).await,
+                Ok(()),
+                "{known}"
+            );
+        }
+        let no = refused("bad-txns-inputs-missingorspent");
+        assert!(is_refusal(&no));
+        assert_eq!(
+            already_known(&chain, &tx, no.clone()).await,
+            Err(no.clone())
+        );
+        assert!(!is_refusal(&FedimixError::Offline));
+        assert!(!is_refusal(&unreadable()));
+        assert_eq!(
+            already_known(&chain, &tx, FedimixError::Offline).await,
+            Err(FedimixError::Offline)
+        );
+        // Nor does a lost answer hide a transaction the server does have.
+        chain.know(tx.compute_txid());
+        assert_eq!(
+            already_known(&chain, &tx, FedimixError::Offline).await,
+            Ok(())
+        );
+        assert_eq!(already_known(&chain, &tx, no).await, Ok(()));
     }
 
     #[test]

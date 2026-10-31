@@ -395,6 +395,9 @@ pub struct SendPreview {
     pub federation: Option<String>,
     pub inputs: Vec<SendInput>,
     pub change: ChangeDestination,
+    /// Sentences the review should show, such as why the balance is more than
+    /// can be sent, or why change stays in Saving.
+    pub notes: Vec<String>,
     pub expires_at: Timestamp,
 }
 

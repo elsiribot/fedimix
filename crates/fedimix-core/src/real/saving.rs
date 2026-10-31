@@ -6,11 +6,13 @@
 //! [`SavingLive`]. The `saving` lock nests with no other, and no lock is held
 //! across an await.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 
+use super::saving_send::SavingOp;
 use super::{ChainFactory, Core, DB_FILE, Gate, SHUTTING_DOWN, held, problem_of};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
@@ -26,6 +28,9 @@ const ACTIVE_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 /// The longest wait after failures.
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
+/// How often a device is looked for while a review is open.
+pub(super) const DEVICE_POLL: Duration = Duration::from_secs(5);
+
 const SET_UP_FIRST: &str = "Set up Saving with a hardware wallet first.";
 const SCANNING: &str = "Fedimix is still scanning your device's history.";
 const SETUP_STOPPED: &str = "Setting up Saving stopped unexpectedly. Try again.";
@@ -33,7 +38,7 @@ const SETTINGS_MOVED: &str = "The network settings changed during setup. Set up 
 const SYNC_PANICKED: &str =
     "Fedimix could not read the chain server's answer. Check the server in Settings.";
 const ON_CHAIN_ONLY: &str = "Saving receives on chain, not over Lightning.";
-const JADE_PROXY: &str =
+pub(super) const JADE_PROXY: &str =
     "Jade needs Blockstream's PIN server, which cannot use your proxy. Clear the proxy to use it.";
 
 /// What the chain client is made from. A change makes a new client.
@@ -51,7 +56,7 @@ impl ChainTarget {
         }
     }
 
-    fn connect(&self, factory: &ChainFactory) -> Result<Arc<dyn ChainClient>> {
+    pub(super) fn connect(&self, factory: &ChainFactory) -> Result<Arc<dyn ChainClient>> {
         require_server(&self.backend)?;
         factory(&self.backend, self.proxy.as_deref())
     }
@@ -65,6 +70,12 @@ pub(super) struct SavingLive {
     device: Option<DeviceInfo>,
     chain_online: bool,
     problem: Option<String>,
+    /// The one Saving operation in this process, up to its end.
+    pub(super) op: Option<SavingOp>,
+    /// Counts operations started, so a preview from before one is stale.
+    pub(super) generation: u64,
+    /// How many rebroadcasts in a row a server refused, by operation.
+    pub(super) refusals: HashMap<String, u32>,
 }
 
 impl SavingLive {
@@ -87,6 +98,7 @@ impl SavingLive {
             device: account.map(stored_device),
             chain_online: false,
             problem,
+            ..Self::default()
         }
     }
 
@@ -129,7 +141,7 @@ fn sync_delay(interval: Duration, failures: u32) -> Duration {
 }
 
 /// Returns when Fedimix is stopping.
-async fn stopping(gate: &mut watch::Receiver<Gate>) {
+pub(super) async fn stopping(gate: &mut watch::Receiver<Gate>) {
     let _ = gate.wait_for(|gate| *gate == Gate::Stopped).await;
 }
 
@@ -138,10 +150,23 @@ impl Core {
         held(&self.saving)
     }
 
-    fn saving_wallet(&self) -> Result<Arc<SavingWallet>> {
+    pub(super) fn saving_wallet(&self) -> Result<Arc<SavingWallet>> {
         self.saving()
             .wallet()
             .ok_or_else(|| FedimixError::NotSetUp(SET_UP_FIRST.into()))
+    }
+
+    /// The wallet, once it has seen what the device used before: until then its
+    /// address index and its coins are not to be trusted.
+    pub(super) fn scanned_wallet(&self) -> Result<Arc<SavingWallet>> {
+        let wallet = self.saving_wallet()?;
+        if wallet.first_scan_done() {
+            return Ok(wallet);
+        }
+        let problem = self.saving().problem.clone();
+        Err(FedimixError::NotSetUp(
+            problem.unwrap_or_else(|| SCANNING.to_string()),
+        ))
     }
 
     /// Answers from memory and the wallet's tables, whatever the chain is doing.
@@ -200,15 +225,9 @@ impl Core {
             return Err(FedimixError::NotSetUp(ON_CHAIN_ONLY.into()));
         }
         self.ensure_running()?;
-        let wallet = self.saving_wallet()?;
         // Before the first scan, the index would start over on a used device
         // and could hand out an address that was already paid.
-        if !wallet.first_scan_done() {
-            let problem = self.saving().problem.clone();
-            return Err(FedimixError::NotSetUp(
-                problem.unwrap_or_else(|| SCANNING.to_string()),
-            ));
-        }
+        let wallet = self.scanned_wallet()?;
         let address = wallet.next_receive_address()?;
         Ok(ReceiveInfo {
             uri: format!("bitcoin:{address}"),
@@ -383,6 +402,8 @@ impl Core {
 /// call in flight and starts over at once. Only the wait for the chain can be
 /// dropped: `apply` writes to the data folder, so it ends before this does.
 pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>) -> Result<()> {
+    // Ends with the gate. It only asks the USB stack: the folder is not its.
+    tokio::spawn(poll_during_reviews(Arc::clone(&core)));
     let mut gate = core.gate.subscribe();
     let mut target = core.chain.subscribe();
     'connect: loop {
@@ -429,7 +450,12 @@ pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>)
             match synced {
                 Ok(summary) => {
                     failures = 0;
-                    core.note_chain(true, None, summary.changed);
+                    // After a sync that worked, as it reads the wallet's view.
+                    let tended = tokio::select! {
+                        () = stopping(&mut gate) => return Ok(()),
+                        tended = core.tend_signed(&wallet, &*chain) => tended,
+                    };
+                    core.note_chain(true, None, summary.changed || tended);
                 }
                 Err(e) => {
                     failures += 1;
@@ -445,6 +471,31 @@ pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>)
                 _ = target.changed() => continue 'connect,
                 () = tokio::time::sleep(delay) => {}
                 () = core.saving_wake.notified() => {}
+            }
+        }
+    }
+}
+
+/// Keeps `SavingState::device` current while a Send review is open, so the
+/// review can say "Connect your device". A wait at the device polls by itself.
+/// Nothing else polls: asking the USB stack is not free.
+async fn poll_during_reviews(core: Arc<Core>) {
+    let mut gate = core.gate.subscribe();
+    loop {
+        tokio::select! {
+            () = stopping(&mut gate) => return,
+            () = core.review_opened.notified() => {}
+            () = tokio::time::sleep(DEVICE_POLL) => {}
+        }
+        if !core.review_open() {
+            continue;
+        }
+        tokio::select! {
+            () = stopping(&mut gate) => return,
+            polled = core.detect_devices() => {
+                if let Err(e) = polled {
+                    eprintln!("fedimix: looking for the hardware wallet: {e}");
+                }
             }
         }
     }

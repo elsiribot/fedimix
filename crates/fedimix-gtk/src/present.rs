@@ -838,6 +838,7 @@ mod tests {
             federation: Some("f".into()),
             inputs: Vec::new(),
             change: ChangeDestination::None,
+            notes: Vec::new(),
             expires_at: 0,
         }
     }

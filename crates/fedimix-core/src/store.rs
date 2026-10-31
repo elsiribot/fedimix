@@ -14,7 +14,7 @@ use crate::api::{
 use crate::error::{FedimixError, Result};
 use crate::saving::{DeviceAccount, Label, Labels, SentRecord, Tag};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -75,6 +75,20 @@ CREATE TABLE saving_sent (
 );
 ";
 
+/// Signed transactions (schema 6), kept from before their broadcast until the
+/// chain settles them. `change_address` is the federation address a transaction
+/// pays, recorded here so that the row and the record are one write.
+const SIGNED_SCHEMA: &str = "
+CREATE TABLE saving_signed (
+    id TEXT PRIMARY KEY,
+    txid TEXT NOT NULL,
+    tx_hex TEXT NOT NULL,
+    state TEXT NOT NULL,
+    change_address TEXT,
+    created_at INTEGER NOT NULL
+);
+";
+
 /// A write transaction that takes the write lock up front, so it waits for the
 /// busy timeout instead of failing halfway.
 fn begin(conn: &Connection) -> Result<Transaction<'_>> {
@@ -120,6 +134,7 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
             )
             .map_err(db_err),
         4 => tx.execute_batch(SAVING_SCHEMA).map_err(db_err),
+        5 => tx.execute_batch(SIGNED_SCHEMA).map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -176,6 +191,48 @@ pub struct Watch {
     pub id: String,
     pub federation_id: String,
     pub kind: WatchKind,
+    pub created_at: Timestamp,
+}
+
+/// How far a signed transaction has come. `Signed` is an operation still
+/// running: no server is known to have it. `Seen` went out and may yet be lost,
+/// so its coins stay signed away. The last two are final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignedState {
+    Signed,
+    Seen,
+    Confirmed,
+    Dropped,
+}
+
+impl SignedState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Signed => "signed",
+            Self::Seen => "seen",
+            Self::Confirmed => "confirmed",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "signed" => Self::Signed,
+            "seen" => Self::Seen,
+            "confirmed" => Self::Confirmed,
+            "dropped" => Self::Dropped,
+            other => return Err(db_err(format!("unknown signed state {other:?}"))),
+        })
+    }
+}
+
+/// A transaction the device signed, as stored before its broadcast.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SignedTx {
+    pub id: String,
+    pub tx_hex: String,
+    pub state: SignedState,
+    pub change_address: Option<String>,
     pub created_at: Timestamp,
 }
 
@@ -318,6 +375,7 @@ impl Store {
             .map_err(db_err)?;
             tx.execute_batch(SCHEMA).map_err(db_err)?;
             tx.execute_batch(SAVING_SCHEMA).map_err(db_err)?;
+            tx.execute_batch(SIGNED_SCHEMA).map_err(db_err)?;
             tx.execute(
                 "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
                 [SCHEMA_VERSION],
@@ -928,10 +986,6 @@ impl Store {
     }
 
     /// Sets the tag and source of `outpoint`, and leaves `frozen` alone.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Saving send of Task 6 uses it")
-    )]
     pub(crate) fn set_saving_tag(
         &self,
         outpoint: &str,
@@ -964,10 +1018,85 @@ impl Store {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Saving send of Task 6 uses it")
-    )]
+    /// The commit point of a send: from here on it is rebroadcast until settled.
+    pub(crate) fn add_signed(&self, txid: &str, signed: &SignedTx) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO saving_signed (id, txid, tx_hex, state, change_address, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    signed.id,
+                    txid,
+                    signed.tx_hex,
+                    signed.state.as_str(),
+                    signed.change_address,
+                    to_db(signed.created_at)
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The transactions not yet settled, oldest first.
+    pub(crate) fn open_signed(&self) -> Result<Vec<SignedTx>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, tx_hex, state, change_address, created_at FROM saving_signed
+                 WHERE state IN (?1, ?2) ORDER BY created_at, id",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                [SignedState::Signed.as_str(), SignedState::Seen.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, tx_hex, state, change_address, created_at) = row.map_err(db_err)?;
+            out.push(SignedTx {
+                id,
+                tx_hex,
+                state: SignedState::parse(&state)?,
+                change_address,
+                created_at: from_db(created_at),
+            });
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn set_signed_state(&self, id: &str, state: SignedState) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE saving_signed SET state = ?2 WHERE id = ?1",
+                [id, state.as_str()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Whether a transaction that may still be paid went to `address`. One that
+    /// was dropped never paid it, and a v2 address stays until it is paid.
+    pub(crate) fn change_address_used(&self, address: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM saving_signed
+                    WHERE change_address = ?1 AND state != ?2)",
+                [address, SignedState::Dropped.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+    }
+
     pub(crate) fn put_saving_sent(&self, txid: &str, sent: &SentRecord) -> Result<()> {
         let (msat, to_spending) = match &sent.change {
             Some(c) => (Some(to_db(c.amount.msat)), c.to_spending),
@@ -1420,7 +1549,8 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE saving_device;
+                    "DROP TABLE saving_signed;
+                     DROP TABLE saving_device;
                      DROP TABLE saving_labels;
                      DROP TABLE saving_sent;
                      ALTER TABLE watches DROP COLUMN operation;
@@ -1446,7 +1576,8 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE saving_device;
+                    "DROP TABLE saving_signed;
+                     DROP TABLE saving_device;
                      DROP TABLE saving_labels;
                      DROP TABLE saving_sent;
                      ALTER TABLE federations DROP COLUMN joined_session;
@@ -1469,7 +1600,8 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE saving_device;
+                    "DROP TABLE saving_signed;
+                     DROP TABLE saving_device;
                      DROP TABLE saving_labels;
                      DROP TABLE saving_sent;
                      UPDATE schema_version SET version = 4;",
@@ -1479,6 +1611,54 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.device_account(), Ok(None));
         assert!(store.saving_labels().is_ok());
+    }
+
+    #[test]
+    fn a_version_5_database_gains_the_signed_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE saving_signed;
+                     UPDATE schema_version SET version = 5;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.open_signed().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_dropped_transaction_lets_go_of_its_address() {
+        let (_dir, store) = open();
+        let signed = SignedTx {
+            id: "saving-1".into(),
+            tx_hex: "00".into(),
+            state: SignedState::Signed,
+            change_address: Some("address".into()),
+            created_at: 7,
+        };
+        store.add_signed("txid", &signed).unwrap();
+        assert_eq!(store.open_signed().unwrap(), [signed]);
+        assert!(store.change_address_used("address").unwrap());
+        assert!(!store.change_address_used("other").unwrap());
+        store
+            .set_signed_state("saving-1", SignedState::Seen)
+            .unwrap();
+        assert!(store.change_address_used("address").unwrap());
+        assert_eq!(store.open_signed().unwrap().len(), 1);
+        store
+            .set_signed_state("saving-1", SignedState::Confirmed)
+            .unwrap();
+        assert!(store.change_address_used("address").unwrap(), "it was paid");
+        assert_eq!(store.open_signed().unwrap(), Vec::new());
+        store
+            .set_signed_state("saving-1", SignedState::Dropped)
+            .unwrap();
+        assert!(!store.change_address_used("address").unwrap());
     }
 
     #[test]

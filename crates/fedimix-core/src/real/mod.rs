@@ -8,6 +8,7 @@
 mod events;
 mod receive;
 mod saving;
+mod saving_send;
 mod send;
 mod spending;
 
@@ -24,6 +25,7 @@ use self::events::{Events, left_open, supervise};
 #[cfg(feature = "testing")]
 pub use self::saving::sync_saving_now;
 use self::saving::{ChainTarget, SavingLive, supervise_saving};
+use self::saving_send::{HeldSaving, resume_signed};
 use self::send::{HeldSend, Submitting};
 #[cfg(feature = "testing")]
 pub use self::send::{SendHalt, halt_sends};
@@ -35,7 +37,7 @@ use crate::event::{Event, EventStream};
 use crate::federation::{FederationClient, FederationPort, FederationPreview, FedimintPort};
 use crate::saving::{ChainClient, DevicePort, HwiPort, SavingWallet, connect_chain};
 use crate::seed::{DataDirLock, Seed};
-use crate::store::{FederationRow, Store, Watch};
+use crate::store::{FederationRow, SignedState, Store, Watch};
 
 const DB_FILE: &str = "fedimix.db";
 const SHUTTING_DOWN: &str = "Fedimix is shutting down.";
@@ -94,6 +96,7 @@ struct Live {
 struct State {
     live: HashMap<String, Live>,
     previews: HashMap<String, HeldSend>,
+    saving_previews: HashMap<String, HeldSaving>,
 }
 
 enum Reached {
@@ -173,6 +176,8 @@ struct Core {
     saving_setup: tokio::sync::Mutex<()>,
     /// Ends the Saving sync task's wait between syncs.
     saving_wake: Notify,
+    /// A Send review opened, so the device is worth looking for now.
+    review_opened: Notify,
     /// The chain server and proxy in force, so a change reaches the sync task.
     chain: watch::Sender<ChainTarget>,
     /// Sends between their row and the end of `pay_invoice` or `withdraw`. A
@@ -515,6 +520,7 @@ impl RealBackend {
             saving: Mutex::new(saving),
             saving_setup: tokio::sync::Mutex::default(),
             saving_wake: Notify::new(),
+            review_opened: Notify::new(),
             chain: watch::Sender::new(chain),
             submitting: watch::Sender::default(),
             #[cfg(feature = "testing")]
@@ -529,6 +535,14 @@ impl RealBackend {
             .map(|row| tokio::spawn(supervise(Arc::clone(&core), row.id)))
             .collect();
         if let Some(wallet) = saving_wallet {
+            let signed = core.store().open_signed()?;
+            let unsettled = signed
+                .into_iter()
+                .filter(|row| row.state == SignedState::Signed);
+            for row in unsettled {
+                let resume = resume_signed(Arc::clone(&core), Arc::clone(&wallet), row);
+                supervisors.push(tokio::spawn(resume));
+            }
             supervisors.push(tokio::spawn(supervise_saving(Arc::clone(&core), wallet)));
         }
         *core.supervisors.lock().await = supervisors;
@@ -668,13 +682,16 @@ impl Backend for RealBackend {
     }
 
     async fn discard_preview(&self, preview_id: String) -> Result<()> {
-        self.core.state().previews.remove(&preview_id);
+        let mut state = self.core.state();
+        state.previews.remove(&preview_id);
+        state.saving_previews.remove(&preview_id);
         Ok(())
     }
 
-    /// Spending starts at `Broadcasting`, past the point of cancelling.
+    /// Spending starts at `Broadcasting`, past the point of cancelling. A Saving
+    /// send can be cancelled until then.
     async fn cancel_operation(&self, id: OperationId) -> Result<()> {
-        if self.core.store().is_send(&id)? {
+        if self.core.cancel_saving(&id) || self.core.store().is_send(&id)? {
             Ok(())
         } else {
             Err(FedimixError::UnknownItem(id))

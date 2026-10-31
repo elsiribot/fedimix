@@ -16,18 +16,22 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bdk_wallet::Wallet;
 use bdk_wallet::bitcoin::bip32::{DerivationPath, Fingerprint, Xpub};
 use bdk_wallet::bitcoin::constants::COINBASE_MATURITY;
-use bdk_wallet::bitcoin::{self, Address, NetworkKind, OutPoint, Txid};
+use bdk_wallet::bitcoin::psbt::Psbt;
+use bdk_wallet::bitcoin::{
+    self, Address, FeeRate, NetworkKind, OutPoint, ScriptBuf, Transaction, Txid,
+};
 use bdk_wallet::chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::chain::{BlockId, ChainPosition};
-use bdk_wallet::rusqlite::{Connection, Transaction, TransactionBehavior};
+use bdk_wallet::error::CreateTxError;
+use bdk_wallet::rusqlite::{Connection, Transaction as DbTransaction, TransactionBehavior};
 use bdk_wallet::{
     Balance, ChangeSet, CreateWithPersistError, KeychainKind, LoadError, LoadMismatch,
-    LoadWithPersistError, PersistedWallet, Update, WalletPersister,
+    LoadWithPersistError, PersistedWallet, SignOptions, Update, WalletPersister,
 };
 
 use crate::api::{Amount, Coin, DeviceKind, HistoryItem, HistoryKind, HistoryStatus, Network};
@@ -100,8 +104,8 @@ impl WalletPersister for Db {
     type Error = bdk_wallet::rusqlite::Error;
 
     fn initialize(persister: &mut Self) -> std::result::Result<ChangeSet, Self::Error> {
-        let mut tx = Transaction::new(&mut persister.0, TransactionBehavior::Immediate)?;
-        let changeset = <Transaction<'_> as WalletPersister>::initialize(&mut tx)?;
+        let mut tx = DbTransaction::new(&mut persister.0, TransactionBehavior::Immediate)?;
+        let changeset = <DbTransaction<'_> as WalletPersister>::initialize(&mut tx)?;
         tx.commit()?;
         Ok(changeset)
     }
@@ -110,8 +114,8 @@ impl WalletPersister for Db {
         persister: &mut Self,
         changeset: &ChangeSet,
     ) -> std::result::Result<(), Self::Error> {
-        let mut tx = Transaction::new(&mut persister.0, TransactionBehavior::Immediate)?;
-        <Transaction<'_> as WalletPersister>::persist(&mut tx, changeset)?;
+        let mut tx = DbTransaction::new(&mut persister.0, TransactionBehavior::Immediate)?;
+        <DbTransaction<'_> as WalletPersister>::persist(&mut tx, changeset)?;
         tx.commit()
     }
 }
@@ -527,6 +531,108 @@ impl SavingWallet {
         Ok(address.address.to_string())
     }
 
+    /// What a send may pick from: [`Self::spendable_coins`] less what a stored
+    /// transaction has signed away.
+    pub(crate) fn usable_coins(&self, labels: &Labels, locked: &HashSet<OutPoint>) -> Vec<Coin> {
+        let mut coins = self.spendable_coins(labels);
+        coins.retain(|coin| {
+            OutPoint::from_str(&coin.outpoint).is_ok_and(|outpoint| !locked.contains(&outpoint))
+        });
+        coins
+    }
+
+    /// Builds an unsigned send from the usable coins. Change goes to
+    /// `plan.change_to`, or to the internal keychain, so that small change
+    /// counts as the wallet's own and not as money on its way from someone.
+    /// An internal address this uses is revealed but not yet written: call
+    /// [`Self::save`] before the transaction can reach anyone.
+    pub(crate) fn build_send(&self, labels: &Labels, plan: &SendPlan) -> Result<BuiltSend> {
+        let usable = self.usable_coins(labels, &plan.locked);
+        let available = usable.iter().fold(Amount::ZERO, |total, coin| Amount {
+            msat: total.msat.saturating_add(coin.amount.msat),
+        });
+        let mut inner = self.lock();
+        let held_back: Vec<OutPoint> = inner
+            .wallet
+            .list_unspent()
+            .map(|utxo| utxo.outpoint)
+            .filter(|outpoint| {
+                let outpoint = outpoint.to_string();
+                !usable.iter().any(|coin| coin.outpoint == outpoint)
+            })
+            .collect();
+        let mut builder = inner.wallet.build_tx();
+        builder.fee_rate(plan.fee_rate).unspendable(held_back);
+        match plan.amount {
+            Some(amount) => {
+                builder.add_recipient(plan.to.clone(), amount);
+                if let Some(change_to) = &plan.change_to {
+                    builder.drain_to(change_to.clone());
+                }
+            }
+            None => {
+                builder.drain_wallet().drain_to(plan.to.clone());
+            }
+        }
+        let psbt = builder.finish().map_err(|e| build_error(&e, available))?;
+        let fee = psbt.fee().map_err(|_| {
+            FedimixError::Internal("Fedimix could not work out this transaction's fee.".into())
+        })?;
+        let change = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .zip(0u32..)
+            .find(|(output, _)| output.script_pubkey != plan.to)
+            .map(|(output, vout)| (vout, output.value));
+        Ok(BuiltSend { psbt, fee, change })
+    }
+
+    /// The transaction a device signed. Makes no check of what it pays.
+    pub(crate) fn finalize(&self, mut psbt: Psbt) -> Result<Transaction> {
+        let inner = self.lock();
+        let finalized = inner
+            .wallet
+            .finalize_psbt(&mut psbt, SignOptions::default());
+        if !finalized.unwrap_or(false) {
+            return Err(FedimixError::Internal(
+                "Your device did not sign this transaction completely.".into(),
+            ));
+        }
+        // The fee was the one reviewed, whatever rate that makes it.
+        Ok(psbt.extract_tx_unchecked_fee_rate())
+    }
+
+    /// Puts a transaction that reached the server into the wallet at once, as
+    /// seen now, so its coins do not look spendable until the next sync. Later
+    /// than any eviction: BDK treats an equal time as evicted.
+    pub(crate) fn insert_sent(&self, tx: &Transaction) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let mut inner = self.lock();
+        let evicted = inner.wallet.tx_graph().get_last_evicted(tx.compute_txid());
+        let seen_at = evicted.map_or(now, |evicted| now.max(evicted + 1));
+        inner.wallet.apply_unconfirmed_txs([(tx.clone(), seen_at)]);
+        inner.unsaved = true;
+        inner.persist()?;
+        inner.unsaved = false;
+        Ok(())
+    }
+
+    /// Writes what the wallet has staged, such as a revealed change address.
+    pub(crate) fn save(&self) -> Result<()> {
+        self.lock().persist().map(|_| ())
+    }
+
+    pub(crate) fn tx_position(&self, txid: Txid) -> TxPosition {
+        match self.lock().wallet.get_tx(txid) {
+            Some(tx) if tx.chain_position.is_confirmed() => TxPosition::Confirmed,
+            Some(_) => TxPosition::Pending,
+            None => TxPosition::Absent,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn tip(&self) -> bdk_wallet::chain::CheckPoint {
         self.lock().wallet.latest_checkpoint()
@@ -544,6 +650,48 @@ impl SavingWallet {
         [KeychainKind::External, KeychainKind::Internal]
             .into_iter()
             .any(|k| !inner.wallet.get_signers(k).signers().is_empty())
+    }
+}
+
+/// What to build. `amount: None` spends every usable coin, with no change.
+#[derive(Debug)]
+pub(crate) struct SendPlan {
+    pub to: ScriptBuf,
+    pub amount: Option<bitcoin::Amount>,
+    pub fee_rate: FeeRate,
+    /// Where change goes; `None` is this wallet's internal keychain.
+    pub change_to: Option<ScriptBuf>,
+    /// Coins signed away by a stored transaction, whatever the chain says now.
+    pub locked: HashSet<OutPoint>,
+}
+
+/// An unsigned send.
+#[derive(Debug)]
+pub(crate) struct BuiltSend {
+    pub psbt: Psbt,
+    pub fee: bitcoin::Amount,
+    /// The output that is not the payment, if there is one.
+    pub change: Option<(u32, bitcoin::Amount)>,
+}
+
+/// Where the wallet's canonical view has a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxPosition {
+    Confirmed,
+    Pending,
+    Absent,
+}
+
+fn build_error(error: &CreateTxError, available: Amount) -> FedimixError {
+    match error {
+        CreateTxError::CoinSelection(short) => FedimixError::InsufficientFunds {
+            available,
+            needed: sat(short.needed),
+        },
+        CreateTxError::OutputBelowDustLimit(_) => {
+            FedimixError::InvalidAmount("This amount is too small to send on chain.".into())
+        }
+        other => FedimixError::Internal(format!("Fedimix could not build this send: {other}.")),
     }
 }
 
@@ -569,8 +717,7 @@ mod tests {
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::secp256k1::Secp256k1;
     use bdk_wallet::bitcoin::{
-        Amount as BtcAmount, BlockHash, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        absolute, transaction,
+        Amount as BtcAmount, BlockHash, Sequence, TxIn, TxOut, Witness, absolute, transaction,
     };
     use bdk_wallet::chain::spk_client::SyncResponse;
     use bdk_wallet::chain::{CheckPoint, ConfirmationBlockTime, TxUpdate};
@@ -579,7 +726,7 @@ mod tests {
     use super::*;
     use crate::api::{HistoryKind, HistoryStatus, PrivacyTag, SentChange};
     use crate::error::FedimixError;
-    use crate::saving::{FakeChain, Labels};
+    use crate::saving::{FakeChain, Labels, Signer, SoftSigner};
     use crate::store::Store;
 
     const CONFIRMED_AT: u64 = 500;
@@ -1203,6 +1350,130 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(w.history(&labels).len(), 1);
+    }
+
+    /// A send of `sat` signed by the key of `account`, in the wallet.
+    async fn signed_send(w: &SavingWallet, sat: u64, change_to: Option<ScriptBuf>) -> Transaction {
+        let built = w
+            .build_send(
+                &Labels::default(),
+                &SendPlan {
+                    to: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([9; 20])),
+                    amount: Some(BtcAmount::from_sat(sat)),
+                    fee_rate: FeeRate::from_sat_per_vb_u32(2),
+                    change_to,
+                    locked: HashSet::new(),
+                },
+            )
+            .unwrap();
+        let mut psbt = built.psbt;
+        SoftSigner::from_seed(&[7u8; 32], bitcoin::Network::Regtest)
+            .sign(&mut psbt)
+            .await
+            .unwrap();
+        let tx = w.finalize(psbt).unwrap();
+        w.insert_sent(&tx).unwrap();
+        tx
+    }
+
+    /// T3 M2: a sync must ask the server about what the wallet holds pending,
+    /// or a real server's silence would never become an eviction.
+    #[tokio::test]
+    async fn a_sync_expects_what_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(new_wallet(&dir));
+        fund(&w, 0, 10_000, Some(1));
+        let (pending, _) = fund(&w, 1, 20_000, None);
+        let chain = FakeChain::new();
+        w.sync(&chain).await.unwrap();
+        assert!(chain.expected().contains(&pending.txid));
+    }
+
+    /// T3 M2, through the request: nothing here injects an eviction.
+    #[tokio::test]
+    async fn a_dropped_send_returns_its_coin() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(new_wallet(&dir));
+        let (coin, _) = fund(&w, 0, 100_000, Some(1));
+        let tx = signed_send(&w, 30_000, None).await;
+        let labels = Labels::default();
+        assert!(!w.has_coin(&coin.to_string()), "the spend hides the coin");
+        assert_eq!(w.tx_position(tx.compute_txid()), TxPosition::Pending);
+        assert_eq!(w.history(&labels).len(), 2);
+
+        let chain = FakeChain::new();
+        chain.lose(tx.compute_txid());
+        assert!(w.sync(&chain).await.unwrap().changed);
+
+        assert!(w.has_coin(&coin.to_string()), "the coin came back");
+        assert_eq!(w.balance(), Amount::from_sat(100_000));
+        assert_eq!(w.history(&labels).len(), 1);
+        assert_eq!(w.tx_position(tx.compute_txid()), TxPosition::Absent);
+    }
+
+    /// An eviction in the same second must not outrank the transaction's
+    /// return: BDK treats equal times as evicted.
+    #[tokio::test]
+    async fn a_dropped_send_can_come_back_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(new_wallet(&dir));
+        fund(&w, 0, 100_000, Some(1));
+        let tx = signed_send(&w, 30_000, None).await;
+        let chain = FakeChain::new();
+        chain.lose(tx.compute_txid());
+        w.sync(&chain).await.unwrap();
+        w.insert_sent(&tx).unwrap();
+        assert_eq!(w.tx_position(tx.compute_txid()), TxPosition::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_send_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        fund(&w, 0, 100_000, Some(1));
+        let tx = signed_send(&w, 30_000, None).await;
+        drop(w);
+        let w = SavingWallet::open(&db(&dir), Network::Regtest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.tx_position(tx.compute_txid()), TxPosition::Pending);
+    }
+
+    #[tokio::test]
+    async fn small_change_goes_to_the_internal_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        fund(&w, 0, 100_000, Some(1));
+        let tx = signed_send(&w, 95_000, None).await;
+        assert_eq!(tx.output.len(), 2);
+        let change = tx
+            .output
+            .iter()
+            .find(|o| o.value.to_sat() < 95_000)
+            .unwrap();
+        let inner = w.lock();
+        let derived = inner.wallet.derivation_of_spk(change.script_pubkey.clone());
+        assert_eq!(derived.map(|(k, _)| k), Some(KeychainKind::Internal));
+        drop(inner);
+        // So it counts as your own, not as money on its way from someone else.
+        assert_eq!(w.in_flight(), Amount::ZERO);
+        assert!(w.balance() > Amount::ZERO);
+    }
+
+    #[tokio::test]
+    async fn drain_to_puts_the_change_on_that_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        fund(&w, 0, 100_000, Some(1));
+        let federation = ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([8; 32]));
+        let tx = signed_send(&w, 30_000, Some(federation.clone())).await;
+        assert!(tx.output.iter().any(|o| o.script_pubkey == federation));
+        assert!(
+            tx.output
+                .iter()
+                .all(|o| !w.lock().wallet.is_mine(o.script_pubkey.clone())),
+            "no output came back to the wallet"
+        );
     }
 
     #[tokio::test]

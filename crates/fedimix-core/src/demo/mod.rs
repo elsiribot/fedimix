@@ -1087,6 +1087,7 @@ impl Backend for DemoBackend {
                 .flatten(),
             inputs,
             change,
+            notes: Vec::new(),
             expires_at: self.preview_expiry(),
         };
         let held = (preview.expires_at, preview.clone());

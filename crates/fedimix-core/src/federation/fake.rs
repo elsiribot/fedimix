@@ -63,6 +63,16 @@ impl<T: Clone + Send + Sync + 'static> Log<T> {
     }
 }
 
+/// A valid regtest address that nobody can spend from, different for each `id`.
+pub fn regtest_address(id: &str) -> String {
+    use bitcoin::hashes::{Hash, sha256};
+    let hash = sha256::Hash::hash(id.as_bytes()).to_byte_array();
+    let script = bitcoin::ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array(hash));
+    bitcoin::Address::from_script(&script, bitcoin::Network::Regtest)
+        .expect("a witness program has an address")
+        .to_string()
+}
+
 /// A scripted federation.
 pub struct FakeClient {
     id: String,
@@ -74,6 +84,11 @@ pub struct FakeClient {
     min_deposit: Mutex<Result<Amount>>,
     /// `true` for the generation that reports deposits through a watch.
     deposit_watches: Mutex<bool>,
+    /// When set, `deposit_address` repeats this, as v2 does until it is paid.
+    fixed_address: Mutex<Option<String>>,
+    /// Hand out addresses that parse, which a Saving send needs.
+    valid_addresses: AtomicBool,
+    last_deposit: Mutex<Option<String>>,
     lightning_fee: Mutex<Amount>,
     withdraw_fee: Mutex<Amount>,
     receive_fee: Mutex<Option<Amount>>,
@@ -120,6 +135,9 @@ impl FakeClient {
             notes: Mutex::new(Vec::new()),
             min_deposit: Mutex::new(Ok(Amount::from_sat(1_000))),
             deposit_watches: Mutex::new(true),
+            fixed_address: Mutex::default(),
+            valid_addresses: AtomicBool::new(false),
+            last_deposit: Mutex::default(),
             lightning_fee: Mutex::new(Amount::from_sat(10)),
             withdraw_fee: Mutex::new(Amount::from_sat(300)),
             receive_fee: Mutex::new(None),
@@ -167,6 +185,21 @@ impl FakeClient {
     /// `false` acts like the generation with `deposits()` and no watch id.
     pub fn set_deposit_watches(&self, on: bool) {
         *self.deposit_watches.lock().unwrap() = on;
+    }
+
+    /// `deposit_address` gives `address` from now on; `None` gives fresh ones.
+    pub fn set_deposit_address(&self, address: Option<String>) {
+        *self.fixed_address.lock().unwrap() = address;
+    }
+
+    /// `deposit_address` gives addresses that parse. Others encode their watch.
+    pub fn use_valid_addresses(&self) {
+        self.valid_addresses.store(true, Ordering::SeqCst);
+    }
+
+    /// The id behind the last `deposit_address`.
+    pub fn last_deposit(&self) -> Option<String> {
+        self.last_deposit.lock().unwrap().clone()
     }
 
     pub fn set_lightning_fee(&self, fee: Amount) {
@@ -377,7 +410,14 @@ impl FederationClient for FakeClient {
     async fn deposit_address(&self) -> Result<(String, Option<String>)> {
         let id = self.next_id("deposit");
         let watch = (*self.deposit_watches.lock().unwrap()).then(|| id.clone());
-        Ok((format!("bcrt1-{id}"), watch))
+        *self.last_deposit.lock().unwrap() = Some(id.clone());
+        let address = if self.valid_addresses.load(Ordering::SeqCst) {
+            regtest_address(&id)
+        } else {
+            format!("bcrt1-{id}")
+        };
+        let fixed = self.fixed_address.lock().unwrap().clone();
+        Ok((fixed.unwrap_or(address), watch))
     }
 
     async fn lightning_quote(&self, invoice: &str) -> Result<LightningQuote> {

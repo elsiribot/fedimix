@@ -20,10 +20,10 @@ use fedimix_core::testing::{
     halt_sends, sync_saving_now,
 };
 use fedimix_core::{
-    Amount, Backend, ChainBackend, CoreConfig, DeviceKind, Event, EventStream, FedimixError,
-    HistoryItem, HistoryKind, HistoryStatus, Network, Notice, OperationState, PrivacyTag,
-    RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest, SendAmount, SendPreview, SendRequest,
-    Settings, WalletKind,
+    Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
+    FedimixError, HistoryItem, HistoryKind, HistoryStatus, Network, Notice, OperationState,
+    PrivacyTag, RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest, SendAmount, SendPreview,
+    SendRequest, Settings, WalletKind,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -1691,4 +1691,339 @@ async fn saving_sees_a_funded_address() {
         );
         backend.shutdown().await.unwrap();
     }
+}
+
+// Sending from Saving, signed by a software device.
+
+const DEVICE: &str = "software:test";
+
+/// A Saving wallet joined to the federation, in a folder that can be reopened.
+struct SavingWallet {
+    _dir: TempDir,
+    config: CoreConfig,
+    devices: Arc<FakeDevices>,
+    port: Arc<FedimintPort>,
+}
+
+impl SavingWallet {
+    fn new() -> Self {
+        let (dir, config) = folder();
+        let devices = Arc::new(FakeDevices::new());
+        let seed: [u8; 32] = rand::random();
+        devices.add(
+            DEVICE,
+            "Test device",
+            DeviceKind::Software,
+            Arc::new(SoftSigner::from_seed(&seed, bitcoin::Network::Regtest)),
+        );
+        let port = Arc::new(FedimintPort::new(dir.path()));
+        Self {
+            _dir: dir,
+            config,
+            devices,
+            port,
+        }
+    }
+
+    async fn open(&self) -> fedimix_core::Result<Arc<RealBackend>> {
+        let factory: ChainFactory = Arc::new(connect_chain);
+        RealBackend::with_ports(
+            self.config.clone(),
+            self.port.clone(),
+            factory,
+            self.devices.clone(),
+        )
+        .await
+    }
+
+    /// Set up on `server`, first scan done, joined.
+    async fn ready(&self, server: ChainBackend) -> Arc<RealBackend> {
+        let backend = self.open().await.unwrap();
+        backend
+            .set_settings(Settings {
+                chain_backend: server,
+                ..Settings::for_network(Network::Regtest)
+            })
+            .await
+            .unwrap();
+        backend.setup_saving(DEVICE.into()).await.unwrap();
+        backend.join_federation(invite()).await.unwrap();
+        wait_online(&backend).await;
+        backend
+    }
+
+    async fn reopened(&self) -> Arc<RealBackend> {
+        tokio::time::timeout(PATIENCE, async {
+            loop {
+                match self.open().await {
+                    Ok(backend) => return backend,
+                    Err(e) => eprintln!("not yet: {e}"),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("a dropped backend lets go of its folder")
+    }
+}
+
+/// A Saving address, once the first scan allows one.
+async fn saving_address(backend: &RealBackend) -> String {
+    let request = || ReceiveRequest {
+        wallet: WalletKind::Saving,
+        method: ReceiveMethod::OnChain,
+    };
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            match backend.receive(request()).await {
+                Ok(info) => return info.payload,
+                Err(FedimixError::NotSetUp(wait)) if wait.contains("scanning") => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .expect("the first scan ends")
+}
+
+/// Waits, syncing, until `check` holds of Saving.
+async fn wait_saving(backend: &RealBackend, check: impl Fn(&fedimix_core::SavingState) -> bool) {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            sync_saving_now(backend);
+            if check(&backend.saving_state().await.unwrap()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("Saving reaches the state");
+}
+
+/// Pays `sat` to a coin of its own, confirmed.
+async fn fund_saving(backend: &RealBackend, sat: u64) {
+    let address = saving_address(backend).await;
+    fund(&address, sat);
+    mine(1);
+    wait_saving(backend, |state| {
+        let coin = state.coins.iter().find(|coin| coin.address == address);
+        coin.is_some_and(|coin| coin.confirmed)
+    })
+    .await;
+}
+
+fn from_saving(address: &str, sat: u64) -> SendRequest {
+    SendRequest {
+        wallet: WalletKind::Saving,
+        destination: address.to_string(),
+        amount: SendAmount::Exact(Amount::from_sat(sat)),
+        fee_rate_sat_vb: None,
+    }
+}
+
+/// Confirms `preview` and waits for its end.
+async fn sent(backend: &RealBackend, preview: SendPreview) -> String {
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let (state, txid) = final_state(&events, &id).await;
+    assert_eq!(state, OperationState::Done);
+    txid.expect("a done send names its transaction")
+}
+
+/// The whole of "change into the federation", on both generations: the send
+/// reaches the chain and the change reaches Spending, less the deposit's fee.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn saving_send_change_lands_in_spending() {
+    const COIN: u64 = 400_000;
+    const SEND: u64 = 100_000;
+    let wallet = SavingWallet::new();
+    let backend = wallet.ready(esplora()).await;
+    fund_saving(&backend, COIN).await;
+    let before = balance_of(&backend).await;
+
+    let payee = btc("getnewaddress");
+    let preview = backend
+        .prepare_send(from_saving(&payee, SEND))
+        .await
+        .unwrap();
+    assert_eq!(preview.amount, Amount::from_sat(SEND));
+    let ChangeDestination::Spending { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    assert_eq!(
+        change.as_sat() + SEND + preview.fee.as_sat(),
+        COIN,
+        "no sat unaccounted for"
+    );
+    let txid = sent(&backend, preview).await;
+    wait_for_transaction(&txid).await;
+    let row = &backend.saving_state().await.unwrap().history[0];
+    assert_eq!(row.txid.as_ref(), Some(&txid));
+    assert!(matches!(
+        &row.kind,
+        HistoryKind::Sent { change: Some(c) } if c.to_spending && c.amount == change
+    ));
+
+    let events = backend.subscribe();
+    let deposit = mine_until_received(&backend, &events).await;
+    assert_eq!(deposit.kind, HistoryKind::Deposit);
+    assert_eq!(deposit.txid.as_ref(), Some(&txid), "the send's own change");
+    let after = wait_balance(&backend, |now| now > before).await;
+    let rose = after.saturating_sub(before);
+    assert!(rose <= change, "{rose:?} of {change:?}");
+    let fee = change.saturating_sub(rose);
+    assert!(
+        fee.as_sat() * 2 < change.as_sat(),
+        "most of the change arrives: {fee:?} kept of {change:?}"
+    );
+    assert_eq!(received_at(&payee).0, SEND);
+    wait_saving(&backend, |state| {
+        state.history[0].status == HistoryStatus::Complete
+    })
+    .await;
+    assert_eq!(backend.saving_state().await.unwrap().balance, Amount::ZERO);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn saving_send_small_change_stays() {
+    const COIN: u64 = 400_000;
+    /// Below this, P2WPKH change is not worth an output, and goes to the fee.
+    const DUST_SAT: u64 = 294;
+    let wallet = SavingWallet::new();
+    let backend = wallet.ready(electrum()).await;
+    fund_saving(&backend, COIN).await;
+    let min_deposit = address(&backend).await.min_deposit.unwrap();
+    // At the margin, the largest change that stays.
+    let wanted = min_deposit.as_sat() * 2;
+    eprintln!("min_deposit {min_deposit:?}, change {wanted}");
+
+    let payee = btc("getnewaddress");
+    let probe = backend
+        .prepare_send(from_saving(&payee, 100_000))
+        .await
+        .unwrap();
+    let amount = COIN - probe.fee.as_sat() - wanted;
+    let preview = backend
+        .prepare_send(from_saving(&payee, amount))
+        .await
+        .unwrap();
+    let change = preview.change.clone();
+    let txid = sent(&backend, preview).await;
+    wait_for_transaction(&txid).await;
+    mine(1);
+    match change {
+        ChangeDestination::SmallChange { amount: change } => {
+            wait_saving(&backend, |state| {
+                state.coins.len() == 1
+                    && state.coins[0].confirmed
+                    && state.coins[0].tag == PrivacyTag::SmallChange
+                    && state.coins[0].amount == change
+            })
+            .await;
+            assert_eq!(backend.saving_state().await.unwrap().balance, change);
+        }
+        // The margin is below dust where the federation's fee is that low.
+        ChangeDestination::None if wanted < DUST_SAT => {
+            wait_saving(&backend, |state| {
+                state.coins.is_empty() && state.history[0].status == HistoryStatus::Complete
+            })
+            .await;
+        }
+        other => panic!("{other:?}"),
+    }
+    backend.shutdown().await.unwrap();
+}
+
+/// v2 repeats its address until a payment to it is seen, so the second send
+/// waits for the first one's change. v1 gives a fresh address each time.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn v2_second_send_waits_for_first_change() {
+    const SAME: &str = "Your last change is still reaching Spending. Try again in a few minutes.";
+    let v2 = std::env::var("FEDIMIX_EXPECT_MODULES").unwrap() == "v2";
+    let wallet = SavingWallet::new();
+    let backend = wallet.ready(esplora()).await;
+    fund_saving(&backend, 300_000).await;
+    fund_saving(&backend, 300_000).await;
+    let payee = btc("getnewaddress");
+    let preview = backend
+        .prepare_send(from_saving(&payee, 50_000))
+        .await
+        .unwrap();
+    let txid = sent(&backend, preview).await;
+    wait_for_transaction(&txid).await;
+
+    let second = backend.prepare_send(from_saving(&payee, 50_000)).await;
+    if !v2 {
+        second.expect("a fresh address");
+        backend.shutdown().await.unwrap();
+        return;
+    }
+    assert_eq!(second, Err(FedimixError::NotSetUp(SAME.into())));
+    let preview = tokio::time::timeout(PATIENCE, async {
+        loop {
+            mine(1);
+            match backend.prepare_send(from_saving(&payee, 50_000)).await {
+                Ok(preview) => return preview,
+                Err(FedimixError::NotSetUp(wait)) if wait == SAME => {}
+                Err(e) => panic!("{e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("the change is seen, and the address moves on");
+    assert!(matches!(preview.change, ChangeDestination::Spending { .. }));
+    wait_for_transaction(&sent(&backend, preview).await).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn killed_after_sign_rebroadcasts() {
+    const SEND: u64 = 60_000;
+    let wallet = SavingWallet::new();
+    let backend = wallet.ready(electrum()).await;
+    fund_saving(&backend, 300_000).await;
+    let payee = btc("getnewaddress");
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend
+        .prepare_send(from_saving(&payee, SEND))
+        .await
+        .unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            let running = backend.operations().await.unwrap();
+            if running
+                .iter()
+                .any(|op| op.id == id && op.state == OperationState::Broadcasting)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the send is signed and stored");
+    drop(backend);
+
+    let backend = wallet.reopened().await;
+    wait_no_operations(&backend).await;
+    mine(1);
+    wait_saving(&backend, |state| {
+        !state.history.is_empty()
+            && state.history[0].status == HistoryStatus::Complete
+            && matches!(state.history[0].kind, HistoryKind::Sent { .. })
+    })
+    .await;
+    let (sat, txids) = received_at(&payee);
+    assert_eq!((sat, txids.len()), (SEND, 1), "paid once");
+    backend.shutdown().await.unwrap();
 }
