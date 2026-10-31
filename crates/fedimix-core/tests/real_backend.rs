@@ -269,6 +269,36 @@ async fn a_federation_that_cannot_open_says_why() {
 }
 
 #[tokio::test]
+async fn a_failed_open_tells_a_subscriber_its_problem() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // The first open hangs until a subscriber is attached, as a front end
+    // takes its snapshot before the supervisor's first answer.
+    harness.port.set_held(true);
+    harness
+        .port
+        .set_open_error(Some(FedimixError::Internal(WRONG_PHRASE.into())));
+    let backend = harness.open().await.unwrap();
+    let events = backend.subscribe();
+    harness.port.set_held(false);
+    wait_event(&events, &Event::FederationChanged).await;
+    let federation = backend.spending_state().await.unwrap().federation.unwrap();
+    assert_eq!(federation.problem.as_deref(), Some(WRONG_PHRASE));
+
+    // A different problem is news too.
+    harness
+        .port
+        .set_open_error(Some(FedimixError::Internal("Another problem.".into())));
+    wait_event(&events, &Event::FederationChanged).await;
+    let federation = backend.spending_state().await.unwrap().federation.unwrap();
+    assert_eq!(federation.problem.as_deref(), Some("Another problem."));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn spending_state_splits_at_target() {
     let harness = Harness::new();
     harness.first.set_balance(Amount::from_sat(7_000_000));
@@ -489,7 +519,7 @@ async fn settings_persist_and_ranges_are_checked() {
     }
     let changed = Settings {
         anonymity_target: 7,
-        ..Settings::default()
+        ..Settings::for_network(Network::Regtest)
     };
     backend.set_settings(changed.clone()).await.unwrap();
     backend.shutdown().await.unwrap();
@@ -1774,6 +1804,10 @@ async fn assert_refused_for_a_missing_seed(harness: &Harness) {
     };
     assert!(sentence.contains(seed.to_str().unwrap()), "{sentence}");
     assert!(sentence.contains("Restore"), "{sentence}");
+    assert!(
+        sentence.contains("or choose another data folder"),
+        "{sentence}"
+    );
     assert!(!seed.exists(), "no new seed may take the old one's place");
 }
 
@@ -1802,6 +1836,18 @@ async fn a_missing_seed_beside_a_store_with_no_federation_is_refused() {
     let backend = harness.open().await.unwrap();
     backend.shutdown().await.unwrap();
     drop(backend);
+    assert_refused_for_a_missing_seed(&harness).await;
+}
+
+#[tokio::test]
+async fn missing_seed_with_a_surviving_federations_folder_is_refused() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    // The real port makes `federations/<id>` on a join; the fake keeps no files.
+    std::fs::create_dir_all(harness.dir.path().join("federations").join("one")).unwrap();
+    lose_store(&harness);
     assert_refused_for_a_missing_seed(&harness).await;
 }
 

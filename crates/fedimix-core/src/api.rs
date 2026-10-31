@@ -156,6 +156,8 @@ pub struct FederationInfo {
     pub problem: Option<String>,
     /// It runs Lightning, so Spending can pay and receive over it here.
     pub has_lightning: bool,
+    /// The invite code it was joined with; the README tells users to keep it.
+    pub invite: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -461,6 +463,17 @@ impl Network {
     }
 }
 
+impl Network {
+    /// The public Esplora server to start from; regtest has none.
+    pub fn default_esplora_url(self) -> &'static str {
+        match self {
+            Self::Bitcoin => "https://blockstream.info/api",
+            Self::Signet => "https://mempool.space/signet/api",
+            Self::Regtest => "",
+        }
+    }
+}
+
 impl std::str::FromStr for Network {
     type Err = String;
 
@@ -507,6 +520,19 @@ pub struct Settings {
     pub recovery_words_shown: bool,
 }
 
+impl Settings {
+    /// The defaults for a folder on `network`. Regtest has no public chain
+    /// server, so its URL is empty: unset until the user names one.
+    pub fn for_network(network: Network) -> Self {
+        Settings {
+            chain_backend: ChainBackend::Esplora {
+                url: network.default_esplora_url().to_string(),
+            },
+            ..Settings::default()
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -517,7 +543,7 @@ impl Default for Settings {
             fee_guard_percent: 2,
             cover_budget_sat_per_month: 20_000,
             chain_backend: ChainBackend::Esplora {
-                url: "https://blockstream.info/api".to_string(),
+                url: Network::Bitcoin.default_esplora_url().to_string(),
             },
             socks5_proxy: None,
             recovery_words_shown: false,
@@ -528,6 +554,18 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_chain_server_follows_network() {
+        let url = |network| match Settings::for_network(network).chain_backend {
+            ChainBackend::Esplora { url } => url,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(url(Network::Bitcoin), "https://blockstream.info/api");
+        assert_eq!(url(Network::Signet), "https://mempool.space/signet/api");
+        // Regtest has no public server: it is unset until the user names one.
+        assert_eq!(url(Network::Regtest), "");
+    }
 
     #[test]
     fn amount_sat_roundtrip() {

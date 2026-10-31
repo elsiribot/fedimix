@@ -53,6 +53,9 @@ pub struct Args {
     pub page: Option<StartPage>,
     /// Script for the in-app demo driver.
     pub drive: Option<std::path::PathBuf>,
+    /// Milliseconds the demo spends in each operation state, in place of its
+    /// own, so a flow's screenshot cannot outlast a state.
+    pub demo_step_ms: Option<u64>,
     /// `None` picks the network's default folder.
     pub data_dir: Option<PathBuf>,
     pub network: Network,
@@ -81,6 +84,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut scenario = None;
     let mut page = None;
     let mut drive = None;
+    let mut demo_step_ms = None;
     let mut data_dir = None;
     let mut network = None;
     while let Some(arg) = args.next() {
@@ -98,6 +102,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let v = args.next().ok_or("--demo-drive needs a file")?;
                 drive = Some(std::path::PathBuf::from(v));
             }
+            "--demo-step-ms" => {
+                let v = args.next().ok_or("--demo-step-ms needs milliseconds")?;
+                demo_step_ms = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--demo-step-ms needs milliseconds, got '{v}'"))?,
+                );
+            }
             "--data-dir" => {
                 let v = args.next().ok_or("--data-dir needs a folder")?;
                 data_dir = Some(PathBuf::from(v));
@@ -109,8 +120,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
-    if !demo && (scenario.is_some() || page.is_some()) {
-        return Err("--demo-scenario and --demo-page require --demo".to_string());
+    if !demo && (scenario.is_some() || page.is_some() || demo_step_ms.is_some()) {
+        return Err("--demo-scenario, --demo-page and --demo-step-ms require --demo".to_string());
     }
     if demo && (data_dir.is_some() || network.is_some()) {
         return Err("--data-dir and --network do not apply to --demo".to_string());
@@ -124,6 +135,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         scenario: scenario.unwrap_or(DemoScenario::Funded),
         page,
         drive,
+        demo_step_ms,
         data_dir,
         network: network.unwrap_or(Network::Bitcoin),
     })
@@ -135,6 +147,18 @@ mod tests {
 
     fn p(args: &[&str]) -> Result<Args, String> {
         parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn demo_step_ms_takes_milliseconds_and_needs_demo() {
+        assert_eq!(
+            p(&["--demo", "--demo-step-ms", "2500"])
+                .unwrap()
+                .demo_step_ms,
+            Some(2500)
+        );
+        assert!(p(&["--demo", "--demo-step-ms", "slow"]).is_err());
+        assert!(p(&["--demo-step-ms", "10"]).is_err());
     }
 
     #[test]

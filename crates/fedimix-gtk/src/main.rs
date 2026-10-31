@@ -97,7 +97,10 @@ fn main() -> gtk::glib::ExitCode {
 
     let runtime = bridge::start_runtime();
     let (backend, send_lock_timeout): (Arc<dyn Backend>, _) = if args.demo {
-        let timing = DemoTiming::for_scenario(args.scenario);
+        let mut timing = DemoTiming::for_scenario(args.scenario);
+        if let Some(ms) = args.demo_step_ms {
+            timing.step = std::time::Duration::from_millis(ms);
+        }
         (
             DemoBackend::with_timing(args.scenario, timing),
             timing

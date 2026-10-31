@@ -3,7 +3,8 @@
 # driver under headless sway, taking a grim screenshot at every `shot` step.
 # Usage: scripts/interact-demo.sh [flow-name ...]   (default: all flows)
 # Flow header comments: `# scenario: <demo scenario>`, `# page: <demo page>`,
-# `# size: WxH`.
+# `# size: WxH`, `# step-ms: N` (time in each operation state,
+# for flows whose screenshot would outlast the demo's 300 ms).
 # Output: target/screenshots/interact/<flow>-<shot>.png
 set -euo pipefail
 
@@ -34,11 +35,12 @@ cleanup() {
 trap cleanup EXIT
 
 run_flow() {
-    local file="$1" name scenario page size width height
+    local file="$1" name scenario page size width height step
     name="$(basename "$file" .drive)"
     scenario="$(sed -n 's/^# scenario: *//p' "$file" | head -n1)"
     page="$(sed -n 's/^# page: *//p' "$file" | head -n1)"
     size="$(sed -n 's/^# size: *//p' "$file" | head -n1)"
+    step="$(sed -n 's/^# step-ms: *//p' "$file" | head -n1)"
     scenario="${scenario:-funded}"
     size="${size:-480x640}"
     width="${size%x*}"
@@ -66,7 +68,7 @@ run_flow() {
     mkfifo "$rt/stdin"
     exec 3<>"$rt/stdin"
     GDK_BACKEND=wayland GSK_RENDERER=cairo GTK_A11Y=none \
-        "$bin" --demo --demo-scenario "$scenario" ${page:+--demo-page "$page"} \
+        "$bin" --demo --demo-scenario "$scenario" ${page:+--demo-page "$page"} ${step:+--demo-step-ms "$step"} \
         --demo-drive "$file" \
         <&3 >"$rt/out.log" 2>"$rt/err.log" &
     app_pid=$!

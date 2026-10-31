@@ -612,6 +612,26 @@ impl Inner {
             });
             self.federations.add(&row);
             rows.push(row);
+            if let Some(offer) = present::federation_invite(fed) {
+                let invite = adw::ActionRow::builder()
+                    .use_markup(false)
+                    .title("Invite code")
+                    .subtitle(&offer.shown)
+                    .subtitle_selectable(true)
+                    .build();
+                let copy = gtk::Button::with_label("Copy");
+                copy.set_valign(gtk::Align::Center);
+                copy.connect_clicked({
+                    let ctx = self.ctx.clone();
+                    move |button| {
+                        button.clipboard().set_text(&offer.copy);
+                        ctx.toast("Invite code copied.");
+                    }
+                });
+                invite.add_suffix(&copy);
+                self.federations.add(&invite);
+                rows.push(invite);
+            }
         }
         let add = adw::ActionRow::builder()
             .title("Add federation")

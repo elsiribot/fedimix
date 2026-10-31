@@ -84,7 +84,7 @@ impl Seed {
     /// The refusal for a data folder that holds a wallet but no phrase.
     pub(crate) fn missing(dir: &Path) -> FedimixError {
         FedimixError::Internal(format!(
-            "The seed file {} is missing, but this folder holds a wallet, so Fedimix will not start. Restore the file from your backup, or write your recovery words into it with mode 0600.",
+            "The seed file {} is missing, but this folder holds a wallet, so Fedimix will not start. Restore the file from your backup, or write your recovery words into it with mode 0600, or choose another data folder.",
             dir.join(SEED_FILE).display()
         ))
     }

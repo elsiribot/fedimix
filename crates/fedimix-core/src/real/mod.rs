@@ -221,6 +221,7 @@ impl Core {
                 open_error.filter(|_| open).and_then(|e| problem_of(&e))
             },
             has_lightning: row.has_lightning,
+            invite: row.invite.clone(),
         }
     }
 
@@ -399,6 +400,12 @@ impl Core {
     }
 }
 
+/// Whether `federations/` holds a client database. The port creates
+/// `federations/<id>` only after a seed exists, so none can be here by chance.
+fn has_federation_data(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("federations")).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 pub struct RealBackend {
     core: Arc<Core>,
 }
@@ -422,7 +429,9 @@ impl RealBackend {
         let seed_is_new = !Seed::exists(&dir, &lock);
         let db = dir.join(DB_FILE);
         // Before `load_or_create`: a new seed cannot open what the old one made.
-        if seed_is_new && db.exists() && Store::open(&db)?.holds_a_wallet()? {
+        if seed_is_new
+            && (has_federation_data(&dir) || (db.exists() && Store::open(&db)?.holds_a_wallet()?))
+        {
             return Err(Seed::missing(&dir));
         }
         let seed = Seed::load_or_create(&dir, &lock)?;

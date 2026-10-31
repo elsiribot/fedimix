@@ -60,6 +60,7 @@ pub fn federation(online: bool) -> FederationInfo {
         recovering: false,
         problem: None,
         has_lightning: true,
+        invite: "fed1demoalpha".to_string(),
     }
 }
 

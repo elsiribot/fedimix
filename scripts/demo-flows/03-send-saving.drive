@@ -1,4 +1,7 @@
 # scenario: funded
+# step-ms: 3000
+# Each shot takes about half a second; at the default 300 ms a state is over
+# before the next step looks for it, so the flow ran on luck.
 # Send from Saving: review, confirm, history updated.
 expect 1.2034 BTC
 click Send

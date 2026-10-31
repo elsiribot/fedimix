@@ -193,6 +193,35 @@ pub fn federation_subtitle(f: &FederationInfo) -> String {
     format!("{} {DOT} {status}\n{}", format::btc(f.balance), f.id)
 }
 
+/// An invite as Settings offers it: a short form to read, the whole code to copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteOffer {
+    pub shown: String,
+    pub copy: String,
+}
+
+/// Longest invite shown whole; a longer one keeps its ends.
+const INVITE_SHOWN_WHOLE: usize = 24;
+
+/// `None` when the federation's invite is not known.
+pub fn federation_invite(f: &FederationInfo) -> Option<InviteOffer> {
+    if f.invite.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = f.invite.chars().collect();
+    let shown = if chars.len() <= INVITE_SHOWN_WHOLE {
+        f.invite.clone()
+    } else {
+        let head: String = chars[..12].iter().collect();
+        let tail: String = chars[chars.len() - 8..].iter().collect();
+        format!("{head}\u{2026}{tail}")
+    };
+    Some(InviteOffer {
+        shown,
+        copy: f.invite.clone(),
+    })
+}
+
 /// What to say once a join has worked, if anything.
 pub fn join_notice(f: &FederationInfo) -> Option<String> {
     (!f.has_lightning)
@@ -1346,7 +1375,32 @@ mod tests {
             recovering: false,
             problem: None,
             has_lightning: true,
+            invite: "fed1abc".into(),
         }
+    }
+
+    #[test]
+    fn federation_row_offers_its_invite() {
+        let long = "fed1".to_string() + &"q".repeat(120);
+        let fed = FederationInfo {
+            invite: long.clone(),
+            ..federation_info()
+        };
+        let offer = federation_invite(&fed).unwrap();
+        assert_eq!(offer.copy, long);
+        assert!(offer.shown.starts_with("fed1qqq"), "{}", offer.shown);
+        assert!(offer.shown.ends_with("qqq"), "{}", offer.shown);
+        assert!(offer.shown.chars().count() < 40, "{}", offer.shown);
+        let short = FederationInfo {
+            invite: "fed1abc".into(),
+            ..federation_info()
+        };
+        assert_eq!(federation_invite(&short).unwrap().shown, "fed1abc");
+        let none = FederationInfo {
+            invite: String::new(),
+            ..federation_info()
+        };
+        assert_eq!(federation_invite(&none), None);
     }
 
     #[test]
@@ -1406,6 +1460,7 @@ mod tests {
             recovering,
             problem: None,
             has_lightning: true,
+            invite: String::new(),
         };
         assert_eq!(connection_banner(None), None);
         assert_eq!(connection_banner(Some(&fed(true, false))), None);

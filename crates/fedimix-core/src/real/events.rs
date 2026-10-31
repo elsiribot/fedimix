@@ -8,7 +8,7 @@ use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::{Core, Gate, held};
+use super::{Core, Gate, held, problem_of};
 use crate::api::{Amount, WalletKind};
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream};
@@ -163,7 +163,19 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
                 if e != FedimixError::Offline {
                     eprintln!("fedimix: opening federation {id}: {e}");
                 }
-                core.state().live.entry(id).or_default().last_open_error = Some(e);
+                // A federation that keeps failing the same way is no news. A
+                // front end only looks again on an event, so a change must send one.
+                let changed = {
+                    let mut state = core.state();
+                    let live = state.live.entry(id.clone()).or_default();
+                    let before = live.last_open_error.as_ref().and_then(problem_of);
+                    let changed = before != problem_of(&e);
+                    live.last_open_error = Some(e);
+                    changed
+                };
+                if changed {
+                    core.events.emit(&Event::FederationChanged);
+                }
                 return;
             }
         },

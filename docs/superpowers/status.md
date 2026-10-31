@@ -20,11 +20,11 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet). Open from the re-review: O1-O4 and N8 (accepted). M14 (per-network default chain server) is left for Phase 3. `just interact-demo` flow 03 is flaky, about 1 run in 4, at `expect Broadcasting`.
+Phase 3 (Saving, hardware wallet), Task 1 done: the Saving dependencies (bdk_wallet, bdk_esplora, bdk_electrum, async-hwi, rusqlite 0.31; udev and hidapi in the nix build), the per-network chain server default (M14), N1-N3, and Settings shows each federation's invite with Copy. Next: Task 2 of the Phase 3 plan. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause (a shot outlasting a 300 ms state) is from reading.
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.
-- Decide restore-from-words in the app: today the words alone do nothing there. The README has the manual path (new folder, words in `seed` mode 0600, join with invite codes). The app does not show invite codes, so users must keep their own.
+- Decide restore-from-words in the app: today the words alone do nothing there. The README has the manual path (new folder, words in `seed` mode 0600, join with invite codes). Settings now shows each invite with Copy.
 - v2 reuses its deposit address until a payment to it is seen, and Receive says so. Phase 3's fresh change address needs either an upstream `next_receive_address` or a refusal of concurrent sends: decide before the Phase 3 design is final.
 - SOCKS5 for federation traffic: fedimint 0.13 has no upstream support, so a set proxy blocks federation connections (a sentence says so).
 - The seed sits in a plain 0600 file in the data folder; decide whether that is enough or it needs encryption.

@@ -61,6 +61,9 @@
           pango
           gtk4
           libadwaita
+          # async-hwi talks to hardware wallets through hidapi and libudev
+          udev
+          hidapi
         ];
 
         # cleanCargoSource keeps only Cargo and Rust files, but the GTK crate

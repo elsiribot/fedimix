@@ -18,7 +18,11 @@ tokio = { version = "1", features = ["macros", "rt"] }
 qrcode = { version = "0.14", default-features = false }
 bitcoin = "0.32.6"
 lightning-invoice = "0.34"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+bdk_wallet = { version = "3.2.0", features = ["rusqlite"] }
+bdk_esplora = { version = "0.22.3", default-features = false, features = ["async-https-rustls", "tokio"] }
+bdk_electrum = "0.24.1"
+async-hwi = { version = "0.0.35", default-features = false, features = ["ledger", "coldcard", "bitbox", "jade", "rustls"] }
 rand = "0.8"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }

@@ -6,7 +6,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::api::{HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind};
+use crate::api::{
+    ChainBackend, HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind,
+};
 use crate::error::{FedimixError, Result};
 
 const SCHEMA_VERSION: i64 = 4;
@@ -325,10 +327,36 @@ impl Store {
             .query_row("SELECT json FROM settings WHERE id = 1", [], |r| r.get(0))
             .optional()
             .map_err(db_err)?;
-        match json {
-            None => Ok(Settings::default()),
-            Some(json) => serde_json::from_str(&json).map_err(db_err),
+        let network = self.network()?;
+        let mut settings = match json {
+            None => return Ok(Settings::for_network(network)),
+            Some(json) => serde_json::from_str::<Settings>(&json).map_err(db_err)?,
+        };
+        // The mainnet default in another network's folder was never chosen
+        // there: an older version wrote it. Read it as unset.
+        if network != Network::Bitcoin
+            && settings.chain_backend
+                == (ChainBackend::Esplora {
+                    url: Network::Bitcoin.default_esplora_url().to_string(),
+                })
+        {
+            settings.chain_backend = Settings::for_network(network).chain_backend;
         }
+        Ok(settings)
+    }
+
+    /// The network the folder is bound to; mainnet before it is bound.
+    fn network(&self) -> Result<Network> {
+        let name: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'network'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_err)?;
+        Ok(name
+            .and_then(|name| name.parse().ok())
+            .unwrap_or(Network::Bitcoin))
     }
 
     pub(crate) fn set_settings(&self, settings: &Settings) -> Result<()> {
@@ -803,6 +831,27 @@ mod tests {
         };
         store.set_settings(&changed).unwrap();
         assert_eq!(store.settings().unwrap(), changed);
+    }
+
+    #[test]
+    fn mainnet_url_in_a_signet_folder_reads_as_unset() {
+        let (_d, store) = open();
+        store.bind_network(Network::Signet).unwrap();
+        // What an older version stored: the mainnet default, never chosen.
+        store.set_settings(&Settings::default()).unwrap();
+        assert_eq!(
+            store.settings().unwrap().chain_backend,
+            Settings::for_network(Network::Signet).chain_backend
+        );
+        // A server the user picked stays.
+        let chosen = Settings {
+            chain_backend: ChainBackend::Esplora {
+                url: "https://esplora.example/signet/api".into(),
+            },
+            ..Settings::default()
+        };
+        store.set_settings(&chosen).unwrap();
+        assert_eq!(store.settings().unwrap(), chosen);
     }
 
     #[test]
