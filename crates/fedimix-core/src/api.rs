@@ -383,7 +383,10 @@ pub enum ChainBackend {
     Electrum { url: String },
 }
 
+/// `serde(default)`: a stored row from an older version gains new fields at
+/// their defaults instead of failing to load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub spending_target: Amount,
     pub anonymity_target: u32,

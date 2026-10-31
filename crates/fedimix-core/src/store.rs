@@ -1,8 +1,10 @@
 //! SQLite persistence: settings, federations, history, watches and cursors.
 
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::api::{HistoryItem, Settings, Timestamp, WalletKind};
 use crate::error::{FedimixError, Result};
@@ -28,7 +30,7 @@ CREATE TABLE history (
     json TEXT NOT NULL,
     PRIMARY KEY (wallet, federation_id, id)
 );
-CREATE INDEX history_order ON history (wallet, timestamp DESC, id DESC);
+CREATE INDEX history_order ON history (wallet, federation_id, timestamp DESC, id DESC);
 CREATE TABLE watches (
     id TEXT PRIMARY KEY,
     federation_id TEXT NOT NULL,
@@ -38,6 +40,12 @@ CREATE TABLE watches (
 );
 CREATE TABLE cursors (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 ";
+
+/// A write transaction that takes the write lock up front, so it waits for the
+/// busy timeout instead of failing halfway.
+fn begin(conn: &Connection) -> Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_err)
+}
 
 fn db_err(e: impl std::fmt::Display) -> FedimixError {
     FedimixError::Internal(format!(
@@ -60,6 +68,14 @@ fn wallet_name(w: WalletKind) -> &'static str {
         WalletKind::Saving => "saving",
         WalletKind::Spending => "spending",
     }
+}
+
+/// Upgrades the database from `from` to `from + 1`. Version 1 is the first,
+/// so there is none yet.
+fn migrate_step(_tx: &Transaction<'_>, from: i64) -> Result<()> {
+    Err(FedimixError::Internal(format!(
+        "Fedimix cannot upgrade its database from version {from}."
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,11 +133,31 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// Every commit is fsynced (`synchronous=FULL` in WAL mode), so a caller
+    /// that wants a record to survive a crash must commit it before it acts
+    /// (the history row or watch before the payment is sent).
     pub(crate) fn open(path: &Path) -> Result<Store> {
+        // Create the file 0600 ourselves: SQLite would use the umask, and
+        // it gives the -wal and -shm files the database's mode.
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| db_err(format!("{}: {e}", path.display())))?;
         let conn = Connection::open(path).map_err(db_err)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(db_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
+        let mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(db_err)?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(FedimixError::Internal(format!(
+                "Fedimix needs a file system that supports write-ahead logging, but this one gave journal mode {mode}."
+            )));
+        }
+        conn.pragma_update(None, "synchronous", "FULL")
             .map_err(db_err)?;
         let store = Store { conn };
         store.migrate()?;
@@ -129,8 +165,8 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let has_version: bool = self
-            .conn
+        let tx = begin(&self.conn)?;
+        let has_version: bool = tx
             .query_row(
                 "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
                 [],
@@ -138,30 +174,45 @@ impl Store {
             )
             .map_err(db_err)?;
         if !has_version {
-            // Create everything or nothing.
-            let tx = self.conn.unchecked_transaction().map_err(db_err)?;
-            tx.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
-                .map_err(db_err)?;
+            tx.execute_batch(
+                "CREATE TABLE schema_version (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version INTEGER NOT NULL
+                );",
+            )
+            .map_err(db_err)?;
             tx.execute_batch(SCHEMA).map_err(db_err)?;
             tx.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
+                "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
                 [SCHEMA_VERSION],
             )
             .map_err(db_err)?;
             return tx.commit().map_err(db_err);
         }
-        let version: i64 = self
-            .conn
+        let mut version: i64 = tx
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
-            .map_err(db_err)?;
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                FedimixError::Internal(
+                    "The database has no schema version, so Fedimix cannot tell what it holds. Restore it from your backup."
+                        .into(),
+                )
+            })?;
         if version > SCHEMA_VERSION {
             return Err(FedimixError::Internal(
                 "This data folder was made by a newer version of Fedimix. Update Fedimix to open it."
                     .into(),
             ));
         }
-        // Migrations from older versions go here; version 1 is the first.
-        Ok(())
+        // All steps and the version bump commit together.
+        while version < SCHEMA_VERSION {
+            migrate_step(&tx, version)?;
+            version += 1;
+            tx.execute("UPDATE schema_version SET version = ?1", [version])
+                .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
     }
 
     pub(crate) fn settings(&self) -> Result<Settings> {
@@ -241,7 +292,7 @@ impl Store {
     }
 
     pub(crate) fn set_active(&self, id: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        let tx = begin(&self.conn)?;
         tx.execute("UPDATE federations SET active = 0", [])
             .map_err(db_err)?;
         let n = tx
@@ -263,7 +314,7 @@ impl Store {
     ) -> Result<()> {
         let wallet = wallet_name(wallet);
         let federation_id = federation_id.unwrap_or("");
-        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        let tx = begin(&self.conn)?;
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT timestamp FROM history WHERE wallet = ?1 AND federation_id = ?2 AND id = ?3",
@@ -287,49 +338,68 @@ impl Store {
         tx.commit().map_err(db_err)
     }
 
-    /// Newest first by `(timestamp, id)`. `before` is the id of the last item
-    /// the caller has; rows that arrive later never shift the next page.
+    /// Newest first by `(timestamp, id)` within one wallet and federation
+    /// (`None` for Saving). `before` is the id of the last item the caller
+    /// has; rows that arrive later never shift the next page. A row that no
+    /// longer parses is skipped with a warning rather than failing the page.
     pub(crate) fn history_page(
         &self,
         wallet: WalletKind,
+        federation_id: Option<&str>,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<HistoryItem>> {
         let wallet = wallet_name(wallet);
+        let federation_id = federation_id.unwrap_or("");
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let cursor: Option<(i64, String)> = match before {
-            None => None,
-            Some(id) => Some(
-                self.conn
+        let jsons: Vec<String> = match before {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT json FROM history WHERE wallet = ?1 AND federation_id = ?2
+                         ORDER BY timestamp DESC, id DESC LIMIT ?3",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(params![wallet, federation_id, limit], |r| r.get(0))
+                    .map_err(db_err)?;
+                rows.collect::<std::result::Result<_, _>>()
+                    .map_err(db_err)?
+            }
+            Some(id) => {
+                let ts: i64 = self
+                    .conn
                     .query_row(
-                        "SELECT timestamp, id FROM history WHERE wallet = ?1 AND id = ?2 LIMIT 1",
-                        params![wallet, id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        "SELECT timestamp FROM history
+                         WHERE wallet = ?1 AND federation_id = ?2 AND id = ?3",
+                        params![wallet, federation_id, id],
+                        |r| r.get(0),
                     )
                     .optional()
                     .map_err(db_err)?
-                    .ok_or_else(|| FedimixError::UnknownItem(id.to_string()))?,
-            ),
+                    .ok_or_else(|| FedimixError::UnknownItem(id.to_string()))?;
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT json FROM history
+                         WHERE wallet = ?1 AND federation_id = ?2 AND (timestamp, id) < (?3, ?4)
+                         ORDER BY timestamp DESC, id DESC LIMIT ?5",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(params![wallet, federation_id, ts, id, limit], |r| r.get(0))
+                    .map_err(db_err)?;
+                rows.collect::<std::result::Result<_, _>>()
+                    .map_err(db_err)?
+            }
         };
-        let (ts, id) = cursor.unwrap_or((i64::MAX, String::new()));
-        // Without a cursor everything qualifies: ts is the maximum, and the
-        // id comparison is skipped by the `?4` flag.
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT json FROM history
-                 WHERE wallet = ?1 AND (?4 = 0 OR (timestamp, id) < (?2, ?3))
-                 ORDER BY timestamp DESC, id DESC LIMIT ?5",
-            )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map(params![wallet, ts, id, before.is_some(), limit], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for json in rows {
-            out.push(serde_json::from_str(&json.map_err(db_err)?).map_err(db_err)?);
+        let mut out = Vec::with_capacity(jsons.len());
+        for json in jsons {
+            match serde_json::from_str(&json) {
+                Ok(item) => out.push(item),
+                Err(e) => eprintln!("fedimix: skipping a history row that cannot be read: {e}"),
+            }
         }
         Ok(out)
     }
@@ -486,7 +556,9 @@ mod tests {
         assert_eq!(feds[0].online_at, Some(5));
         assert_eq!(store.active_federation().unwrap().as_deref(), Some("f1"));
         assert_eq!(
-            ids(&store.history_page(WalletKind::Spending, None, 10).unwrap()),
+            ids(&store
+                .history_page(WalletKind::Spending, Some("f1"), None, 10)
+                .unwrap()),
             ["a"]
         );
         assert_eq!(store.watches().unwrap().len(), 1);
@@ -503,27 +575,29 @@ mod tests {
                 .unwrap();
         }
         // Newest first by (timestamp, id): e, d, c, b, a.
-        let first = store.history_page(WalletKind::Spending, None, 2).unwrap();
+        let first = store
+            .history_page(WalletKind::Spending, Some("f"), None, 2)
+            .unwrap();
         assert_eq!(ids(&first), ["e", "d"]);
         store
             .upsert_history(WalletKind::Spending, Some("f"), &item("new", 100))
             .unwrap();
         let second = store
-            .history_page(WalletKind::Spending, Some("d"), 2)
+            .history_page(WalletKind::Spending, Some("f"), Some("d"), 2)
             .unwrap();
         assert_eq!(ids(&second), ["c", "b"]);
         let third = store
-            .history_page(WalletKind::Spending, Some("b"), 5)
+            .history_page(WalletKind::Spending, Some("f"), Some("b"), 5)
             .unwrap();
         assert_eq!(ids(&third), ["a"]);
         assert!(
             store
-                .history_page(WalletKind::Saving, None, 5)
+                .history_page(WalletKind::Saving, None, None, 5)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            store.history_page(WalletKind::Spending, Some("nope"), 5),
+            store.history_page(WalletKind::Spending, Some("f"), Some("nope"), 5),
             Err(crate::FedimixError::UnknownItem("nope".into()))
         );
     }
@@ -542,7 +616,9 @@ mod tests {
         store
             .upsert_history(WalletKind::Spending, Some("f"), &done)
             .unwrap();
-        let page = store.history_page(WalletKind::Spending, None, 10).unwrap();
+        let page = store
+            .history_page(WalletKind::Spending, Some("f"), None, 10)
+            .unwrap();
         assert_eq!(ids(&page), ["b", "a"]);
         assert_eq!(page[1].status, HistoryStatus::Complete);
         assert_eq!(page[1].timestamp, 1);
@@ -570,6 +646,121 @@ mod tests {
             store.set_active("zzz"),
             Err(crate::FedimixError::UnknownItem("zzz".into()))
         );
+    }
+
+    #[test]
+    fn history_is_per_federation() {
+        let (_d, store) = open();
+        store
+            .upsert_history(WalletKind::Spending, Some("f1"), &item("a", 1))
+            .unwrap();
+        store
+            .upsert_history(WalletKind::Spending, Some("f2"), &item("b", 2))
+            .unwrap();
+        store
+            .upsert_history(WalletKind::Spending, Some("f2"), &item("a", 3))
+            .unwrap();
+        store
+            .upsert_history(WalletKind::Saving, None, &item("s", 4))
+            .unwrap();
+        let f1 = store
+            .history_page(WalletKind::Spending, Some("f1"), None, 10)
+            .unwrap();
+        assert_eq!(ids(&f1), ["a"]);
+        assert_eq!(f1[0].timestamp, 1);
+        let f2 = store
+            .history_page(WalletKind::Spending, Some("f2"), None, 1)
+            .unwrap();
+        assert_eq!(ids(&f2), ["a"]);
+        assert_eq!(f2[0].timestamp, 3);
+        // The cursor is resolved inside its own federation.
+        let next = store
+            .history_page(WalletKind::Spending, Some("f2"), Some("a"), 10)
+            .unwrap();
+        assert_eq!(ids(&next), ["b"]);
+        assert_eq!(
+            ids(&store
+                .history_page(WalletKind::Saving, None, None, 10)
+                .unwrap()),
+            ["s"]
+        );
+    }
+
+    #[test]
+    fn data_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("data");
+        crate::seed::open_data_dir(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        let db = dir.join("fedimix.db");
+        let store = Store::open(&db).unwrap();
+        store.set_cursor("c", 1).unwrap();
+        assert_eq!(mode(&db), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let p = dir.join(format!("fedimix.db{suffix}"));
+            if p.exists() {
+                assert_eq!(mode(&p), 0o600, "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn old_settings_row_gains_new_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        drop(Store::open(&path).unwrap());
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute(
+            "INSERT INTO settings (id, json) VALUES (1, '{\"anonymity_target\": 3}')",
+            [],
+        )
+        .unwrap();
+        drop(raw);
+        let got = Store::open(&path).unwrap().settings().unwrap();
+        assert_eq!(got.anonymity_target, 3);
+        assert_eq!(got.fee_guard_percent, Settings::default().fee_guard_percent);
+    }
+
+    #[test]
+    fn unreadable_history_row_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &item("a", 1))
+            .unwrap();
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &item("c", 3))
+            .unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute(
+            "INSERT INTO history (wallet, federation_id, id, timestamp, json)
+             VALUES ('spending', 'f', 'b', 2, '{\"kind\": \"FromTheFuture\"}')",
+            [],
+        )
+        .unwrap();
+        let page = store
+            .history_page(WalletKind::Spending, Some("f"), None, 10)
+            .unwrap();
+        assert_eq!(ids(&page), ["c", "a"]);
+    }
+
+    #[test]
+    fn empty_version_row_gets_a_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        drop(Store::open(&path).unwrap());
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute("DELETE FROM schema_version", []).unwrap();
+        drop(raw);
+        match Store::open(&path).err().unwrap() {
+            crate::FedimixError::Internal(msg) => {
+                assert!(msg.contains("no schema version"), "{msg}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
