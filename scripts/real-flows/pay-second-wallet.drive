@@ -3,7 +3,7 @@ expect-slow 0.0019 BTC
 click Send
 type-env "Lightning invoice or on-chain address" FEDIMIX_SECOND_INVOICE
 click Review
-expect-slow Network fee
+expect-slow Total
 shot review
 click Send
 expect-slow Payment sent

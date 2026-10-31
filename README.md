@@ -100,7 +100,8 @@ Scenarios (`--demo-scenario`): `funded` (default), `below-target`,
 `exit-deferred` (Spending too low for exit fees, every queue and history
 status), `long-names` (below target with a queue, oversized names),
 `device-disconnected` (Saving set up, device unplugged), `preview-expiry`
-(previews expire within a second), `device-rejects` (the device refuses),
+(previews expire within a second), `device-rejects` (the device refuses), `confirm-fails` (Spending sends refused
+at Confirm),
 `recovering` (data being restored from the federation).
 
 Pages (`--demo-page`): `saving`, `spending`, `coins`, `coin-detail`, `moving`,

@@ -407,7 +407,8 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
         DemoScenario::Funded
         | DemoScenario::PreviewExpiry
         | DemoScenario::DeviceRejects
-        | DemoScenario::SendStuck => funded(),
+        | DemoScenario::SendStuck
+        | DemoScenario::ConfirmFails => funded(),
         DemoScenario::BelowTarget => {
             let history = funded_saving_history();
             Fixture {

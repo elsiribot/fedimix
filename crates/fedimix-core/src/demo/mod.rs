@@ -79,6 +79,8 @@ pub enum DemoScenario {
     DeviceRejects,
     /// Funded, with sends held in Broadcasting for a while.
     SendStuck,
+    /// Funded, with Spending sends refused at Confirm.
+    ConfirmFails,
     /// Funded, with far more history than a snapshot carries.
     LongHistory,
     /// Without Saving, its data being rebuilt from the federation.
@@ -131,6 +133,7 @@ impl FromStr for DemoScenario {
             "offline" => Ok(Self::Offline),
             "exit-deferred" => Ok(Self::ExitDeferred),
             "send-stuck" => Ok(Self::SendStuck),
+            "confirm-fails" => Ok(Self::ConfirmFails),
             "long-names" => Ok(Self::LongNames),
             "long-history" => Ok(Self::LongHistory),
             "device-disconnected" => Ok(Self::DeviceDisconnected),
@@ -138,7 +141,7 @@ impl FromStr for DemoScenario {
             "device-rejects" => Ok(Self::DeviceRejects),
             "recovering" => Ok(Self::Recovering),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, long-history, recovering)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, confirm-fails, long-history, recovering)"
             )),
         }
     }
@@ -175,6 +178,8 @@ struct State {
     /// Previews whose operation was cancelled.
     cancelled: HashSet<String>,
     next_id: u64,
+    /// Spending sends are refused at Confirm.
+    confirm_fails: bool,
 }
 
 /// Unconfirmed previews with their expiry.
@@ -384,6 +389,7 @@ impl State {
             operations: HashMap::new(),
             cancelled: HashSet::new(),
             next_id: 1,
+            confirm_fails: scenario == DemoScenario::ConfirmFails,
         }
     }
 
@@ -462,6 +468,9 @@ impl State {
         match p.wallet {
             WalletKind::Spending => {
                 self.check_online()?;
+                if self.confirm_fails {
+                    return Err(FedimixError::Offline);
+                }
                 let needed = with_fee(p.amount, p.fee);
                 if needed > self.spending_balance {
                     return Err(FedimixError::InsufficientFunds {
@@ -1316,7 +1325,7 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 13] = [
+    const ALL: [DemoScenario; 14] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
@@ -1328,6 +1337,7 @@ mod tests {
         DemoScenario::PreviewExpiry,
         DemoScenario::DeviceRejects,
         DemoScenario::SendStuck,
+        DemoScenario::ConfirmFails,
         DemoScenario::LongHistory,
         DemoScenario::Recovering,
     ];

@@ -5,7 +5,7 @@ click Spending
 click Send
 type "Lightning invoice or on-chain address" lnbc1200u1demo
 click Review
-expect Network fee
+expect Total
 click Send
 expect Broadcasting
 expect-locked
@@ -13,6 +13,6 @@ shot locked
 expect You can close this; the result will appear when it arrives
 shot unlocked
 close-dialog
-expect-not Network fee
+expect-not Total
 expect Payment sent
 shot toast

@@ -357,15 +357,11 @@ impl Progress {
                 *self.operation.borrow_mut() = Some(id.clone());
                 ctx.watch_operation(id, move |state| self.on_state(state));
             }
-            Err(e @ FedimixError::PreviewExpired) => {
-                self.back_to_form(&present::user_message(&e));
-            }
+            // The core may have used the preview up, and Review makes a new one.
             Err(e) => {
                 *self.preview_id.borrow_mut() = Some(preview_id);
-                self.set_busy(false);
-                if let Some(label) = self.error.upgrade() {
-                    set_error(&label, Some(&present::user_message(&e)));
-                }
+                self.discard(ctx);
+                self.back_to_form(&present::user_message(&e));
             }
         }
     }
@@ -445,6 +441,7 @@ fn review_page(
     let wallet = preview.wallet;
     let hero = widgets::amount_button("title-1");
     hero.set_amount(&format::btc_exact(preview.amount));
+    hero.set_opens_details(present::review_discloses(&preview));
     let revealer = gtk::Revealer::builder()
         .child(&detail_lines(&preview))
         .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -466,8 +463,10 @@ fn review_page(
     body.append(&revealer);
     body.append(&caption("To"));
     body.append(&long_text(&preview.destination));
-    body.append(&caption("Network fee"));
+    body.append(&caption(present::fee_label(wallet)));
     body.append(&long_text(&format::sats(preview.fee)));
+    body.append(&caption("Total"));
+    body.append(&long_text(&present::review_total(&preview)));
 
     let error = error_label();
     let label = gtk::Label::builder()

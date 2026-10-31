@@ -14,6 +14,7 @@ use crate::ui::{receive_dialog, send_dialog};
 pub struct AmountButton {
     button: gtk::Button,
     label: gtk::Label,
+    chevron: gtk::Label,
 }
 
 impl AmountButton {
@@ -23,6 +24,13 @@ impl AmountButton {
 
     pub fn set_amount(&self, text: &str) {
         self.label.set_label(text);
+    }
+
+    /// A button with nothing behind it shows no chevron and takes no click.
+    pub fn set_opens_details(&self, opens: bool) {
+        self.chevron.set_visible(opens);
+        self.button.set_can_target(opens);
+        self.button.set_focusable(opens);
     }
 
     pub fn connect_clicked(&self, f: impl Fn() + 'static) {
@@ -51,7 +59,11 @@ pub fn amount_button(css: &str) -> AmountButton {
         .halign(gtk::Align::Center)
         .build();
     button.add_css_class("flat");
-    AmountButton { button, label }
+    AmountButton {
+        button,
+        label,
+        chevron,
+    }
 }
 
 /// Centered vertical container for the hero block.

@@ -1,0 +1,13 @@
+# scenario: confirm-fails
+# A failed Confirm used the preview up: back to the form with the reason, so a
+# second click cannot dead-end in "no longer available".
+click Spending
+click Send
+type "Lightning invoice or on-chain address" lnbc1200u1demo
+click Review
+expect Total
+click Send
+expect You are offline. Reconnect and try again
+expect-not Total
+expect Review
+shot back-at-form

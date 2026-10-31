@@ -521,6 +521,25 @@ pub fn change_text(change: &fedimix_core::ChangeDestination) -> Option<String> {
     }
 }
 
+/// Whether the review has inputs or change to disclose.
+pub fn review_discloses(preview: &SendPreview) -> bool {
+    !preview.inputs.is_empty() || change_text(&preview.change).is_some()
+}
+
+/// A Spending fee is the gateway's and the federation's, not a miner's.
+pub fn fee_label(wallet: WalletKind) -> &'static str {
+    match wallet {
+        WalletKind::Spending => "Fee",
+        WalletKind::Saving => "Network fee",
+    }
+}
+
+/// What leaves the wallet: the amount and the fee.
+pub fn review_total(preview: &SendPreview) -> String {
+    let total = preview.amount.checked_add(preview.fee);
+    format::btc_exact(total.unwrap_or(Amount { msat: u64::MAX }))
+}
+
 /// Label and sensitivity of the review Confirm button.
 pub fn confirm_button(
     wallet: fedimix_core::WalletKind,
@@ -751,6 +770,46 @@ pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview() -> SendPreview {
+        SendPreview {
+            id: "p".into(),
+            wallet: WalletKind::Spending,
+            destination: "d".into(),
+            amount: sat(1_000),
+            fee: sat(10),
+            federation: Some("f".into()),
+            inputs: Vec::new(),
+            change: ChangeDestination::None,
+            expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_review_with_nothing_to_disclose_says_so() {
+        assert!(!review_discloses(&preview()));
+        let change = SendPreview {
+            change: ChangeDestination::Spending { amount: sat(1) },
+            ..preview()
+        };
+        assert!(review_discloses(&change));
+        let input = SendPreview {
+            inputs: vec![SendInput {
+                outpoint_or_note: "notes".into(),
+                amount: sat(1_010),
+                tag: None,
+            }],
+            ..preview()
+        };
+        assert!(review_discloses(&input));
+    }
+
+    #[test]
+    fn a_review_names_its_fee_and_the_real_debit() {
+        assert_eq!(fee_label(WalletKind::Spending), "Fee");
+        assert_eq!(fee_label(WalletKind::Saving), "Network fee");
+        assert_eq!(review_total(&preview()), format::btc_exact(sat(1_010)));
+    }
 
     #[test]
     fn proxy_caption_states_the_limit() {
