@@ -382,8 +382,13 @@ impl RealBackend {
         // The lock comes first: it decides who may touch the seed and the store.
         let lock = DataDirLock::acquire(&dir)?;
         let seed_is_new = !Seed::exists(&dir, &lock);
+        let db = dir.join(DB_FILE);
+        // Before `load_or_create`: a new seed cannot open what the old one made.
+        if seed_is_new && db.exists() && Store::open(&db)?.holds_a_wallet()? {
+            return Err(Seed::missing(&dir));
+        }
         let seed = Seed::load_or_create(&dir, &lock)?;
-        let store = Store::open(&dir.join(DB_FILE))?;
+        let store = Store::open(&db)?;
         store.bind_network(config.network)?;
         let seed_born_with_store = store.seed_born_with_store(seed_is_new)?;
         let gate = Gate::of(&store.settings()?);

@@ -1695,6 +1695,59 @@ async fn a_seed_born_with_its_store_joins_fresh_also_after_a_restart() {
     backend.shutdown().await.unwrap();
 }
 
+/// What refusing a folder whose seed is gone must look like.
+async fn assert_refused_for_a_missing_seed(harness: &Harness) {
+    let seed = harness.dir.path().join("seed");
+    std::fs::remove_file(&seed).unwrap();
+    let reply = harness.open().await;
+    let Err(FedimixError::Internal(sentence)) = &reply else {
+        panic!("started without its seed: {:?}", reply.map(|_| ()));
+    };
+    assert!(sentence.contains(seed.to_str().unwrap()), "{sentence}");
+    assert!(sentence.contains("Restore"), "{sentence}");
+    assert!(!seed.exists(), "no new seed may take the old one's place");
+}
+
+#[tokio::test]
+async fn a_missing_seed_beside_a_joined_store_is_refused_not_replaced() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    let words = std::fs::read_to_string(harness.dir.path().join("seed")).unwrap();
+
+    assert_refused_for_a_missing_seed(&harness).await;
+
+    // The file coming back is all it takes.
+    let seed = harness.dir.path().join("seed");
+    std::fs::write(&seed, &words).unwrap();
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let backend = harness.open().await.unwrap();
+    assert_eq!(backend.recovery_words().await.unwrap(), words);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missing_seed_beside_a_store_with_no_federation_is_refused() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    assert_refused_for_a_missing_seed(&harness).await;
+}
+
+#[tokio::test]
+async fn a_lost_seed_and_store_start_a_new_wallet() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    lose_store(&harness);
+    std::fs::remove_file(harness.dir.path().join("seed")).unwrap();
+    let backend = harness.open().await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
 /// 200 sat. The fake needs `add_invoice` to know one; this one is lexically real.
 const INVOICE: &str = "lnbcrt2000n1abc";
 const ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";

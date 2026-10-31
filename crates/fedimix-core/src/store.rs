@@ -583,6 +583,18 @@ impl Store {
         Ok(value == "true")
     }
 
+    /// Whether a wallet has lived here: a federation, or a seed once recorded.
+    pub(crate) fn holds_a_wallet(&self) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM federations)
+                     OR EXISTS (SELECT 1 FROM meta WHERE key = 'seed_born_with_store')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+    }
+
     pub(crate) fn add_watch(&self, watch: &Watch) -> Result<()> {
         insert_watch(&self.conn, watch)
     }
@@ -997,6 +1009,17 @@ mod tests {
         let (_d, store) = open();
         assert!(!store.seed_born_with_store(false).unwrap());
         assert!(!store.seed_born_with_store(true).unwrap());
+    }
+
+    #[test]
+    fn a_wallet_shows_by_its_seed_record_or_a_federation() {
+        let (_d, store) = open();
+        assert!(!store.holds_a_wallet().unwrap());
+        store.seed_born_with_store(true).unwrap();
+        assert!(store.holds_a_wallet().unwrap());
+        let (_d, store) = open();
+        store.add_federation(&federation("f")).unwrap();
+        assert!(store.holds_a_wallet().unwrap());
     }
 
     #[test]
