@@ -755,6 +755,8 @@ mod tests {
             incoming: false,
             status: HistoryStatus::Pending,
             timestamp,
+            txid: None,
+            fee: None,
         }
     }
 

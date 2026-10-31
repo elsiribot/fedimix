@@ -39,6 +39,11 @@ fn recovery_mark(federation: &str) -> String {
     format!("recovering:{federation}")
 }
 
+/// A fee of zero is one that was not named.
+pub(super) fn paid_fee(fee: Amount) -> Option<Amount> {
+    (fee != Amount::ZERO).then_some(fee)
+}
+
 fn incoming(
     id: &str,
     kind: HistoryKind,
@@ -53,6 +58,8 @@ fn incoming(
         incoming: true,
         status,
         timestamp: at,
+        txid: None,
+        fee: None,
     }
 }
 
@@ -235,13 +242,11 @@ impl Core {
                 };
                 Some(incoming(&watch.id, kind, *amount, status, now))
             }
-            WatchUpdate::Settled { amount, .. } => Some(incoming(
-                &watch.id,
-                kind,
-                *amount,
-                HistoryStatus::Complete,
-                now,
-            )),
+            WatchUpdate::Settled { amount, fee, txid } => Some(HistoryItem {
+                fee: paid_fee(*fee),
+                txid: txid.clone(),
+                ..incoming(&watch.id, kind, *amount, HistoryStatus::Complete, now)
+            }),
             // These name no amount, so they can only update a row. A deposit
             // watch that has none saw no deposit.
             WatchUpdate::Expired | WatchUpdate::Refunded | WatchUpdate::Failed { .. } => {
@@ -443,13 +448,17 @@ async fn follow_deposits(
         } else {
             HistoryStatus::Pending
         };
-        let item = incoming(
-            &event.id,
-            HistoryKind::Deposit,
-            event.amount,
-            status,
-            (core.clock)(),
-        );
+        let item = HistoryItem {
+            fee: paid_fee(event.fee),
+            txid: event.txid,
+            ..incoming(
+                &event.id,
+                HistoryKind::Deposit,
+                event.amount,
+                status,
+                (core.clock)(),
+            )
+        };
         let saved = core.record(federation, &item).and_then(|()| {
             core.store()
                 .set_cursor(&deposits_cursor(federation), event.cursor)

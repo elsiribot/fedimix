@@ -14,6 +14,7 @@ use std::time::Duration;
 
 #[cfg(feature = "testing")]
 use super::held;
+use super::receive::paid_fee;
 use super::{Core, saving_not_set_up};
 use crate::api::*;
 use crate::destination::{DestinationKind, parse_destination, requested_amount, validate_address};
@@ -258,6 +259,8 @@ impl Core {
             incoming: false,
             status: HistoryStatus::Pending,
             timestamp: now,
+            txid: None,
+            fee: Some(quote.fee()),
         };
         let watch = Watch {
             id: intent.clone(),
@@ -327,13 +330,22 @@ impl Core {
         status: HistoryStatus,
         state: OperationState,
     ) -> Result<()> {
+        self.finish_row(watch, |row| HistoryItem { status, ..row }, state)
+    }
+
+    fn finish_row(
+        &self,
+        watch: &Watch,
+        finished: impl FnOnce(HistoryItem) -> HistoryItem,
+        state: OperationState,
+    ) -> Result<()> {
         let federation = &watch.federation_id;
         let row = self
             .store()
             .history_item(WalletKind::Spending, Some(federation), &watch.id)?;
         let history_id = row.as_ref().map(|row| row.id.clone());
         if let Some(row) = row {
-            self.record(federation, &HistoryItem { status, ..row })?;
+            self.record(federation, &finished(row))?;
         }
         self.store().finish_watch(&watch.id)?;
         self.report(&watch.id, state, history_id);
@@ -350,11 +362,20 @@ impl Core {
     }
 
     /// `watch` is keyed on the intent, as the row is. The amount stays the one
-    /// the row was written with: what was sent, as previewed.
+    /// the row was written with: what was sent, as previewed. So does the fee,
+    /// unless the operation names one: details that cannot be read report zero.
     pub(super) fn apply_send(&self, watch: &Watch, update: &WatchUpdate) -> Result<()> {
         let (status, state) = match update {
             WatchUpdate::Confirming { .. } => return Ok(()),
-            WatchUpdate::Settled { .. } => (HistoryStatus::Complete, OperationState::Done),
+            WatchUpdate::Settled { fee, txid, .. } => {
+                let finished = |row: HistoryItem| HistoryItem {
+                    status: HistoryStatus::Complete,
+                    fee: paid_fee(*fee).or(row.fee),
+                    txid: txid.clone().or(row.txid.clone()),
+                    ..row
+                };
+                return self.finish_row(watch, finished, OperationState::Done);
+            }
             WatchUpdate::Refunded => (HistoryStatus::Refunded, failed_with(CAME_BACK)),
             WatchUpdate::Expired => (HistoryStatus::Failed, failed_with(EXPIRED)),
             WatchUpdate::Failed { reason } => (HistoryStatus::Failed, failed_with(reason)),

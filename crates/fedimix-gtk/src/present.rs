@@ -32,6 +32,8 @@ pub struct HistoryRowView {
     pub amount: String,
     pub trailing: String,
     pub nested: Option<String>,
+    /// Fee and transaction, to read or copy.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,7 +276,19 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         amount: format::signed(item.amount, item.incoming),
         trailing,
         nested,
+        detail: history_detail(item),
     }
+}
+
+/// Only a finished row has a fee that was paid.
+fn history_detail(item: &HistoryItem) -> Option<String> {
+    if item.status != HistoryStatus::Complete {
+        return None;
+    }
+    let fee = item.fee.map(|fee| format!("Fee {}", format::sats(fee)));
+    let txid = item.txid.as_ref().map(|txid| format!("Txid {txid}"));
+    let parts: Vec<String> = fee.into_iter().chain(txid).collect();
+    (!parts.is_empty()).then(|| parts.join(&format!(" {DOT} ")))
 }
 
 pub fn queue_row(item: &QueueItem, anonymity_target: u32) -> QueueRowView {
@@ -758,6 +772,8 @@ mod tests {
             incoming,
             status,
             timestamp: 1_793_356_920,
+            txid: None,
+            fee: None,
         }
     }
 
@@ -1180,6 +1196,40 @@ mod tests {
         let sp = spending(0.05, 0.42, 0.05, false);
         assert!(saving_banner(&sp, true).is_some());
         assert_eq!(saving_banner(&sp, false), None);
+    }
+
+    #[test]
+    fn a_finished_row_shows_its_fee_and_txid() {
+        let done = HistoryItem {
+            txid: Some("abc".into()),
+            fee: Some(sat(300)),
+            ..hist(
+                HistoryKind::Sent { change: None },
+                false,
+                HistoryStatus::Complete,
+            )
+        };
+        assert_eq!(
+            history_row(&done, 0).detail.as_deref(),
+            Some("Fee 300 sat \u{b7} Txid abc")
+        );
+        let lightning = HistoryItem {
+            txid: None,
+            ..done.clone()
+        };
+        assert_eq!(
+            history_row(&lightning, 0).detail.as_deref(),
+            Some("Fee 300 sat")
+        );
+        let failed = HistoryItem {
+            status: HistoryStatus::Failed,
+            ..done
+        };
+        assert_eq!(
+            history_row(&failed, 0).detail,
+            None,
+            "that fee was not paid"
+        );
     }
 
     #[test]

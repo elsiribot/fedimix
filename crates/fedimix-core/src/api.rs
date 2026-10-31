@@ -198,6 +198,12 @@ pub struct HistoryItem {
     pub incoming: bool,
     pub status: HistoryStatus,
     pub timestamp: Timestamp,
+    /// The on-chain transaction, once there is one.
+    #[serde(default)]
+    pub txid: Option<String>,
+    /// What this cost on top of `amount`, or took from it when incoming.
+    #[serde(default)]
+    pub fee: Option<Amount>,
 }
 
 /// One page of history, newest first.
@@ -568,6 +574,26 @@ mod tests {
         old.as_object_mut().unwrap().remove("recovery_words_shown");
         let loaded: Settings = serde_json::from_value(old).unwrap();
         assert!(!loaded.recovery_words_shown);
+    }
+
+    #[test]
+    fn a_stored_history_row_without_the_new_fields_loads() {
+        let item = HistoryItem {
+            id: "old".into(),
+            kind: HistoryKind::Paid,
+            amount: Amount::from_sat(1),
+            incoming: false,
+            status: HistoryStatus::Complete,
+            timestamp: 1,
+            txid: Some("t".into()),
+            fee: Some(Amount::from_sat(1)),
+        };
+        let mut old = serde_json::to_value(&item).unwrap();
+        for field in ["txid", "fee"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        let loaded: HistoryItem = serde_json::from_value(old).unwrap();
+        assert_eq!((loaded.txid, loaded.fee), (None, None));
     }
 
     #[test]

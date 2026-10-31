@@ -413,6 +413,8 @@ impl State {
             incoming,
             status: HistoryStatus::Complete,
             timestamp: BASE_TS,
+            txid: None,
+            fee: None,
         }
     }
 

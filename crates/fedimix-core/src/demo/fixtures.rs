@@ -94,6 +94,7 @@ fn hist(
     status: HistoryStatus,
     age_secs: u64,
 ) -> HistoryItem {
+    let on_chain = matches!(kind, HistoryKind::Sent { .. });
     HistoryItem {
         id: id.to_string(),
         kind,
@@ -101,6 +102,8 @@ fn hist(
         incoming,
         status,
         timestamp: BASE_TS - age_secs,
+        txid: on_chain.then(|| format!("{age_secs:064x}")),
+        fee: on_chain.then_some(Amount::from_sat(300)),
     }
 }
 
@@ -363,6 +366,8 @@ fn long_history_rows(prefix: &str, spending: bool) -> Vec<HistoryItem> {
                 incoming,
                 status: HistoryStatus::Complete,
                 timestamp: BASE_TS - (n as u64 + 1) * 5 * HOUR,
+                txid: None,
+                fee: None,
             }
         })
         .collect()

@@ -91,6 +91,20 @@ fn build_row(item: &HistoryRowView) -> gtk::ListBoxRow {
         nested_label.add_css_class("caption");
         content.append(&nested_label);
     }
+    if let Some(detail) = &item.detail {
+        // Selectable, as a recipient may ask for the txid.
+        let detail_label = gtk::Label::builder()
+            .label(detail)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Char)
+            .selectable(true)
+            .margin_start(28)
+            .build();
+        detail_label.add_css_class("dim-label");
+        detail_label.add_css_class("caption");
+        content.append(&detail_label);
+    }
     gtk::ListBoxRow::builder()
         .child(&content)
         .activatable(false)

@@ -2325,6 +2325,77 @@ async fn on_chain_preview(backend: &dyn Backend) -> SendPreview {
         .unwrap()
 }
 
+/// Confirms an on-chain preview and returns its intent and operation.
+async fn withdrawn(harness: &Harness, backend: &dyn Backend) -> (String, String) {
+    let preview = on_chain_preview(backend).await;
+    let intent = backend.confirm_send(preview.id).await.unwrap();
+    let first = &harness.first;
+    within("the operation", async {
+        loop {
+            if let Some(operation) = first.find_operation(&intent).await.unwrap() {
+                return (intent.clone(), operation);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_settled_withdrawal_keeps_its_fee_and_txid() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(2_000)).await;
+    let (intent, operation) = withdrawn(&harness, &*backend).await;
+    let row = row_of(&rows(&*backend).await, &intent);
+    assert_eq!(row.fee, Some(sat(300)), "the fee shown, until a better one");
+    assert_eq!(row.txid, None);
+
+    harness.first.push_update(
+        &operation,
+        WatchUpdate::Settled {
+            amount: sat(500),
+            fee: sat(290),
+            txid: Some("txid".into()),
+        },
+    );
+    wait_status(&*backend, &intent, HistoryStatus::Complete).await;
+    let row = row_of(&rows(&*backend).await, &intent);
+    assert_eq!(row.fee, Some(sat(290)));
+    assert_eq!(row.txid.as_deref(), Some("txid"));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_send_with_unreadable_details_keeps_the_fee_it_was_shown() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(2_000)).await;
+    let (intent, operation) = withdrawn(&harness, &*backend).await;
+    harness.first.push_update(
+        &operation,
+        WatchUpdate::Settled {
+            amount: Amount::ZERO,
+            fee: Amount::ZERO,
+            txid: None,
+        },
+    );
+    wait_status(&*backend, &intent, HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, &intent).fee, Some(sat(300)));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deposit_row_keeps_its_fee_and_txid() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    let backend = harness.joined().await;
+    harness.first.push_deposit(deposit_event(1, "first", true));
+    wait_status(&*backend, "first", HistoryStatus::Complete).await;
+    let row = row_of(&rows(&*backend).await, "first");
+    assert_eq!(row.fee, Some(sat(100)));
+    assert_eq!(row.txid.as_deref(), Some("txid"));
+    backend.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_higher_fee_at_confirm_expires_the_preview() {
     let harness = Harness::new();
