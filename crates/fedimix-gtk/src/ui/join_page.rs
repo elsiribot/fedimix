@@ -156,6 +156,7 @@ impl Inner {
                 let Some(inner) = weak.upgrade() else { return };
                 for fed in list {
                     let row = adw::ActionRow::builder()
+                        .use_markup(false)
                         .title(&fed.name)
                         .subtitle("Suggested")
                         .build();
@@ -199,7 +200,10 @@ impl Inner {
                 if let Some(inner) = weak.upgrade() {
                     inner.set_busy(false);
                     match &res {
-                        Ok(_) => {
+                        Ok(info) => {
+                            if let Some(notice) = present::join_notice(info) {
+                                ctx.toast(&notice);
+                            }
                             if let Some(f) = inner.on_joined.borrow().as_ref() {
                                 f();
                             }

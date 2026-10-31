@@ -11,6 +11,7 @@ fn split(balance: Amount, target: Amount) -> (Amount, Amount) {
 
 pub(super) fn spending_state(
     federation: Option<FederationInfo>,
+    total_balance: Amount,
     target: Amount,
     notes: Vec<NoteBucket>,
     history: Vec<HistoryItem>,
@@ -20,6 +21,7 @@ pub(super) fn spending_state(
     SpendingState {
         federation,
         balance,
+        total_balance,
         target,
         for_spending,
         moving,

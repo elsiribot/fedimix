@@ -213,6 +213,7 @@ impl Core {
             // Nothing runs behind a closed gate, so say offline instead.
             recovering: open && recovering,
             problem: open_error.filter(|_| open).and_then(|e| problem_of(&e)),
+            has_lightning: row.has_lightning,
         }
     }
 
@@ -263,14 +264,21 @@ impl Core {
         Ok(Reached::Joined(preview, client))
     }
 
-    fn new_row(&self, id: &str, name: String, invite: &str, balance: Amount) -> FederationRow {
+    fn new_row(&self, preview: FederationPreview, invite: &str, balance: Amount) -> FederationRow {
+        let FederationPreview {
+            id,
+            name,
+            has_lightning,
+            ..
+        } = preview;
         FederationRow {
-            id: id.to_string(),
+            id,
             name,
             invite: invite.to_string(),
             online_at: Some((self.clock)()),
             balance_msat: balance.msat,
             joined_session: None,
+            has_lightning,
         }
     }
 
@@ -292,7 +300,7 @@ impl Core {
                 return self.federation(&id);
             }
             Reached::Unjoined(preview) => {
-                let row = self.new_row(&preview.id, preview.name, invite, Amount::ZERO);
+                let row = self.new_row(preview, invite, Amount::ZERO);
                 self.store().add_federation(&row)?;
                 supervisors.push(tokio::spawn(supervise(Arc::clone(self), row.id.clone())));
                 self.events.emit(&Event::FederationChanged);
@@ -309,8 +317,9 @@ impl Core {
             .inspect_err(|e| eprintln!("fedimix: reading the session count of {id}: {e}"))
             .ok();
         let row = FederationRow {
+            id: id.clone(),
             joined_session,
-            ..self.new_row(&id, preview.name, invite, balance)
+            ..self.new_row(preview, invite, balance)
         };
         let added = self.store().add_federation(&row);
         if let Err(e) = added {
@@ -473,9 +482,13 @@ impl Backend for RealBackend {
                 store.settings()?.spending_target,
             )
         };
+        let total_balance = rows.iter().fold(Amount::ZERO, |total, row| Amount {
+            msat: total.msat.saturating_add(row.balance_msat),
+        });
         let Some(row) = rows.iter().find(|row| Some(&row.id) == active.as_ref()) else {
             return Ok(spending::spending_state(
                 None,
+                total_balance,
                 target,
                 Vec::new(),
                 Vec::new(),
@@ -494,6 +507,7 @@ impl Backend for RealBackend {
         )?;
         Ok(spending::spending_state(
             Some(federation),
+            total_balance,
             target,
             notes,
             history,

@@ -211,7 +211,7 @@ impl Inner {
         self.hint.set_visible(hint.is_some());
         self.hint.set_label(hint.as_deref().unwrap_or(""));
         self.backup.set_revealed(present::backup_banner(
-            s.spending.balance,
+            s.spending.total_balance,
             s.recovery_words_shown,
         ));
         if self.last.borrow().as_ref() == Some(&s.spending) {

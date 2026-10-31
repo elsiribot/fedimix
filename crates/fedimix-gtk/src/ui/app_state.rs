@@ -45,6 +45,13 @@ pub struct AppContext {
     shared: Rc<Shared>,
 }
 
+/// Messages can quote what a federation sent, so they are not markup.
+fn plain_toast(message: &str) -> adw::Toast {
+    let toast = adw::Toast::new(message);
+    toast.set_use_markup(false);
+    toast
+}
+
 impl AppContext {
     pub fn new(
         bridge: CoreBridge,
@@ -82,7 +89,7 @@ impl AppContext {
     }
 
     pub fn toast(&self, message: &str) {
-        self.toasts.add_toast(adw::Toast::new(message));
+        self.toasts.add_toast(plain_toast(message));
     }
 
     /// Claim the single Refill dialog; `false` if one is already up.
@@ -97,7 +104,7 @@ impl AppContext {
     /// Show `message` now, ahead of any toast on screen. For outcomes, which
     /// must not wait behind "started".
     pub fn toast_now(&self, message: &str) {
-        let toast = adw::Toast::new(message);
+        let toast = plain_toast(message);
         toast.set_priority(adw::ToastPriority::High);
         self.toasts.add_toast(toast);
     }

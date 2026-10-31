@@ -519,6 +519,18 @@ impl FakePort {
         self.add_federation_on(invite, id, Some(network))
     }
 
+    pub fn add_federation_without_lightning(
+        &self,
+        invite: &str,
+        id: &str,
+        network: Network,
+    ) -> Arc<FakeClient> {
+        let client = self.add_federation(invite, id, network);
+        let mut invites = self.invites.lock().unwrap();
+        invites.get_mut(invite).expect("just added").0.has_lightning = false;
+        client
+    }
+
     /// `None` is a federation that names no network Fedimix knows.
     pub fn add_federation_on(
         &self,

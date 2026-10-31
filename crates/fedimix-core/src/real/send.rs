@@ -179,6 +179,7 @@ impl Core {
             destination: destination.normalized,
             amount: quote.amount(),
             fee: quote.fee(),
+            federation: Some(federation.clone()),
             inputs: Vec::new(),
             change: ChangeDestination::None,
             expires_at: (self.clock)() + PREVIEW_TTL,

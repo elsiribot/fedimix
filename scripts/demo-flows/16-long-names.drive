@@ -18,3 +18,8 @@ shot spending
 click Refill from Saving
 expect Refill Spending
 shot refill
+close-dialog
+# A name from a federation is plain text, not markup.
+action app.settings
+expect Community & Mutual-Aid
+shot settings

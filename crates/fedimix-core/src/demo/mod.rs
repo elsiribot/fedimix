@@ -842,6 +842,7 @@ impl Backend for DemoBackend {
             saving_ready: st.saving_ready,
             notes: st.notes(),
             history: newest(&st.spending_history),
+            total_balance: st.spending_balance,
             features: Features::ALL,
         })
     }
@@ -1068,6 +1069,9 @@ impl Backend for DemoBackend {
             destination,
             amount,
             fee,
+            federation: (wallet == WalletKind::Spending)
+                .then(|| st.federation.as_ref().map(|f| f.id.clone()))
+                .flatten(),
             inputs,
             change,
             expires_at: self.preview_expiry(),

@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::api::{HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind};
 use crate::error::{FedimixError, Result};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -21,7 +21,8 @@ CREATE TABLE federations (
     balance_msat INTEGER NOT NULL,
     active INTEGER NOT NULL DEFAULT 0,
     position INTEGER NOT NULL,
-    joined_session INTEGER
+    joined_session INTEGER,
+    has_lightning INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE history (
     wallet TEXT NOT NULL,
@@ -82,6 +83,12 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
         2 => tx
             .execute_batch("ALTER TABLE federations ADD COLUMN joined_session INTEGER;")
             .map_err(db_err),
+        // Rows from before this were never asked, and warning is the rare case.
+        3 => tx
+            .execute_batch(
+                "ALTER TABLE federations ADD COLUMN has_lightning INTEGER NOT NULL DEFAULT 1;",
+            )
+            .map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -98,6 +105,7 @@ pub(crate) struct FederationRow {
     pub balance_msat: u64,
     /// The federation's session count at the join, if it could be read.
     pub joined_session: Option<u64>,
+    pub has_lightning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,7 +348,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, invite, online_at, balance_msat, joined_session
+                "SELECT id, name, invite, online_at, balance_msat, joined_session, has_lightning
                  FROM federations ORDER BY position",
             )
             .map_err(db_err)?;
@@ -353,6 +361,7 @@ impl Store {
                     online_at: r.get::<_, Option<i64>>(3)?.map(from_db),
                     balance_msat: from_db(r.get(4)?),
                     joined_session: r.get::<_, Option<i64>>(5)?.map(from_db),
+                    has_lightning: r.get(6)?,
                 })
             })
             .map_err(db_err)?;
@@ -365,21 +374,24 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO federations
-                    (id, name, invite, online_at, balance_msat, joined_session, position, active)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                    (id, name, invite, online_at, balance_msat, joined_session, has_lightning,
+                     position, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                     (SELECT COALESCE(MAX(position), 0) + 1 FROM federations),
                     NOT EXISTS (SELECT 1 FROM federations WHERE active = 1))
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, invite = excluded.invite,
                     online_at = excluded.online_at, balance_msat = excluded.balance_msat,
-                    joined_session = COALESCE(joined_session, excluded.joined_session)",
+                    joined_session = COALESCE(joined_session, excluded.joined_session),
+                    has_lightning = excluded.has_lightning",
                 params![
                     row.id,
                     row.name,
                     row.invite,
                     row.online_at.map(to_db),
                     to_db(row.balance_msat),
-                    row.joined_session.map(to_db)
+                    row.joined_session.map(to_db),
+                    row.has_lightning
                 ],
             )
             .map_err(db_err)?;
@@ -806,6 +818,7 @@ mod tests {
                     online_at: Some(5),
                     balance_msat: 2_100_000_000_000_000_000,
                     joined_session: None,
+                    has_lightning: true,
                 })
                 .unwrap();
             store.set_active("f1").unwrap();
@@ -1139,6 +1152,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE watches DROP COLUMN operation;
                      ALTER TABLE federations DROP COLUMN joined_session;
+                     ALTER TABLE federations DROP COLUMN has_lightning;
                      UPDATE schema_version SET version = 1;",
                 )
                 .unwrap();
@@ -1160,12 +1174,14 @@ mod tests {
                 .conn
                 .execute_batch(
                     "ALTER TABLE federations DROP COLUMN joined_session;
+                     ALTER TABLE federations DROP COLUMN has_lightning;
                      UPDATE schema_version SET version = 2;",
                 )
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.federations().unwrap()[0].joined_session, None);
+        assert!(store.federations().unwrap()[0].has_lightning);
     }
 
     #[test]
@@ -1217,6 +1233,7 @@ mod tests {
             online_at: None,
             balance_msat: 0,
             joined_session: None,
+            has_lightning: true,
         }
     }
 

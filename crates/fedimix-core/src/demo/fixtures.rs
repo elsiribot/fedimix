@@ -13,7 +13,7 @@ pub const FEDERATION_ID: &str = "demo-fed-alpha";
 pub const DEVICE_NAME: &str = "Ledger Nano S+";
 pub const DEVICE_ID: &str = "demo-ledger-0";
 /// Wraps only where a line must break: no spaces for most of its length.
-const LONG_FEDERATION: &str = "The-Extraordinarily-Long-Named-Community-Mutual-Aid-Federation \
+const LONG_FEDERATION: &str = "The-Extraordinarily-Long-Named-Community & Mutual-Aid-Federation \
 of the Greater Metropolitan Area and All of Its Surrounding Districts";
 const LONG_DEVICE: &str = "Ledger Nano S Plus Limited Anniversary Edition Hardware Wallet \
 With An Unreasonably Long Display Name";
@@ -59,6 +59,7 @@ pub fn federation(online: bool) -> FederationInfo {
         balance: Amount::ZERO,
         recovering: false,
         problem: None,
+        has_lightning: true,
     }
 }
 

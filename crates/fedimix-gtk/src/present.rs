@@ -167,6 +167,23 @@ pub fn backup_banner(balance: Amount, words_shown: bool) -> bool {
     balance > Amount::ZERO && !words_shown
 }
 
+/// Under a federation's name in Settings: what it holds, how it is doing, and
+/// its id, as a name is all a federation chooses for itself.
+pub fn federation_subtitle(f: &FederationInfo) -> String {
+    let status = match (&f.problem, f.online) {
+        (Some(problem), _) => problem.as_str(),
+        (None, true) => "Online",
+        (None, false) => "Offline",
+    };
+    format!("{} {DOT} {status}\n{}", format::btc(f.balance), f.id)
+}
+
+/// What to say once a join has worked, if anything.
+pub fn join_notice(f: &FederationInfo) -> Option<String> {
+    (!f.has_lightning)
+        .then(|| "This federation has no Lightning: only on-chain works here.".to_string())
+}
+
 /// The Join page's text. Without suggestions the invite is the only way in.
 pub fn join_description(has_suggestions: bool) -> &'static str {
     if has_suggestions {
@@ -758,6 +775,7 @@ mod tests {
             for_spending: btc(for_spending),
             moving: btc(moving),
             saving_ready: ready,
+            total_balance: Amount::ZERO,
             features: Features::ALL,
             notes: vec![],
             history: vec![],
@@ -1233,6 +1251,56 @@ mod tests {
         );
     }
 
+    fn federation_info() -> FederationInfo {
+        FederationInfo {
+            id: "abc123".into(),
+            name: "Bob & Alice".into(),
+            online: true,
+            anonymity_estimate: 0,
+            balance: sat(1_230_000),
+            recovering: false,
+            problem: None,
+            has_lightning: true,
+        }
+    }
+
+    #[test]
+    fn a_federation_row_says_what_it_holds_and_which_one_it_is() {
+        assert_eq!(
+            federation_subtitle(&federation_info()),
+            "0.0123 BTC \u{b7} Online\nabc123"
+        );
+        let offline = FederationInfo {
+            online: false,
+            ..federation_info()
+        };
+        assert_eq!(
+            federation_subtitle(&offline),
+            "0.0123 BTC \u{b7} Offline\nabc123"
+        );
+        let broken = FederationInfo {
+            problem: Some("It broke.".into()),
+            ..offline
+        };
+        assert_eq!(
+            federation_subtitle(&broken),
+            "0.0123 BTC \u{b7} It broke.\nabc123"
+        );
+    }
+
+    #[test]
+    fn a_join_without_lightning_says_so() {
+        assert_eq!(join_notice(&federation_info()), None);
+        let dark = FederationInfo {
+            has_lightning: false,
+            ..federation_info()
+        };
+        assert_eq!(
+            join_notice(&dark).as_deref(),
+            Some("This federation has no Lightning: only on-chain works here.")
+        );
+    }
+
     #[test]
     fn the_recovery_warning_promises_only_what_is_true() {
         assert!(RECOVERY_WARNING.contains("cannot restore a wallet from them alone"));
@@ -1252,6 +1320,7 @@ mod tests {
             balance: Amount::ZERO,
             recovering,
             problem: None,
+            has_lightning: true,
         };
         assert_eq!(connection_banner(None), None);
         assert_eq!(connection_banner(Some(&fed(true, false))), None);

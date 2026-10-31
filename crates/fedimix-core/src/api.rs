@@ -154,6 +154,8 @@ pub struct FederationInfo {
     /// A sentence on why this federation cannot be reached, when waiting will
     /// not cure it. `None` covers plain offline, which `online` says.
     pub problem: Option<String>,
+    /// It runs Lightning, so Spending can pay and receive over it here.
+    pub has_lightning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,6 +281,8 @@ impl Features {
 pub struct SpendingState {
     pub federation: Option<FederationInfo>,
     pub balance: Amount,
+    /// What every joined federation holds, the active one included.
+    pub total_balance: Amount,
     pub target: Amount,
     pub for_spending: Amount,
     pub moving: Amount,
@@ -376,6 +380,9 @@ pub struct SendPreview {
     pub destination: String,
     pub amount: Amount,
     pub fee: Amount,
+    /// The id of the federation this pays from, whichever is active by the time
+    /// it is confirmed. `None` for Saving.
+    pub federation: Option<String>,
     pub inputs: Vec<SendInput>,
     pub change: ChangeDestination,
     pub expires_at: Timestamp,

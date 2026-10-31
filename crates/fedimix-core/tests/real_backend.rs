@@ -2486,6 +2486,49 @@ async fn a_deposit_settles_with_an_unreadable_session_count() {
 }
 
 #[tokio::test]
+async fn a_preview_names_the_federation_it_spends_from() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(2_000)).await;
+    let preview = on_chain_preview(&*backend).await;
+    assert_eq!(preview.federation.as_deref(), Some("one"));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_federation_keeps_saying_whether_it_has_lightning() {
+    let harness = Harness::new();
+    harness
+        .port
+        .add_federation_without_lightning("fed1dark", "dark", Network::Regtest);
+    let backend = harness.joined().await;
+    assert!(backend.federations().await.unwrap()[0].has_lightning);
+    let joined = backend.join_federation("fed1dark".into()).await.unwrap();
+    assert!(!joined.has_lightning);
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = harness.open().await.unwrap();
+    let rows = backend.federations().await.unwrap();
+    assert!(!rows.iter().find(|f| f.id == "dark").unwrap().has_lightning);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_snapshot_totals_every_federation() {
+    let harness = Harness::new();
+    harness.first.set_balance(sat(1_000));
+    harness.second.set_balance(sat(500));
+    let backend = harness.joined().await;
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    wait_until("both balances", || async {
+        backend.spending_state().await.unwrap().total_balance == sat(1_500)
+    })
+    .await;
+    assert_eq!(backend.spending_state().await.unwrap().balance, sat(1_000));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_higher_fee_at_confirm_expires_the_preview() {
     let harness = Harness::new();
     let backend = funded(&harness, sat(1_000)).await;

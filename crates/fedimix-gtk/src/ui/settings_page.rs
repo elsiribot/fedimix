@@ -577,8 +577,10 @@ impl Inner {
             }
             radio.set_active(Some(fed.id.as_str()) == active);
             let row = adw::ActionRow::builder()
+                // The name comes from the federation, so it is not markup.
+                .use_markup(false)
                 .title(&fed.name)
-                .subtitle(if fed.online { "Online" } else { "Offline" })
+                .subtitle(present::federation_subtitle(fed))
                 .activatable_widget(&radio)
                 .build();
             row.add_prefix(&radio);
