@@ -963,6 +963,94 @@ async fn lost_client_db_recovers_balance() {
     backend.shutdown().await.unwrap();
 }
 
+/// This run's guardians, stopped with SIGSTOP until dropped, also on a panic. A
+/// stopped guardian answers nothing, which is the hard case of a dead federation,
+/// and it comes back, so the tests after this one still have a federation.
+/// Only processes under this run's `FM_TEST_DIR`, by exact pid.
+struct StoppedGuardians(Vec<String>);
+
+impl StoppedGuardians {
+    fn new() -> Self {
+        let test_dir = std::env::var("FM_TEST_DIR").expect("FM_TEST_DIR is set by devimint");
+        let marker = format!("FM_DATA_DIR={test_dir}/");
+        let pids: Vec<String> = std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+            .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|pid| {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"));
+                let environ = std::fs::read(format!("/proc/{pid}/environ"));
+                comm.is_ok_and(|comm| comm.contains("fedimintd"))
+                    && environ.is_ok_and(|e| String::from_utf8_lossy(&e).contains(&marker))
+            })
+            .collect();
+        assert!(!pids.is_empty(), "no guardian of this run was found");
+        Self::signal("STOP", &pids);
+        Self(pids)
+    }
+
+    fn signal(signal: &str, pids: &[String]) {
+        let status = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .args(pids)
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -{signal} {pids:?}");
+    }
+}
+
+impl Drop for StoppedGuardians {
+    fn drop(&mut self) {
+        Self::signal("CONT", &self.0);
+    }
+}
+
+/// Fedimix starts and reads with no guardian answering, and connects once they
+/// are back. A hung `open` is the supervisor's: nothing here may wait for it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn a_stopped_federation_leaves_the_wallet_readable() {
+    const READ_LIMIT: Duration = Duration::from_secs(2);
+    let (_dir, config) = folder();
+    let backend = joined_backend(&config).await;
+    let events = backend.subscribe();
+    pay_backend_with_lnd(&backend, 10_000).await;
+    wait_received(&backend, &events).await;
+    let balance = wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let stopped = StoppedGuardians::new();
+    let backend = tokio::time::timeout(READ_LIMIT, RealBackend::open(config))
+        .await
+        .expect("opening waits for no federation")
+        .unwrap();
+    // Longer than a first connection attempt takes when guardians answer.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let state = tokio::time::timeout(READ_LIMIT, backend.spending_state())
+        .await
+        .expect("a read waits for no federation")
+        .unwrap();
+    let federation = state.federation.unwrap();
+    assert!(!federation.online);
+    assert_eq!(federation.problem, None, "waiting cures this");
+    assert_eq!(state.balance, balance);
+    let request = ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::OnChain,
+    };
+    let asked = tokio::time::timeout(READ_LIMIT, backend.receive(request))
+        .await
+        .expect("a refusal waits for no federation");
+    assert_eq!(asked.err(), Some(FedimixError::Offline));
+
+    drop(stopped);
+    tokio::time::timeout(Duration::from_secs(180), connected_with(&backend, balance))
+        .await
+        .expect("the federation came back");
+    backend.shutdown().await.unwrap();
+}
+
 /// The manual restore the README documents: the words in a new folder's `seed`,
 /// then a join with the invite code. The old folder is never run again.
 #[tokio::test(flavor = "multi_thread")]

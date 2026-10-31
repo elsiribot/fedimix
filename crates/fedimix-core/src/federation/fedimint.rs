@@ -176,6 +176,15 @@ fn wrong_currency() -> FedimixError {
     FedimixError::InvalidDestination("This invoice belongs to a different Bitcoin network.".into())
 }
 
+/// The pay-time check in `validate_send_invoice` is the second guard: this one
+/// gives the sentence, before anything is quoted.
+fn check_currency(invoice: &Bolt11Invoice, network: Option<bitcoin::Network>) -> Result<()> {
+    match network {
+        Some(network) if invoice.currency() != Currency::from(network) => Err(wrong_currency()),
+        _ => Ok(()),
+    }
+}
+
 fn parse_invoice(invoice: &str) -> Result<Bolt11Invoice> {
     Bolt11Invoice::from_str(invoice).map_err(|_| {
         FedimixError::InvalidDestination("That is not a valid Lightning invoice.".into())
@@ -737,11 +746,7 @@ impl FederationClient for FedimintClient {
         if parsed.is_expired() {
             return Err(expired_invoice());
         }
-        if let Some(network) = self.network
-            && parsed.currency() != Currency::from(network)
-        {
-            return Err(wrong_currency());
-        }
+        check_currency(&parsed, self.network)?;
         let (gateway, routing) = read(ln.select_gateway(Some(parsed.clone())))
             .await?
             .map_err(|e| no_gateway(&e))?;
@@ -897,6 +902,23 @@ pub(super) fn settled_send(details: Option<(Amount, Amount)>, txid: Option<Strin
 mod tests {
     use super::*;
     use fedimint_connectors::Connectivity;
+
+    /// BOLT 11's own example, on mainnet.
+    const MAINNET_INVOICE: &str = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh";
+
+    #[test]
+    fn an_invoice_for_another_network_is_refused() {
+        let invoice = parse_invoice(MAINNET_INVOICE).unwrap();
+        assert_eq!(
+            check_currency(&invoice, Some(bitcoin::Network::Regtest)),
+            Err(wrong_currency())
+        );
+        assert_eq!(
+            check_currency(&invoice, Some(bitcoin::Network::Signet)),
+            Err(wrong_currency())
+        );
+        check_currency(&invoice, Some(bitcoin::Network::Bitcoin)).unwrap();
+    }
 
     #[test]
     fn a_send_that_succeeded_stays_settled_with_no_details() {

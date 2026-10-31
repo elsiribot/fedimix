@@ -2547,6 +2547,74 @@ async fn a_set_proxy_is_the_problem_while_it_stands() {
 }
 
 #[tokio::test]
+async fn a_preview_confirmed_after_a_switch_pays_from_its_own_federation() {
+    let harness = Harness::new();
+    harness.second.set_balance(sat(9_000));
+    let backend = funded(&harness, sat(2_000)).await;
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    let preview = on_chain_preview(&*backend).await;
+    backend.set_active_federation("two".into()).await.unwrap();
+    wait_online(&*backend, true).await;
+    let intent = backend.confirm_send(preview.id).await.unwrap();
+    wait_until("the withdrawal", || async {
+        harness.first.withdrawn().len() == 1
+    })
+    .await;
+    assert!(harness.second.withdrawn().is_empty());
+    assert!(
+        rows(&*backend).await.is_empty(),
+        "not a row of the active one"
+    );
+    backend.set_active_federation("one".into()).await.unwrap();
+    row_of(&rows(&*backend).await, &intent);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deposit_to_a_federation_not_active_stays_out_of_the_active_list() {
+    let harness = Harness::new();
+    harness.second.set_deposit_watches(false);
+    let backend = harness.joined().await;
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    let events = backend.subscribe();
+    harness
+        .second
+        .push_deposit(deposit_event(1, "elsewhere", true));
+    wait_event(&events, &Event::FederationChanged).await;
+    wait_until("the deposit's notice", || async {
+        backend.set_active_federation("two".into()).await.unwrap();
+        let found = rows(&*backend).await.iter().any(|r| r.id == "elsewhere");
+        backend.set_active_federation("one".into()).await.unwrap();
+        found
+    })
+    .await;
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn max_sends_from_the_active_balance() {
+    let harness = Harness::new();
+    harness.second.set_balance(sat(9_000));
+    let backend = funded(&harness, sat(2_000)).await;
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    let max = to(ADDRESS, SendAmount::Max);
+    let preview = backend.prepare_send(max.clone()).await.unwrap();
+    assert_eq!(preview.amount, sat(1_700));
+
+    backend.set_active_federation("two".into()).await.unwrap();
+    wait_online(&*backend, true).await;
+    wait_until("the second federation's preview", || async {
+        backend
+            .prepare_send(max.clone())
+            .await
+            .is_ok_and(|preview| preview.amount == sat(8_700))
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_higher_fee_at_confirm_expires_the_preview() {
     let harness = Harness::new();
     let backend = funded(&harness, sat(1_000)).await;
