@@ -14,6 +14,7 @@ use crate::format;
 use crate::present::{self, SettingsForm};
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::join_page::JoinPage;
+use crate::ui::recovery_words;
 
 /// Quiet period after the last edit before settings are written.
 const APPLY_DELAY: Duration = Duration::from_millis(400);
@@ -66,6 +67,48 @@ impl Network {
     fn url(&self) -> &str {
         match &self.backend {
             ChainBackend::Esplora { url } | ChainBackend::Electrum { url } => url,
+        }
+    }
+}
+
+/// What an Apply writes.
+enum NetworkEdit<'a> {
+    /// Server type and URL, which only make sense together.
+    Server {
+        electrum: bool,
+        url: &'a str,
+    },
+    Proxy(&'a str),
+    /// Neither: the values in force, for writes of other settings.
+    None,
+}
+
+/// Network values for the settings to write.
+struct NetworkFields<'a> {
+    electrum: bool,
+    url: &'a str,
+    proxy: &'a str,
+}
+
+impl Network {
+    /// The edited value from `edit`, every other from the values in force.
+    /// Half-typed or untouched fields never get through, and applying one
+    /// row never clears (or changes) the other: that would drop a user's
+    /// proxy without their say.
+    fn with_edit<'a>(&'a self, edit: NetworkEdit<'a>) -> NetworkFields<'a> {
+        let forced = NetworkFields {
+            electrum: self.is_electrum(),
+            url: self.url(),
+            proxy: self.proxy.as_deref().unwrap_or(""),
+        };
+        match edit {
+            NetworkEdit::Server { electrum, url } => NetworkFields {
+                electrum,
+                url,
+                ..forced
+            },
+            NetworkEdit::Proxy(proxy) => NetworkFields { proxy, ..forced },
+            NetworkEdit::None => forced,
         }
     }
 }
@@ -207,6 +250,19 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
     hardware.add(&inner.hw_name);
     hardware.add(&inner.hw_status);
     page.add(&hardware);
+
+    let backup = adw::PreferencesGroup::builder().title("Backup").build();
+    let words = adw::ActionRow::builder()
+        .title("Recovery words")
+        .activatable(true)
+        .build();
+    words.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    words.connect_activated({
+        let ctx = ctx.clone();
+        move |_| recovery_words::push(&ctx)
+    });
+    backup.add(&words);
+    page.add(&backup);
 
     let network = adw::PreferencesGroup::builder().title("Network").build();
     network.add(&inner.backend);
@@ -368,8 +424,8 @@ impl Inner {
     /// Debounced write of everything but the network fields.
     fn apply(self: &Rc<Self>) {
         let network = self.network.borrow().clone();
-        let proxy = network.proxy.as_deref().unwrap_or("");
-        if let Ok(settings) = self.build(network.is_electrum(), network.url(), proxy) {
+        let f = network.with_edit(NetworkEdit::None);
+        if let Ok(settings) = self.build(f.electrum, f.url, f.proxy) {
             self.write(settings);
         }
     }
@@ -377,19 +433,22 @@ impl Inner {
     /// Server type and URL, which only make sense together. The proxy is
     /// left at the value in force, whatever its field holds.
     fn apply_server(self: &Rc<Self>) {
-        let proxy = self.network.borrow().proxy.clone();
-        let settings = self.build(
-            self.backend.selected() == 1,
-            &self.url.text(),
-            proxy.as_deref().unwrap_or(""),
-        );
+        let network = self.network.borrow().clone();
+        let url = self.url.text();
+        let f = network.with_edit(NetworkEdit::Server {
+            electrum: self.backend.selected() == 1,
+            url: &url,
+        });
+        let settings = self.build(f.electrum, f.url, f.proxy);
         self.apply_network(settings);
     }
 
     /// The proxy alone; the server stays at the value in force.
     fn apply_proxy(self: &Rc<Self>) {
         let network = self.network.borrow().clone();
-        let settings = self.build(network.is_electrum(), network.url(), &self.proxy.text());
+        let proxy = self.proxy.text();
+        let f = network.with_edit(NetworkEdit::Proxy(&proxy));
+        let settings = self.build(f.electrum, f.url, f.proxy);
         self.apply_network(settings);
     }
 
@@ -569,4 +628,76 @@ pub(crate) fn push_join(ctx: &Rc<AppContext>) {
     toolbar.set_content(Some(join.widget()));
     ctx.nav
         .push(&adw::NavigationPage::new(&toolbar, "Add federation"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROXY: &str = "127.0.0.1:9050";
+
+    fn in_force() -> Network {
+        Network {
+            backend: ChainBackend::Electrum {
+                url: "ssl://electrum.example:50002".into(),
+            },
+            proxy: Some(PROXY.into()),
+        }
+    }
+
+    /// The settings a form with these network fields would write.
+    fn written(fields: &NetworkFields) -> Settings {
+        present::settings_from_form(&SettingsForm {
+            target_btc: "0.05",
+            anonymity_target: 50.0,
+            min_hours: 24.0,
+            grace_minutes: 10.0,
+            fee_guard_percent: 2.0,
+            cover_budget_sat: 20_000.0,
+            electrum: fields.electrum,
+            url: fields.url,
+            proxy: fields.proxy,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn applying_the_server_never_clears_the_proxy() {
+        let net = in_force();
+        let fields = net.with_edit(NetworkEdit::Server {
+            electrum: false,
+            url: "https://esplora.example/api",
+        });
+        let s = written(&fields);
+        assert_eq!(s.socks5_proxy.as_deref(), Some(PROXY));
+        assert_eq!(
+            s.chain_backend,
+            ChainBackend::Esplora {
+                url: "https://esplora.example/api".into()
+            }
+        );
+    }
+
+    #[test]
+    fn applying_the_proxy_leaves_the_server_alone() {
+        let net = in_force();
+        let fields = net.with_edit(NetworkEdit::Proxy("10.0.0.1:1080"));
+        let s = written(&fields);
+        assert_eq!(s.socks5_proxy.as_deref(), Some("10.0.0.1:1080"));
+        assert_eq!(
+            s.chain_backend,
+            ChainBackend::Electrum {
+                url: "ssl://electrum.example:50002".into()
+            }
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_empty_proxy_edit_clears_it() {
+        let net = in_force();
+        let cleared = net.with_edit(NetworkEdit::Proxy(""));
+        assert_eq!(written(&cleared).socks5_proxy, None);
+        let untouched = net.with_edit(NetworkEdit::None);
+        assert_eq!(written(&untouched).socks5_proxy.as_deref(), Some(PROXY));
+    }
 }

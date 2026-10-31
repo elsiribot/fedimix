@@ -34,6 +34,9 @@ pub enum Event {
         id: OperationId,
         kind: OperationKind,
         state: OperationState,
+        /// The history row the operation made, once it exists (as a rule
+        /// with `Done`). Look it up with `history`.
+        history_id: Option<String>,
     },
 }
 

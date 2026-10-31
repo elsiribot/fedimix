@@ -71,6 +71,10 @@ impl fmt::Display for Amount {
 /// Unix seconds.
 pub type Timestamp = u64;
 
+/// Most history rows a [`SavingState`] or [`SpendingState`] carries, newest
+/// first. Older rows come from `history`.
+pub const SNAPSHOT_HISTORY: usize = 50;
+
 /// Identifies a running operation; its progress arrives as
 /// [`crate::Event::Operation`].
 pub type OperationId = String;
@@ -80,6 +84,14 @@ pub enum OperationKind {
     Send,
     Refill,
     Exit,
+}
+
+/// An operation that has not reached a final state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningOperation {
+    pub id: OperationId,
+    pub kind: OperationKind,
+    pub state: OperationState,
 }
 
 /// `Done`, `Failed` and `Cancelled` are final. Operations that need no
@@ -134,6 +146,8 @@ pub struct FederationInfo {
     pub name: String,
     pub online: bool,
     pub anonymity_estimate: u32,
+    /// What this federation holds for the user.
+    pub balance: Amount,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +192,14 @@ pub struct HistoryItem {
     pub incoming: bool,
     pub status: HistoryStatus,
     pub timestamp: Timestamp,
+}
+
+/// One page of history, newest first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryPage {
+    pub items: Vec<HistoryItem>,
+    /// Older rows exist beyond this page.
+    pub more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -361,6 +383,8 @@ pub struct ReceiveInfo {
     pub uri: String,
     /// When an invoice stops being payable; addresses do not expire.
     pub expires_at: Option<Timestamp>,
+    /// On-chain deposits below this are not credited.
+    pub min_deposit: Option<Amount>,
 }
 
 /// The Bitcoin network a data folder belongs to.

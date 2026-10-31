@@ -1,0 +1,12 @@
+# scenario: funded
+# size: 360x640
+# Settings > Recovery words: the warning, the words, and Copy.
+action app.settings
+click Recovery words
+expect Write these words down
+expect 12. demo
+shot words
+click Copy
+expect Copied
+click Back
+expect Backup

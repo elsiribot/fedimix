@@ -23,6 +23,7 @@ struct PayloadView {
     text: gtk::Label,
     copy: gtk::Button,
     expiry: gtk::Label,
+    minimum: gtk::Label,
     status: gtk::Label,
     spinner: gtk::Spinner,
     retry: gtk::Button,
@@ -37,6 +38,7 @@ struct WeakPayloadView {
     text: glib::WeakRef<gtk::Label>,
     copy: glib::WeakRef<gtk::Button>,
     expiry: glib::WeakRef<gtk::Label>,
+    minimum: glib::WeakRef<gtk::Label>,
     status: glib::WeakRef<gtk::Label>,
     spinner: glib::WeakRef<gtk::Spinner>,
     retry: glib::WeakRef<gtk::Button>,
@@ -51,6 +53,7 @@ impl WeakPayloadView {
             text: self.text.upgrade()?,
             copy: self.copy.upgrade()?,
             expiry: self.expiry.upgrade()?,
+            minimum: self.minimum.upgrade()?,
             status: self.status.upgrade()?,
             spinner: self.spinner.upgrade()?,
             retry: self.retry.upgrade()?,
@@ -67,6 +70,7 @@ impl PayloadView {
             text: self.text.downgrade(),
             copy: self.copy.downgrade(),
             expiry: self.expiry.downgrade(),
+            minimum: self.minimum.downgrade(),
             status: self.status.downgrade(),
             spinner: self.spinner.downgrade(),
             retry: self.retry.downgrade(),
@@ -92,6 +96,13 @@ impl PayloadView {
         let expiry = gtk::Label::builder().visible(false).xalign(0.0).build();
         expiry.add_css_class("dim-label");
         expiry.add_css_class("caption");
+        let minimum = gtk::Label::builder()
+            .visible(false)
+            .wrap(true)
+            .xalign(0.0)
+            .build();
+        minimum.add_css_class("dim-label");
+        minimum.add_css_class("caption");
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -99,6 +110,7 @@ impl PayloadView {
             .build();
         content.append(&picture);
         content.append(&text);
+        content.append(&minimum);
         content.append(&expiry);
         content.append(&copy);
         let status = gtk::Label::builder()
@@ -140,6 +152,7 @@ impl PayloadView {
             text,
             copy,
             expiry,
+            minimum,
             status,
             spinner,
             retry,
@@ -167,6 +180,9 @@ impl PayloadView {
             .map(|at| present::expiry_line(at, widgets::now()));
         self.expiry.set_visible(expiry.is_some());
         self.expiry.set_label(expiry.as_deref().unwrap_or(""));
+        let minimum = present::receive_minimum(info);
+        self.minimum.set_visible(minimum.is_some());
+        self.minimum.set_label(minimum.as_deref().unwrap_or(""));
         self.copy.set_sensitive(true);
         self.content.set_visible(true);
     }

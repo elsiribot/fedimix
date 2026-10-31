@@ -438,6 +438,59 @@ pub fn visible_history(items: &[HistoryItem], show_cover: bool) -> Vec<HistoryIt
         .collect()
 }
 
+/// How many rows each "Show more" adds.
+pub const HISTORY_PAGE: u32 = fedimix_core::SNAPSHOT_HISTORY as u32;
+
+/// A snapshot with fewer rows than it can hold has all of them; a full one
+/// may have older rows behind it.
+pub fn history_may_have_more(snapshot_len: usize) -> bool {
+    snapshot_len >= fedimix_core::SNAPSHOT_HISTORY
+}
+
+/// Whether pages loaded below `prev` still continue from the end of `next`.
+/// A new row pushes the last one out of the snapshot, which would leave a
+/// gap between it and the pages: they must be dropped then.
+pub fn extra_pages_line_up(prev: &[HistoryItem], next: &[HistoryItem]) -> bool {
+    prev.len() == next.len() && prev.iter().zip(next).all(|(a, b)| a.id == b.id)
+}
+
+/// The rows to draw: the snapshot, then the pages loaded below it.
+pub fn history_to_show(
+    snapshot: &[HistoryItem],
+    pages: &[HistoryItem],
+    show_cover: bool,
+) -> Vec<HistoryItem> {
+    let all: Vec<HistoryItem> = snapshot.iter().chain(pages).cloned().collect();
+    visible_history(&all, show_cover)
+}
+
+/// Under the on-chain address: what the federation does not credit.
+pub fn receive_minimum(info: &ReceiveInfo) -> Option<String> {
+    let min = info.min_deposit.filter(|m| *m != Amount::ZERO)?;
+    Some(format!(
+        "Deposits under {} are not credited.",
+        format::sats(min)
+    ))
+}
+
+/// What to tell about an operation found running at startup, once it ends.
+/// Its dialog is gone, so a toast is the only report.
+pub fn resumed_outcome(kind: OperationKind, state: &OperationState) -> Option<String> {
+    match state {
+        OperationState::Done => Some(
+            match kind {
+                OperationKind::Send => "Payment sent",
+                OperationKind::Refill => "Refill done",
+                OperationKind::Exit => "Exit done",
+            }
+            .to_string(),
+        ),
+        OperationState::Failed { error } => Some(user_message(error)),
+        OperationState::Cancelled => Some("Cancelled".to_string()),
+        _ => None,
+    }
+}
+
 /// Raw values of the Settings page, as the widgets report them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsForm<'a> {
@@ -1037,6 +1090,7 @@ mod tests {
             id: "a".into(),
             kind: OperationKind::Send,
             state,
+            history_id: None,
         };
         assert!(!event_needs_refresh(&op(OperationState::Signing)));
         assert!(event_needs_refresh(&op(OperationState::Done)));
@@ -1064,6 +1118,100 @@ mod tests {
         assert!(operation_cancellable(&S::AwaitingDevice));
         assert!(operation_cancellable(&S::Signing));
         assert!(!operation_cancellable(&S::Broadcasting));
+    }
+
+    fn receive_info(min_deposit: Option<Amount>) -> fedimix_core::ReceiveInfo {
+        fedimix_core::ReceiveInfo {
+            payload: "bc1qdemo".into(),
+            uri: "bitcoin:bc1qdemo".into(),
+            expires_at: None,
+            min_deposit,
+        }
+    }
+
+    #[test]
+    fn receive_shows_minimum() {
+        assert_eq!(
+            receive_minimum(&receive_info(Some(sat(10_000)))),
+            Some("Deposits under 10000 sat are not credited.".to_string())
+        );
+        assert_eq!(receive_minimum(&receive_info(None)), None);
+        assert_eq!(receive_minimum(&receive_info(Some(Amount::ZERO))), None);
+    }
+
+    fn rows(ids: &[&str]) -> Vec<HistoryItem> {
+        ids.iter()
+            .map(|id| HistoryItem {
+                id: id.to_string(),
+                ..hist(HistoryKind::Paid, false, HistoryStatus::Complete)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn show_more_is_offered_only_for_a_full_snapshot() {
+        assert!(!history_may_have_more(0));
+        assert!(!history_may_have_more(fedimix_core::SNAPSHOT_HISTORY - 1));
+        assert!(history_may_have_more(fedimix_core::SNAPSHOT_HISTORY));
+    }
+
+    #[test]
+    fn loaded_pages_survive_only_an_unshifted_snapshot() {
+        let before = rows(&["a", "b", "c"]);
+        // A status change moves nothing.
+        let mut updated = rows(&["a", "b", "c"]);
+        updated[0].status = HistoryStatus::Pending;
+        assert!(extra_pages_line_up(&before, &updated));
+        // A new row pushes the last one out: the pages below would skip it.
+        assert!(!extra_pages_line_up(&before, &rows(&["n", "a", "b"])));
+        assert!(!extra_pages_line_up(&before, &rows(&["a", "b"])));
+    }
+
+    #[test]
+    fn rows_shown_are_the_snapshot_then_the_pages() {
+        let snapshot = rows(&["a", "b"]);
+        let pages = rows(&["c", "d"]);
+        let ids: Vec<_> = history_to_show(&snapshot, &pages, true)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, ["a", "b", "c", "d"]);
+        let mut pages = pages;
+        pages[0].kind = HistoryKind::Cover;
+        let ids: Vec<_> = history_to_show(&snapshot, &pages, false)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, ["a", "b", "d"]);
+    }
+
+    #[test]
+    fn operations_found_at_startup_report_their_outcome() {
+        use OperationKind::*;
+        let failed = OperationState::Failed {
+            error: fedimix_core::FedimixError::Offline,
+        };
+        assert_eq!(
+            resumed_outcome(Send, &OperationState::Done).as_deref(),
+            Some("Payment sent")
+        );
+        assert_eq!(
+            resumed_outcome(Refill, &OperationState::Done).as_deref(),
+            Some("Refill done")
+        );
+        assert_eq!(
+            resumed_outcome(Exit, &OperationState::Done).as_deref(),
+            Some("Exit done")
+        );
+        assert_eq!(
+            resumed_outcome(Send, &failed).as_deref(),
+            Some("You are offline. Reconnect and try again")
+        );
+        assert_eq!(
+            resumed_outcome(Send, &OperationState::Cancelled).as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(resumed_outcome(Send, &OperationState::Signing), None);
     }
 
     #[test]

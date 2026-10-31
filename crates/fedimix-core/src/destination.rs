@@ -1,6 +1,6 @@
 //! Parsing of user-entered destinations and BTC amounts.
 
-use crate::api::Amount;
+use crate::api::{Amount, Network};
 use crate::error::{FedimixError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +134,28 @@ fn is_alphanumeric(s: &str) -> bool {
     s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// First characters of base58 addresses: mainnet P2PKH and P2SH, testnet
+/// P2PKH (`m`, `n`) and P2SH.
+const BASE58_PREFIXES: [char; 5] = ['1', '3', 'm', 'n', '2'];
+const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_LENGTHS: std::ops::RangeInclusive<usize> = 26..=35;
+
+/// Base58 is case-sensitive: the address is kept as entered.
+fn parse_base58(body: &str) -> Option<Destination> {
+    let shaped = body.starts_with(BASE58_PREFIXES)
+        && BASE58_LENGTHS.contains(&body.len())
+        && body.chars().all(|c| BASE58_ALPHABET.contains(c));
+    shaped.then(|| Destination {
+        kind: DestinationKind::OnChain,
+        normalized: body.to_string(),
+        amount: None,
+    })
+}
+
 fn parse_address(body: &str) -> Result<Destination> {
+    if let Some(destination) = parse_base58(body) {
+        return Ok(destination);
+    }
     let normalized = lower_bech32(body)?;
     let valid = ADDRESS_PREFIXES.iter().any(|p| {
         normalized
@@ -170,12 +191,31 @@ fn parse_bip21(body: &str) -> Result<Destination> {
     Ok(destination)
 }
 
+/// Whether `address` is a real bitcoin address on `network`: checksum and
+/// network included, which [`parse_destination`] does not look at.
+pub fn validate_address(address: &str, network: Network) -> Result<()> {
+    use std::str::FromStr;
+    let network = match network {
+        Network::Bitcoin => bitcoin::Network::Bitcoin,
+        Network::Signet => bitcoin::Network::Signet,
+        Network::Regtest => bitcoin::Network::Regtest,
+    };
+    let unchecked =
+        bitcoin::Address::from_str(address.trim()).map_err(|_| invalid_destination())?;
+    unchecked.require_network(network).map(|_| ()).map_err(|_| {
+        FedimixError::InvalidDestination(
+            "This address belongs to a different bitcoin network".to_string(),
+        )
+    })
+}
+
 /// Classify and normalize what the user entered as a recipient.
 ///
 /// Accepts Lightning invoices (bare or `lightning:`), bech32 addresses (bare
-/// or BIP21 `bitcoin:`) of mainnet, testnet and regtest, in either case. The
-/// amount is the one the destination itself carries. Checksums are not
-/// verified yet.
+/// or BIP21 `bitcoin:`) of mainnet, testnet and regtest, in either case, and
+/// base58 addresses by their shape. The amount is the one the destination
+/// itself carries. This is lexical: checksums and networks are checked by
+/// [`validate_address`].
 pub fn parse_destination(input: &str) -> Result<Destination> {
     let input = input.trim();
     if let Some(body) = strip_scheme(input, "lightning:") {
@@ -309,6 +349,91 @@ mod tests {
         ] {
             assert!(parse_destination(bad).is_err(), "{bad}");
         }
+    }
+
+    const MAINNET_P2PKH: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+    const MAINNET_P2SH: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+    const TESTNET_P2PKH: &str = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn";
+    const TESTNET_P2SH: &str = "2N2JD6wb56AfK4tfmM6PwdVmoYk2dCKf4Br";
+    const MAINNET_BECH32: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const TESTNET_BECH32: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    #[test]
+    fn base58_addresses_parse() {
+        for addr in [MAINNET_P2PKH, MAINNET_P2SH, TESTNET_P2PKH, TESTNET_P2SH] {
+            // Base58 is case-sensitive: nothing is normalized.
+            assert_eq!(parsed(addr), (OnChain, addr.to_string(), None), "{addr}");
+        }
+        assert_eq!(
+            parsed(&format!("bitcoin:{MAINNET_P2PKH}?amount=0.5")),
+            (OnChain, MAINNET_P2PKH.to_string(), Some(sat(50_000_000)))
+        );
+    }
+
+    #[test]
+    fn base58_lookalikes_are_refused() {
+        // 0, O, I and l are not in the alphabet; too short; wrong first char.
+        for bad in [
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN0",
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVNl",
+            "1abc",
+            "9BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+        ] {
+            assert!(parse_destination(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_matching_network() {
+        assert_eq!(validate_address(MAINNET_P2PKH, Network::Bitcoin), Ok(()));
+        assert_eq!(validate_address(MAINNET_P2SH, Network::Bitcoin), Ok(()));
+        assert_eq!(validate_address(MAINNET_BECH32, Network::Bitcoin), Ok(()));
+        assert_eq!(validate_address(TESTNET_P2PKH, Network::Signet), Ok(()));
+        assert_eq!(validate_address(TESTNET_BECH32, Network::Signet), Ok(()));
+        assert_eq!(
+            validate_address(&MAINNET_BECH32.to_uppercase(), Network::Bitcoin),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_refuses_wrong_network() {
+        for (addr, net) in [
+            (MAINNET_P2PKH, Network::Signet),
+            (MAINNET_BECH32, Network::Regtest),
+            (TESTNET_P2SH, Network::Bitcoin),
+            (TESTNET_BECH32, Network::Bitcoin),
+        ] {
+            assert!(
+                matches!(
+                    validate_address(addr, net),
+                    Err(FedimixError::InvalidDestination(_))
+                ),
+                "{addr} on {net:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_bad_checksum() {
+        // Last character changed: still lexically an address.
+        for (addr, net) in [
+            ("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3", Network::Bitcoin),
+            (
+                "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdp",
+                Network::Bitcoin,
+            ),
+        ] {
+            assert!(parse_destination(addr).is_ok(), "{addr} parses");
+            assert!(
+                matches!(
+                    validate_address(addr, net),
+                    Err(FedimixError::InvalidDestination(_))
+                ),
+                "{addr}"
+            );
+        }
+        assert!(validate_address("", Network::Bitcoin).is_err());
     }
 
     #[test]

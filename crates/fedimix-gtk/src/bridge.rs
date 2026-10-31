@@ -5,6 +5,25 @@ use std::sync::Arc;
 
 use fedimix_core::{Backend, Event, Fedimix, FedimixError};
 
+/// Why a call ended without a result. `user_message` puts "Something went
+/// wrong:" in front, so this must not say it too.
+const PANIC_WHY: &str = "a background task stopped.";
+
+/// Most a clean shutdown may take; a hung backend must not block quitting.
+pub const SHUTDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `fut`, or an error once `cap` has passed.
+pub async fn capped<Fut>(fut: Fut, cap: std::time::Duration) -> Result<(), FedimixError>
+where
+    Fut: Future<Output = Result<(), FedimixError>>,
+{
+    tokio::time::timeout(cap, fut).await.unwrap_or_else(|_| {
+        Err(FedimixError::Internal(
+            "shutdown took too long.".to_string(),
+        ))
+    })
+}
+
 #[derive(Clone)]
 pub struct CoreBridge {
     core: Fedimix,
@@ -64,9 +83,7 @@ impl CoreBridge {
         gtk::glib::spawn_future_local(async move {
             let res = match task.await {
                 Ok(res) => res,
-                Err(_) => Err(FedimixError::Internal(
-                    "Something went wrong inside Fedimix.".to_string(),
-                )),
+                Err(_) => Err(FedimixError::Internal(PANIC_WHY.to_string())),
             };
             on_done(res);
         });
@@ -141,11 +158,30 @@ mod tests {
             },
             || got.borrow().is_some(),
         );
-        assert_eq!(
-            got.borrow().clone(),
-            Some(Err(FedimixError::Internal(
-                "Something went wrong inside Fedimix.".to_string()
-            )))
-        );
+        let err = got.borrow().clone().unwrap().unwrap_err();
+        assert_eq!(err, FedimixError::Internal(PANIC_WHY.to_string()));
+        // The user text already says "Something went wrong"; the reason must
+        // not say it again.
+        let text = crate::present::user_message(&err);
+        assert_eq!(text, "Something went wrong: a background task stopped.");
+        assert_eq!(text.matches("Something went wrong").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_hung_backend() {
+        let started = std::time::Instant::now();
+        let res = capped(
+            std::future::pending::<Result<(), FedimixError>>(),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(res, Err(FedimixError::Internal(_))));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let ok = capped(
+            async { Ok::<_, FedimixError>(()) },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(ok, Ok(()));
     }
 }

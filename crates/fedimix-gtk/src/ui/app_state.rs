@@ -9,7 +9,7 @@ use fedimix_core::{OperationId, OperationState, QueueState, SavingState, Spendin
 
 use crate::bridge::CoreBridge;
 use crate::operations::OperationTable;
-use crate::present::user_message;
+use crate::present::{self, user_message};
 use crate::refresh::RefreshGate;
 
 #[derive(Debug, Clone)]
@@ -110,6 +110,40 @@ impl AppContext {
         if let Some(state) = replay {
             f(&state);
         }
+    }
+
+    /// Watch the operations already running, as after a restart: nobody
+    /// started them in this process, so a toast reports how each ends.
+    pub fn resume_operations(&self) {
+        let core = self.bridge.core();
+        let toasts = self.toasts.clone();
+        let ctx = self.clone();
+        self.bridge
+            .call(async move { core.operations().await }, move |res| {
+                let running = match res {
+                    Ok(running) => running,
+                    Err(e) => {
+                        ctx.toast(&format!(
+                            "Could not check for running operations. {}",
+                            user_message(&e)
+                        ));
+                        return;
+                    }
+                };
+                for op in running {
+                    // The overlay alone, not `ctx`: the table holds this
+                    // closure until the operation ends.
+                    let toasts = toasts.clone();
+                    let kind = op.kind;
+                    ctx.watch_operation(op.id, move |state| {
+                        if let Some(text) = present::resumed_outcome(kind, state) {
+                            let toast = adw::Toast::new(&text);
+                            toast.set_priority(adw::ToastPriority::High);
+                            toasts.add_toast(toast);
+                        }
+                    });
+                }
+            });
     }
 
     /// Feed an `Event::Operation` to its watcher.

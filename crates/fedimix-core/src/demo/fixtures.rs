@@ -55,6 +55,8 @@ pub fn federation(online: bool) -> FederationInfo {
         name: FEDERATION_NAME.to_string(),
         online,
         anonymity_estimate: 60,
+        // The demo backend fills in the real figure.
+        balance: Amount::ZERO,
     }
 }
 
@@ -338,6 +340,40 @@ fn long_names() -> Fixture {
     }
 }
 
+/// Rows to scroll through: two years of small, varied activity.
+const LONG_HISTORY_ROWS: usize = 130;
+
+fn long_history_rows(prefix: &str, spending: bool) -> Vec<HistoryItem> {
+    (0..LONG_HISTORY_ROWS)
+        .map(|n| {
+            let (kind, incoming) = match (spending, n % 4) {
+                (true, 0) => (HistoryKind::Paid, false),
+                (true, 1) => (HistoryKind::ReceivedLightning, true),
+                (true, 2) => (HistoryKind::Deposit, true),
+                (true, _) => (HistoryKind::Sent { change: None }, false),
+                (false, 0 | 2) => (HistoryKind::Deposit, true),
+                (false, _) => (HistoryKind::Sent { change: None }, false),
+            };
+            HistoryItem {
+                id: format!("{prefix}-{n:03}"),
+                kind,
+                amount: Amount::from_sat(2_000 + 1_370 * n as u64),
+                incoming,
+                status: HistoryStatus::Complete,
+                timestamp: BASE_TS - (n as u64 + 1) * 5 * HOUR,
+            }
+        })
+        .collect()
+}
+
+fn long_history() -> Fixture {
+    Fixture {
+        saving_history: long_history_rows("s-long", false),
+        spending_history: long_history_rows("p-long", true),
+        ..funded()
+    }
+}
+
 fn funded() -> Fixture {
     Fixture {
         device: Some(device()),
@@ -359,6 +395,7 @@ fn funded() -> Fixture {
 
 pub fn fixture(scenario: DemoScenario) -> Fixture {
     match scenario {
+        DemoScenario::LongHistory => long_history(),
         DemoScenario::Funded
         | DemoScenario::PreviewExpiry
         | DemoScenario::DeviceRejects

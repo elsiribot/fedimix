@@ -28,4 +28,19 @@ pub trait Backend: Send + Sync + 'static {
     async fn discard_preview(&self, preview_id: String) -> Result<()>;
     async fn cancel_operation(&self, id: OperationId) -> Result<()>;
     async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()>;
+    /// Rows older than `before` (a row id; `None` starts at the newest),
+    /// newest first, at most `limit`. Spending covers the active federation.
+    async fn history(
+        &self,
+        wallet: WalletKind,
+        before: Option<String>,
+        limit: u32,
+    ) -> Result<HistoryPage>;
+    /// Operations that have not reached a final state, for a front end that
+    /// starts while one runs.
+    async fn operations(&self) -> Result<Vec<RunningOperation>>;
+    /// The seed as space-separated words. Secret.
+    async fn recovery_words(&self) -> Result<String>;
+    /// Stop cleanly before the process exits.
+    async fn shutdown(&self) -> Result<()>;
 }

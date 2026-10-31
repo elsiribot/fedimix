@@ -2391,6 +2391,7 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "async-trait",
+ "bitcoin",
  "fedimint-bip39",
  "fedimint-client",
  "fedimint-connectors",

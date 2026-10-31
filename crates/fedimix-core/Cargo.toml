@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 async-channel.workspace = true
 async-trait.workspace = true
+bitcoin.workspace = true
 fedimint-bip39.workspace = true
 fedimint-client.workspace = true
 rand.workspace = true

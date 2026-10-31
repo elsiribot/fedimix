@@ -50,6 +50,7 @@ async fn next_state(events: &EventStream, id: &str) -> (OperationKind, Operation
             id: got,
             kind,
             state,
+            ..
         } = event
             && got == id
         {

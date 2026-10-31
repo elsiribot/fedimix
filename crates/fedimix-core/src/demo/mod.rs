@@ -20,6 +20,11 @@ use fixtures::BASE_TS;
 const ONCHAIN_FEE_SAT: u64 = 420;
 const LIGHTNING_FEE_SAT: u64 = 12;
 const SMALL_CHANGE_SAT: u64 = 10_000;
+/// Smallest on-chain deposit the demo federation credits.
+const SPENDING_MIN_DEPOSIT_SAT: u64 = 10_000;
+/// What `recovery_words` returns: twelve words that fail the BIP39 checksum,
+/// so they can never be mistaken for a real seed.
+const DEMO_RECOVERY_WORDS: &str = "demo demo demo demo demo demo demo demo demo demo demo demo";
 /// Virtual size of a demo Saving transaction; 420 sat at 3 sat/vB.
 const TX_VBYTES: u64 = 140;
 const NOTIFY_DELAY: Duration = Duration::from_secs(2);
@@ -73,6 +78,8 @@ pub enum DemoScenario {
     DeviceRejects,
     /// Funded, with sends held in Broadcasting for a while.
     SendStuck,
+    /// Funded, with far more history than a snapshot carries.
+    LongHistory,
 }
 
 /// How fast the demo moves.
@@ -122,11 +129,12 @@ impl FromStr for DemoScenario {
             "exit-deferred" => Ok(Self::ExitDeferred),
             "send-stuck" => Ok(Self::SendStuck),
             "long-names" => Ok(Self::LongNames),
+            "long-history" => Ok(Self::LongHistory),
             "device-disconnected" => Ok(Self::DeviceDisconnected),
             "preview-expiry" => Ok(Self::PreviewExpiry),
             "device-rejects" => Ok(Self::DeviceRejects),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, long-history)"
             )),
         }
     }
@@ -159,7 +167,7 @@ struct State {
     sends: Previews<SendPreview>,
     refills: Previews<RefillPreview>,
     exits: Previews<ExitPreview>,
-    operations: HashMap<OperationId, RunningOperation>,
+    operations: HashMap<OperationId, ActiveOperation>,
     /// Previews whose operation was cancelled.
     cancelled: HashSet<String>,
     next_id: u64,
@@ -168,8 +176,9 @@ struct State {
 /// Unconfirmed previews with their expiry.
 type Previews<T> = HashMap<String, (Timestamp, T)>;
 
-#[derive(Default)]
-struct RunningOperation {
+struct ActiveOperation {
+    kind: OperationKind,
+    state: OperationState,
     cancel_requested: bool,
 }
 
@@ -247,12 +256,24 @@ struct Run {
 
 impl Run {
     fn emit(&self, state: OperationState) {
+        self.emit_with(state, None);
+    }
+
+    fn emit_with(&self, state: OperationState, history_id: Option<String>) {
         let event = Event::Operation {
             id: self.id.clone(),
             kind: self.job.kind(),
             state,
+            history_id,
         };
         broadcast(&self.senders, &event);
+    }
+
+    /// Record `state` for `operations()`.
+    async fn note(&self, state: &OperationState) {
+        if let Some(op) = self.state.lock().await.operations.get_mut(&self.id) {
+            op.state = state.clone();
+        }
     }
 
     async fn cancel_requested(&self) -> bool {
@@ -265,6 +286,7 @@ impl Run {
     /// Walk the plan; `Some` is an early final state.
     async fn walk(&self) -> Option<OperationState> {
         for state in self.plan {
+            self.note(state).await;
             self.emit(state.clone());
             tokio::time::sleep(self.step).await;
             if *state == OperationState::Broadcasting {
@@ -306,11 +328,18 @@ impl Run {
         {
             notify_later(&self.senders, Notice::SendConfirmed { amount: p.amount });
         }
-        self.finish(last).await;
+        let history_id = match last {
+            OperationState::Done => events.iter().find_map(|e| match e {
+                Event::HistoryItemAdded { item, .. } => Some(item.id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        self.finish(last, history_id).await;
     }
 
-    async fn finish(self, last: OperationState) {
-        self.emit(last.clone());
+    async fn finish(self, last: OperationState, history_id: Option<String>) {
+        self.emit_with(last.clone(), history_id);
         if last != OperationState::Done {
             let mut st = self.state.lock().await;
             let events = self.job.abandon(&mut st);
@@ -348,6 +377,14 @@ impl State {
             cancelled: HashSet::new(),
             next_id: 1,
         }
+    }
+
+    /// The active federation with what Spending holds in it.
+    fn federation_info(&self) -> Option<FederationInfo> {
+        self.federation.clone().map(|f| FederationInfo {
+            balance: self.spending_balance,
+            ..f
+        })
     }
 
     fn saving_balance(&self) -> Amount {
@@ -649,6 +686,11 @@ fn split_denominations(amount: Amount) -> Vec<Amount> {
     out
 }
 
+/// The newest [`SNAPSHOT_HISTORY`] rows of `history` (newest first).
+fn newest(history: &[HistoryItem]) -> Vec<HistoryItem> {
+    history.iter().take(SNAPSHOT_HISTORY).cloned().collect()
+}
+
 fn now_secs() -> Timestamp {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -706,8 +748,14 @@ impl DemoBackend {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|e| FedimixError::Internal(e.to_string()))?;
         let id = st.fresh_id("op");
-        st.operations
-            .insert(id.clone(), RunningOperation::default());
+        st.operations.insert(
+            id.clone(),
+            ActiveOperation {
+                kind: job.kind(),
+                state: plan[0].clone(),
+                cancel_requested: false,
+            },
+        );
         let run = Run {
             state: Arc::clone(&self.state),
             senders: Arc::clone(&self.senders),
@@ -798,21 +846,21 @@ impl Backend for DemoBackend {
             balance: st.saving_balance(),
             in_flight: st.in_flight,
             coins: st.coins.clone(),
-            history: st.saving_history.clone(),
+            history: newest(&st.saving_history),
         })
     }
 
     async fn spending_state(&self) -> Result<SpendingState> {
         let st = self.state.lock().await;
         Ok(SpendingState {
-            federation: st.federation.clone(),
+            federation: st.federation_info(),
             balance: st.spending_balance,
             target: st.settings.spending_target,
             for_spending: st.for_spending,
             moving: st.moving,
             saving_ready: st.saving_ready,
             notes: st.notes(),
-            history: st.spending_history.clone(),
+            history: newest(&st.spending_history),
         })
     }
 
@@ -847,14 +895,22 @@ impl Backend for DemoBackend {
                 "invite must start with fed1".to_string(),
             ));
         }
-        let info = fixtures::federation(true);
-        self.state.lock().await.federation = Some(info.clone());
+        let mut st = self.state.lock().await;
+        st.federation = Some(fixtures::federation(true));
+        let info = st.federation_info().expect("just set");
+        drop(st);
         self.emit(Event::FederationChanged);
         Ok(info)
     }
 
     async fn federations(&self) -> Result<Vec<FederationInfo>> {
-        Ok(self.state.lock().await.federation.iter().cloned().collect())
+        Ok(self
+            .state
+            .lock()
+            .await
+            .federation_info()
+            .into_iter()
+            .collect())
     }
 
     async fn set_active_federation(&self, id: String) -> Result<()> {
@@ -923,6 +979,7 @@ impl Backend for DemoBackend {
                     uri: format!("lightning:{payload}"),
                     payload,
                     expires_at: Some(now_secs() + u64::from(expiry_secs)),
+                    min_deposit: None,
                 }
             }
             ReceiveMethod::OnChain => {
@@ -931,6 +988,8 @@ impl Backend for DemoBackend {
                     uri: format!("bitcoin:{payload}"),
                     payload,
                     expires_at: None,
+                    min_deposit: (request.wallet == WalletKind::Spending)
+                        .then_some(Amount::from_sat(SPENDING_MIN_DEPOSIT_SAT)),
                 }
             }
         })
@@ -1185,6 +1244,57 @@ impl Backend for DemoBackend {
         Ok(preview)
     }
 
+    async fn history(
+        &self,
+        wallet: WalletKind,
+        before: Option<String>,
+        limit: u32,
+    ) -> Result<HistoryPage> {
+        let st = self.state.lock().await;
+        let all = match wallet {
+            WalletKind::Saving => &st.saving_history,
+            WalletKind::Spending => &st.spending_history,
+        };
+        let start = match before {
+            None => 0,
+            Some(id) => {
+                all.iter()
+                    .position(|i| i.id == id)
+                    .ok_or(FedimixError::UnknownItem(id))?
+                    + 1
+            }
+        };
+        let rest = &all[start..];
+        let take = rest.len().min(limit as usize);
+        Ok(HistoryPage {
+            items: rest[..take].to_vec(),
+            more: rest.len() > take,
+        })
+    }
+
+    async fn operations(&self) -> Result<Vec<RunningOperation>> {
+        let st = self.state.lock().await;
+        let mut running: Vec<_> = st
+            .operations
+            .iter()
+            .map(|(id, op)| RunningOperation {
+                id: id.clone(),
+                kind: op.kind,
+                state: op.state.clone(),
+            })
+            .collect();
+        running.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(running)
+    }
+
+    async fn recovery_words(&self) -> Result<String> {
+        Ok(DEMO_RECOVERY_WORDS.to_string())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()> {
         {
             let mut st = self.state.lock().await;
@@ -1210,7 +1320,7 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 11] = [
+    const ALL: [DemoScenario; 12] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
@@ -1222,6 +1332,7 @@ mod tests {
         DemoScenario::PreviewExpiry,
         DemoScenario::DeviceRejects,
         DemoScenario::SendStuck,
+        DemoScenario::LongHistory,
     ];
 
     fn btc(v: f64) -> Amount {
@@ -1730,6 +1841,196 @@ mod tests {
         assert!(!b.queue_state().await.unwrap().waiting_for_saving);
     }
 
+    /// Every id of `wallet`, newest first, read page by page.
+    async fn paged_ids(b: &DemoBackend, wallet: WalletKind, limit: u32) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut before = None;
+        loop {
+            let page = b.history(wallet, before.clone(), limit).await.unwrap();
+            assert!(page.items.len() <= limit as usize);
+            before = page.items.last().map(|i| i.id.clone());
+            ids.extend(page.items.into_iter().map(|i| i.id));
+            if !page.more {
+                return ids;
+            }
+            assert!(before.is_some(), "more without items would never end");
+        }
+    }
+
+    #[tokio::test]
+    async fn history_pages_through_everything_once() {
+        let b = fast(DemoScenario::LongHistory);
+        for (wallet, limit) in [(WalletKind::Spending, 20), (WalletKind::Saving, 33)] {
+            let all: Vec<String> = {
+                let st = b.state.lock().await;
+                match wallet {
+                    WalletKind::Spending => &st.spending_history,
+                    WalletKind::Saving => &st.saving_history,
+                }
+                .iter()
+                .map(|i| i.id.clone())
+                .collect()
+            };
+            assert!(all.len() > SNAPSHOT_HISTORY, "enough to page");
+            assert_eq!(paged_ids(&b, wallet, limit).await, all, "{wallet:?}");
+        }
+        // One page can hold the rest exactly: no phantom "more".
+        let n = paged_ids(&b, WalletKind::Saving, 1000).await.len() as u32;
+        let page = b.history(WalletKind::Saving, None, n).await.unwrap();
+        assert!(!page.more);
+    }
+
+    #[tokio::test]
+    async fn snapshots_keep_only_the_newest_history() {
+        let b = fast(DemoScenario::LongHistory);
+        let saving = b.saving_state().await.unwrap();
+        let spending = b.spending_state().await.unwrap();
+        assert_eq!(saving.history.len(), SNAPSHOT_HISTORY);
+        assert_eq!(spending.history.len(), SNAPSHOT_HISTORY);
+        let first = b.history(WalletKind::Saving, None, 50).await.unwrap();
+        assert_eq!(first.items, saving.history);
+        assert!(first.more);
+    }
+
+    #[tokio::test]
+    async fn history_after_an_unknown_row_errors() {
+        let b = fast(DemoScenario::Funded);
+        assert!(matches!(
+            b.history(WalletKind::Saving, Some("nope".into()), 10).await,
+            Err(FedimixError::UnknownItem(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn operations_lists_running_only() {
+        let timing = DemoTiming {
+            step: Duration::from_millis(5),
+            broadcast_hold: Duration::from_millis(400),
+            ..FAST
+        };
+        let b = DemoBackend::with_timing(DemoScenario::Funded, timing);
+        assert_eq!(b.operations().await, Ok(Vec::new()));
+        let events = b.subscribe();
+        let p = b
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", exact(0.001)))
+            .await
+            .unwrap();
+        let op = b.confirm_send(p.id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            b.operations().await,
+            Ok(vec![RunningOperation {
+                id: op.clone(),
+                kind: OperationKind::Send,
+                state: OperationState::Broadcasting,
+            }])
+        );
+        assert_eq!(settled(&events, Ok(op)).await, OperationState::Done);
+        assert_eq!(b.operations().await, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn done_names_the_history_row_it_made() {
+        let b = fast(DemoScenario::Funded);
+        let events = b.subscribe();
+        let p = b
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", exact(0.001)))
+            .await
+            .unwrap();
+        let op = b.confirm_send(p.id).await.unwrap();
+        let newest = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                Event::Operation {
+                    id,
+                    state: OperationState::Done,
+                    history_id,
+                    ..
+                } if id == op => break history_id,
+                Event::Operation {
+                    id,
+                    state,
+                    history_id,
+                    ..
+                } if id == op => {
+                    assert!(!state.is_final());
+                    assert_eq!(history_id, None, "no row yet in {state:?}");
+                }
+                _ => {}
+            }
+        };
+        let sp = b.spending_state().await.unwrap();
+        assert_eq!(newest, Some(sp.history[0].id.clone()));
+    }
+
+    #[tokio::test]
+    async fn failed_operation_has_no_history_row() {
+        let b = fast(DemoScenario::DeviceRejects);
+        let events = b.subscribe();
+        let p = b
+            .prepare_send(send(WalletKind::Saving, "bc1qabc", exact(0.25)))
+            .await
+            .unwrap();
+        let op = b.confirm_send(p.id).await.unwrap();
+        loop {
+            if let Some(Event::Operation {
+                id,
+                state,
+                history_id,
+                ..
+            }) = events.next().await
+                && id == op
+                && state.is_final()
+            {
+                assert_eq!(history_id, None);
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_words_are_a_fixed_demo_phrase() {
+        let b = fast(DemoScenario::Funded);
+        let words = b.recovery_words().await.unwrap();
+        assert_eq!(words.split_whitespace().count(), 12);
+        assert_eq!(words, b.recovery_words().await.unwrap());
+        assert!(
+            fedimint_bip39::Mnemonic::parse(&words).is_err(),
+            "must never pass for a real seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_a_no_op() {
+        let b = fast(DemoScenario::Funded);
+        assert_eq!(b.shutdown().await, Ok(()));
+        assert!(b.saving_state().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn spending_address_states_its_minimum() {
+        let b = fast(DemoScenario::Funded);
+        let on_chain = |wallet| ReceiveRequest {
+            wallet,
+            method: ReceiveMethod::OnChain,
+        };
+        let spending = b.receive(on_chain(WalletKind::Spending)).await.unwrap();
+        assert_eq!(spending.min_deposit, Some(Amount::from_sat(10_000)));
+        let saving = b.receive(on_chain(WalletKind::Saving)).await.unwrap();
+        assert_eq!(saving.min_deposit, None);
+    }
+
+    #[tokio::test]
+    async fn federation_info_carries_its_balance() {
+        let b = fast(DemoScenario::Funded);
+        let sp = b.spending_state().await.unwrap();
+        let fed = b.federations().await.unwrap().remove(0);
+        assert_eq!(fed.balance, sp.balance);
+    }
+
     #[test]
     fn scenario_from_str_rejects_unknown() {
         assert_eq!(
@@ -1739,6 +2040,10 @@ mod tests {
         assert_eq!(
             DemoScenario::from_str("first-run"),
             Ok(DemoScenario::FirstRun)
+        );
+        assert_eq!(
+            DemoScenario::from_str("long-history"),
+            Ok(DemoScenario::LongHistory)
         );
         assert!(DemoScenario::from_str("bogus").is_err());
     }

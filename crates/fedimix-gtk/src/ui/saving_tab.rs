@@ -62,7 +62,7 @@ impl SavingTab {
 
         let heading = gtk::Label::builder().label("History").xalign(0.0).build();
         heading.add_css_class("heading");
-        let history = HistoryList::new();
+        let history = HistoryList::new(&ctx, WalletKind::Saving);
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -155,13 +155,7 @@ impl Inner {
                     }
                     None => self.in_flight.set_visible(false),
                 }
-                let now = widgets::now();
-                let rows: Vec<_> = saving
-                    .history
-                    .iter()
-                    .map(|h| present::history_row(h, now))
-                    .collect();
-                self.history.set_items(&rows);
+                self.history.set_snapshot(&saving.history, true);
             }
         }
         *self.last.borrow_mut() = Some(saving.clone());

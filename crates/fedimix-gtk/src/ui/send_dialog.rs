@@ -291,7 +291,8 @@ struct Progress {
     device: String,
     /// Set while confirming, so a second activation does nothing.
     sending: Rc<Cell<bool>>,
-    /// The dialog has been closed; an outcome can only be a toast.
+    /// The review page or the dialog has been left; an outcome can only be
+    /// a toast.
     closed: Cell<bool>,
     /// The preview, until it is confirmed.
     preview_id: RefCell<Option<String>>,
@@ -390,7 +391,11 @@ impl Progress {
         match state {
             OperationState::Done => {
                 self.set_busy(false);
-                if let Some(dialog) = self.dialog.upgrade() {
+                // A dialog the user has left may be in use for something
+                // else by now: leave it alone.
+                if !self.closed.get()
+                    && let Some(dialog) = self.dialog.upgrade()
+                {
                     dialog.close();
                 }
                 self.ctx.toast_now("Payment sent");
@@ -590,6 +595,7 @@ fn review_page(
         let weak = weak.clone();
         move |_| {
             if let Some(progress) = weak.upgrade() {
+                progress.closed.set(true);
                 progress.discard(&ctx);
             }
         }

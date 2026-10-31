@@ -14,4 +14,5 @@ type "Amount (BTC)" 0.002
 expect-not lnbc1000000n1pdemo
 click On-chain
 expect bc1qdemo
+expect Deposits under 10000 sat are not credited.
 shot address

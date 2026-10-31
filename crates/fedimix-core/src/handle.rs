@@ -88,4 +88,28 @@ impl Fedimix {
     pub async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()> {
         self.backend.set_coin_frozen(outpoint, frozen).await
     }
+    /// Rows older than `before` (a row id; `None` starts at the newest),
+    /// newest first, at most `limit`. Snapshots carry only the newest
+    /// [`SNAPSHOT_HISTORY`] rows; this reads the rest.
+    pub async fn history(
+        &self,
+        wallet: WalletKind,
+        before: Option<String>,
+        limit: u32,
+    ) -> Result<HistoryPage> {
+        self.backend.history(wallet, before, limit).await
+    }
+    /// Operations still running, for watching ones started before this
+    /// process (re)started.
+    pub async fn operations(&self) -> Result<Vec<RunningOperation>> {
+        self.backend.operations().await
+    }
+    /// The seed words. Secret: show them once and never log them.
+    pub async fn recovery_words(&self) -> Result<String> {
+        self.backend.recovery_words().await
+    }
+    /// Stop cleanly before the process exits.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.backend.shutdown().await
+    }
 }

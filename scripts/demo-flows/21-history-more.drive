@@ -1,0 +1,28 @@
+# scenario: long-history
+# size: 360x640
+# Both tabs hold 130 rows but a snapshot carries 50: "Show more" appends pages
+# until the oldest row is in, then goes away.
+click Spending
+expect Show more
+expect-not 0.0017
+scroll-end
+shot spending-first
+click Show more
+expect Show more
+expect-not 0.0017
+scroll-end
+shot spending-second
+click Show more
+expect-not Show more
+expect 0.0017
+scroll-end
+shot spending-all
+click Saving
+expect Show more
+click Show more
+expect Show more
+click Show more
+expect-not Show more
+expect 0.0017
+scroll-end
+shot saving-all

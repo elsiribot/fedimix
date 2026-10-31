@@ -121,7 +121,7 @@ impl SpendingTab {
             .build();
         heading_row.append(&heading);
         heading_row.append(&show_cover);
-        let history = HistoryList::new();
+        let history = HistoryList::new(&ctx, WalletKind::Spending);
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -233,11 +233,7 @@ impl Inner {
         self.caption_link.set_visible(caption.queue_link.is_some());
         self.refill.set_visible(caption.shows_refill);
 
-        let now = widgets::now();
-        let rows: Vec<_> = present::visible_history(&s.history, self.show_cover.is_active())
-            .iter()
-            .map(|h| present::history_row(h, now))
-            .collect();
-        self.history.set_items(&rows);
+        self.history
+            .set_snapshot(&s.history, self.show_cover.is_active());
     }
 }

@@ -18,7 +18,9 @@ pub use api::*;
 pub use backend::Backend;
 pub use config::CoreConfig;
 pub use demo::{DemoBackend, DemoScenario, DemoTiming};
-pub use destination::{Destination, DestinationKind, parse_btc, parse_destination};
+pub use destination::{
+    Destination, DestinationKind, parse_btc, parse_destination, validate_address,
+};
 pub use error::{FedimixError, Result};
 pub use event::{Event, EventStream, Notice};
 pub use handle::Fedimix;

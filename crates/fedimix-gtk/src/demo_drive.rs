@@ -20,6 +20,7 @@
 //! - `apply <title>`: press the apply button of an entry row.
 //! - `expect-locked`: the open dialog cannot be closed and its page cannot be
 //!   popped, which is what Escape and Back go through.
+//! - `scroll-end`: scroll the visible scrolled windows to their bottom.
 //! - `activate`: activate the application again, as a second launch does.
 //! - `expect-windows <n>`: the application has `<n>` windows.
 //! - `close-dialog`: close the open dialog, as Escape does.
@@ -55,6 +56,7 @@ pub enum Step {
     ExpectRowControls { text: String, enabled: bool },
     Apply(String),
     CloseDialog,
+    ScrollEnd,
     Activate,
     ExpectWindows(usize),
     Wait(u64),
@@ -102,6 +104,7 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "expect-pinned" => Step::ExpectPinned,
         "apply" => Step::Apply(need("a title")?),
         "close-dialog" => Step::CloseDialog,
+        "scroll-end" => Step::ScrollEnd,
         "activate" => Step::Activate,
         "expect-windows" => Step::ExpectWindows(
             rest.parse()
@@ -151,6 +154,7 @@ impl fmt::Display for Step {
             }
             Step::Apply(t) => write!(f, "apply {t}"),
             Step::CloseDialog => write!(f, "close-dialog"),
+            Step::ScrollEnd => write!(f, "scroll-end"),
             Step::Activate => write!(f, "activate"),
             Step::ExpectWindows(n) => write!(f, "expect-windows {n}"),
             Step::Wait(ms) => write!(f, "wait {ms}"),
@@ -179,7 +183,8 @@ pub fn start(env: Env, steps: Vec<Step>) {
         }
         println!("DRIVE OK");
         let _ = std::io::stdout().flush();
-        env.app.quit();
+        // The road a user's Quit takes, so shutdown runs too.
+        env.app.activate_action("quit", None);
     });
 }
 
@@ -247,6 +252,19 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             let dialog = env.window.visible_dialog().ok_or("no dialog is open")?;
             if !dialog.close() {
                 return Err("the dialog refused to close".to_string());
+            }
+            glib::timeout_future(Duration::from_millis(150)).await;
+        }
+        Step::ScrollEnd => {
+            // Layout may still be growing the content.
+            glib::timeout_future(Duration::from_millis(200)).await;
+            for root in roots(env) {
+                for w in descendants(&root).iter().filter(|w| live(w)) {
+                    if let Some(sw) = w.downcast_ref::<gtk::ScrolledWindow>() {
+                        let adj = sw.vadjustment();
+                        adj.set_value(adj.upper() - adj.page_size());
+                    }
+                }
             }
             glib::timeout_future(Duration::from_millis(150)).await;
         }
@@ -583,6 +601,7 @@ expect-disabled waiting after reconnect
 expect-enabled waiting for lower fees
 apply Server URL
 close-dialog
+scroll-end
 activate
 expect-windows 1
 wait 250
@@ -616,6 +635,7 @@ action app.settings
                 },
                 Step::Apply("Server URL".into()),
                 Step::CloseDialog,
+                Step::ScrollEnd,
                 Step::Activate,
                 Step::ExpectWindows(1),
                 Step::Wait(250),

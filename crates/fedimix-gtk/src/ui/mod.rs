@@ -8,6 +8,7 @@ pub mod moving_page;
 pub mod notes_page;
 pub mod qr;
 pub mod receive_dialog;
+pub mod recovery_words;
 pub mod refill_dialog;
 pub mod saving_tab;
 pub mod send_dialog;
