@@ -23,7 +23,7 @@ just clippy   # lint with warnings denied
 just fmt      # format the code
 ```
 
-`just test-integration` runs the smoke tests in `crates/fedimix-core/tests/devimint.rs`
+`just test-integration` runs the tests in `crates/fedimix-core/tests/devimint.rs`
 against a local devimint federation, once with the default `mintv2`/`walletv2`
 modules and once with `mint`/`wallet`. It uses the separate `integration`
 shell (`nix develop .#integration`), which adds devimint, the fedimint daemons,

@@ -7,15 +7,11 @@ pub mod demo;
 pub mod destination;
 pub mod error;
 pub mod event;
-pub mod handle;
-// The only code that touches the Fedimint client. Receive and send arrive in
-// Tasks 7-8 and use the rest of it.
-#[allow(dead_code)]
+// The only code that touches the Fedimint client.
 mod federation;
+pub mod handle;
 mod real;
 mod seed;
-// Watches and cursors are for Tasks 7-8.
-#[allow(dead_code)]
 mod store;
 
 pub use api::*;

@@ -26,9 +26,7 @@ use crate::store::{HistoryWrite, Watch, WatchKind};
 /// How long a preview can be confirmed, as in the demo.
 const PREVIEW_TTL: Timestamp = 600;
 /// How long `shutdown` waits for submissions, after closing clients took up to
-/// their own 10 s: up to 25 s in all. GTK caps shutdown at 5 s until Task 9
-/// raises that to 30 s, and until then a submission at quit is cut off there,
-/// which a restart settles.
+/// their own 10 s: up to 25 s in all, inside GTK's cap of 30 s.
 const SUBMISSION_GRACE: Duration = Duration::from_secs(15);
 const CAME_BACK: &str = "The payment failed and the money came back.";
 const NEVER_SENT: &str = "This payment was never sent, so no money left your wallet.";

@@ -618,6 +618,7 @@ impl Store {
             .map_err(db_err)
     }
 
+    #[cfg(test)]
     pub(crate) fn add_watch(&self, watch: &Watch) -> Result<()> {
         insert_watch(&self.conn, watch)
     }
