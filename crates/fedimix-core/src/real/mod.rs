@@ -38,6 +38,7 @@ use crate::seed::{DataDirLock, Seed};
 use crate::store::{FederationRow, Store, Watch};
 
 const DB_FILE: &str = "fedimix.db";
+const SHUTTING_DOWN: &str = "Fedimix is shutting down.";
 const SAVING_NOT_SET_UP: &str = "Saving arrives in a later version.";
 const PROXY_SET: &str =
     "With a proxy set, Fedimix stays offline. Clear the proxy in Settings to connect.";
@@ -120,7 +121,9 @@ fn system_clock() -> Timestamp {
 fn problem_of(error: &FedimixError) -> Option<String> {
     match error {
         FedimixError::Offline => None,
-        FedimixError::Internal(sentence) => Some(sentence.clone()),
+        FedimixError::Internal(sentence) | FedimixError::NotSetUp(sentence) => {
+            Some(sentence.clone())
+        }
         other => Some(other.to_string()),
     }
 }
@@ -203,7 +206,7 @@ impl Core {
         match *self.gate.borrow() {
             Gate::Open => Ok(()),
             Gate::Proxy => Err(FedimixError::ProxyUnsupported),
-            Gate::Stopped => Err(FedimixError::Internal("Fedimix is shutting down.".into())),
+            Gate::Stopped => Err(FedimixError::Internal(SHUTTING_DOWN.into())),
         }
     }
 

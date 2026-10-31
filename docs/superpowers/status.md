@@ -17,6 +17,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - The clipboard against another Wayland client or a clipboard manager.
 - Guardians gone for good: `a_stopped_federation_leaves_the_wallet_readable` stops them with SIGSTOP and brings them back.
 - A hung backend at shutdown (30 s cap) in the UI; `NON_UNIQUE` launcher behavior on a desktop.
+- That no Electrum traffic follows a proxy change beyond the one request in flight (at most 10 scripts, its answer read up to 30 s; `decisions.md`, Task 5 fix I1): tested against a stub server, not through a proxy. A Jade PIN step already under way cannot be stopped.
 - Details: `decisions.md`.
 
 ## Next
@@ -28,4 +29,4 @@ Phase 3 (Saving, hardware wallet), Tasks 1-4 done: the dependencies and Phase 2 
 - v2 reuses its deposit address until a payment to it is seen, and Receive says so. Phase 3's fresh change address needs either an upstream `next_receive_address` or a refusal of concurrent sends: decide before the Phase 3 design is final.
 - SOCKS5 for federation traffic: fedimint 0.13 has no upstream support, so a set proxy blocks federation connections (a sentence says so).
 - The seed sits in a plain 0600 file in the data folder; decide whether that is enough or it needs encryption.
-- Hardware wallet testing for Phase 3 needs a device and you. Untested by construction: Ledger signing (`Ledger::with_wallet` with the default `wpkh(@0/**)` policy, `hmac = None`: whether the Ledger app accepts it), BitBox02 pairing and PSBT pruning, Coldcard, Jade, and the sentences for "open the Bitcoin app" and a locked Ledger (matched from the client's status text). Jade's PIN step talks to Blockstream's PIN server outside any proxy.
+- Hardware wallet testing needs a device and you. Untested by construction: Ledger signing (`Ledger::with_wallet` with the default `wpkh(@0/**)` policy, `hmac = None`: whether the Ledger app accepts it), BitBox02 pairing and PSBT pruning, Coldcard, Jade, and the sentences for "open the Bitcoin app" and a locked Ledger (matched from the client's status text). Jade's PIN step talks to Blockstream's PIN server outside any proxy.

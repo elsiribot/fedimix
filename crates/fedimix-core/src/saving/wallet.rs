@@ -39,6 +39,7 @@ use crate::store::{Store, db_err};
 /// address per receive, so a restored wallet may have long runs of unused ones.
 const FULL_SCAN_STOP_GAP: usize = 100;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const ALREADY_SET_UP: &str = "Saving is already set up with a hardware wallet.";
 
 /// The hardware wallet's account: public data only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +119,8 @@ impl WalletPersister for Db {
 struct Inner {
     wallet: PersistedWallet<Db>,
     db: Db,
+    /// A change that a failed write left unsaved.
+    unsaved: bool,
 }
 
 impl Inner {
@@ -319,9 +322,7 @@ impl SavingWallet {
         let store = Store::open(store_path)?;
         if !store.set_device_account(&account)? && store.device_account()? != Some(account.clone())
         {
-            return Err(FedimixError::NotSetUp(
-                "Saving is already set up with a hardware wallet.".into(),
-            ));
+            return Err(FedimixError::NotSetUp(ALREADY_SET_UP.into()));
         }
         Self::attach(store_path, &account, network)
     }
@@ -378,7 +379,11 @@ impl SavingWallet {
         };
         Ok(SavingWallet {
             network,
-            inner: Mutex::new(Inner { wallet, db }),
+            inner: Mutex::new(Inner {
+                wallet,
+                db,
+                unsaved: false,
+            }),
         })
     }
 
@@ -441,7 +446,8 @@ impl SavingWallet {
     /// Applies `update`, and persists when it told the wallet something. What
     /// else BDK staged is `last_seen` of a pending transaction, sent on every
     /// sync; it stays staged and goes with the next real change, so a quiet
-    /// wallet does not write to disk each time.
+    /// wallet does not write to disk each time. A change whose write failed
+    /// counts until a later call has written it.
     pub(crate) fn apply_update(&self, update: Update) -> Result<bool> {
         let mut inner = self.lock();
         let before = inner.view();
@@ -451,9 +457,11 @@ impl SavingWallet {
                     .into(),
             )
         })?;
-        let changed = inner.view() != before;
+        let changed = inner.unsaved || inner.view() != before;
         if changed {
+            inner.unsaved = true;
             inner.persist()?;
+            inner.unsaved = false;
         }
         Ok(changed)
     }
@@ -930,6 +938,32 @@ mod tests {
         });
         assert!(w.sync(&chain).await.unwrap().changed);
         assert!(w.lock().wallet.staged().is_none());
+    }
+
+    /// A write that failed stays owed: a quiet sync after it must make it.
+    #[tokio::test]
+    async fn a_failed_write_is_made_by_the_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(new_wallet(&dir));
+        w.lock()
+            .db
+            .0
+            .busy_timeout(Duration::from_millis(10))
+            .unwrap();
+        let block = |height: u32| Update {
+            chain: Some(w.tip().insert(BlockId {
+                height,
+                hash: BlockHash::from_byte_array([height as u8; 32]),
+            })),
+            ..Default::default()
+        };
+        let other = Connection::open(db(&dir)).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(w.apply_update(block(1)).is_err(), "the database is locked");
+        other.execute_batch("COMMIT").unwrap();
+
+        assert!(w.sync(&FakeChain::new()).await.unwrap().changed);
+        assert!(w.lock().wallet.staged().is_none(), "the write was made");
     }
 
     #[test]

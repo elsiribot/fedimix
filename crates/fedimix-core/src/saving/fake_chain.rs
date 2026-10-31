@@ -15,6 +15,7 @@ use crate::error::{FedimixError, Result};
 #[derive(Default)]
 struct State {
     offline: bool,
+    panics: bool,
     fee_rate: Option<f64>,
     full_scans: VecDeque<FullScanResponse<KeychainKind>>,
     syncs: VecDeque<SyncResponse>,
@@ -44,6 +45,7 @@ impl FakeChain {
     /// Waits out a stall, then answers as the server is now.
     async fn check_online(&self) -> Result<()> {
         let _ = self.stalled.subscribe().wait_for(|stalled| !stalled).await;
+        assert!(!self.state().panics, "the fake chain was told to panic");
         if self.state().offline {
             Err(FedimixError::Offline)
         } else {
@@ -59,6 +61,11 @@ impl FakeChain {
     /// accepted the connection and went quiet does.
     pub fn set_stalled(&self, stalled: bool) {
         self.stalled.send_replace(stalled);
+    }
+
+    /// While set, every call panics, as a bug in a client library would.
+    pub fn set_panics(&self, panics: bool) {
+        self.state().panics = panics;
     }
 
     pub fn set_fee_rate(&self, rate: Option<f64>) {

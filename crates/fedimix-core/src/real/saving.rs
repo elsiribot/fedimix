@@ -11,11 +11,13 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use super::{ChainFactory, Core, Gate, held};
+use super::{ChainFactory, Core, DB_FILE, Gate, SHUTTING_DOWN, held, problem_of};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
 use crate::event::Event;
-use crate::saving::{ChainClient, DeviceAccount, Labels, SavingWallet, Signer};
+use crate::saving::{
+    ALREADY_SET_UP, ChainClient, DeviceAccount, Labels, SavingWallet, Signer, require_server,
+};
 
 /// How often a sync runs with nothing going on.
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -24,10 +26,12 @@ const ACTIVE_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 /// The longest wait after failures.
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
-const NO_SERVER: &str = "Enter a chain server in Settings.";
-const ALREADY_SET_UP: &str = "Saving is already set up with a hardware wallet.";
 const SET_UP_FIRST: &str = "Set up Saving with a hardware wallet first.";
 const SCANNING: &str = "Fedimix is still scanning your device's history.";
+const SETUP_STOPPED: &str = "Setting up Saving stopped unexpectedly. Try again.";
+const SETTINGS_MOVED: &str = "The network settings changed during setup. Set up Saving again.";
+const SYNC_PANICKED: &str =
+    "Fedimix could not read the chain server's answer. Check the server in Settings.";
 const ON_CHAIN_ONLY: &str = "Saving receives on chain, not over Lightning.";
 const JADE_PROXY: &str =
     "Jade needs Blockstream's PIN server, which cannot use your proxy. Clear the proxy to use it.";
@@ -48,10 +52,7 @@ impl ChainTarget {
     }
 
     fn connect(&self, factory: &ChainFactory) -> Result<Arc<dyn ChainClient>> {
-        let (ChainBackend::Esplora { url } | ChainBackend::Electrum { url }) = &self.backend;
-        if url.trim().is_empty() {
-            return Err(FedimixError::NotSetUp(NO_SERVER.into()));
-        }
+        require_server(&self.backend)?;
         factory(&self.backend, self.proxy.as_deref())
     }
 }
@@ -114,18 +115,6 @@ fn account_path(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "m/84'/0'/0'",
         Network::Signet | Network::Regtest => "m/84'/1'/0'",
-    }
-}
-
-/// What to tell the user about a failed sync. Waiting cures `Offline`, so that
-/// is no problem.
-fn problem_of(error: &FedimixError) -> Option<String> {
-    match error {
-        FedimixError::Offline => None,
-        FedimixError::Internal(sentence) | FedimixError::NotSetUp(sentence) => {
-            Some(sentence.clone())
-        }
-        other => Some(other.to_string()),
     }
 }
 
@@ -215,7 +204,10 @@ impl Core {
         // Before the first scan, the index would start over on a used device
         // and could hand out an address that was already paid.
         if !wallet.first_scan_done() {
-            return Err(FedimixError::Internal(SCANNING.into()));
+            let problem = self.saving().problem.clone();
+            return Err(FedimixError::NotSetUp(
+                problem.unwrap_or_else(|| SCANNING.to_string()),
+            ));
         }
         let address = wallet.next_receive_address()?;
         Ok(ReceiveInfo {
@@ -314,24 +306,48 @@ impl Core {
             return Err(FedimixError::NotSetUp(ALREADY_SET_UP.into()));
         }
         let mut gate = self.gate.subscribe();
+        let mut target = self.chain.subscribe();
+        // A new proxy ends the wait: the device was checked against the old one.
         let (device, account) = tokio::select! {
             read = self.read_account(id) => read?,
             () = stopping(&mut gate) => {
-                return Err(FedimixError::Internal("Fedimix is shutting down.".into()));
+                return Err(FedimixError::Internal(SHUTTING_DOWN.into()));
+            }
+            _ = target.changed() => {
+                return Err(FedimixError::NotSetUp(SETTINGS_MOVED.into()));
             }
         };
-        let db = std::path::Path::new(&self.config.data_dir).join(super::DB_FILE);
-        let wallet = Arc::new(SavingWallet::create(&db, account, self.config.network)?);
+        // In a task of its own: a caller that goes away must not leave a wallet
+        // with no sync, and `supervisors` keeps shutdown out until it is done.
+        tokio::spawn(Arc::clone(self).finish_setup(device, account))
+            .await
+            .map_err(|_| FedimixError::Internal(SETUP_STOPPED.into()))?
+    }
+
+    /// Writes the wallet and starts its sync, or neither. Holding `supervisors`
+    /// from the gate check on, so the folder stays held through the write.
+    async fn finish_setup(
+        self: Arc<Self>,
+        device: DeviceInfo,
+        account: DeviceAccount,
+    ) -> Result<()> {
+        let mut supervisors = self.supervisors.lock().await;
+        self.ensure_running()?;
+        let db = std::path::Path::new(&self.config.data_dir).join(DB_FILE);
+        let network = self.config.network;
+        let created =
+            tokio::task::spawn_blocking(move || SavingWallet::create(&db, account, network))
+                .await
+                .map_err(|_| FedimixError::Internal(SETUP_STOPPED.into()))??;
+        let wallet = Arc::new(created);
         {
             let mut live = self.saving();
             live.wallet = Some(Arc::clone(&wallet));
             live.device = Some(device);
             live.problem = None;
         }
+        supervisors.push(tokio::spawn(supervise_saving(Arc::clone(&self), wallet)));
         self.events.emit(&Event::SavingChanged);
-        let mut supervisors = self.supervisors.lock().await;
-        self.ensure_running()?;
-        supervisors.push(tokio::spawn(supervise_saving(Arc::clone(self), wallet)));
         Ok(())
     }
 
@@ -387,11 +403,25 @@ pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>)
         };
         let mut failures = 0;
         loop {
+            // A task of its own, as it runs code fed by a remote server: a
+            // panic there is a failed sync, not the end of syncing.
+            let mut fetch = tokio::spawn({
+                let (wallet, chain) = (Arc::clone(&wallet), Arc::clone(&chain));
+                async move { wallet.fetch(&*chain).await }
+            });
             let fetched = tokio::select! {
-                () = stopping(&mut gate) => return Ok(()),
-                _ = target.changed() => continue 'connect,
-                fetched = wallet.fetch(&*chain) => fetched,
+                () = stopping(&mut gate) => {
+                    fetch.abort();
+                    return Ok(());
+                }
+                _ = target.changed() => {
+                    fetch.abort();
+                    continue 'connect;
+                }
+                fetched = &mut fetch => fetched,
             };
+            let fetched =
+                fetched.unwrap_or_else(|_| Err(FedimixError::Internal(SYNC_PANICKED.into())));
             let synced = match fetched {
                 Ok(fetched) => Arc::clone(&wallet).apply(fetched).await,
                 Err(e) => Err(e),

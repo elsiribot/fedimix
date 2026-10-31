@@ -2,10 +2,11 @@
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bdk_wallet::bitcoin::hashes::Hash as _;
 use bdk_wallet::bitcoin::{
     self, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
@@ -14,7 +15,8 @@ use bdk_wallet::chain::spk_client::{FullScanResponse, SyncResponse};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use fedimix_core::testing::{
     ChainClient, ChainFactory, DepositEvent, FakeChain, FakeClient, FakeDevices, FakePort,
-    FederationClient, SendHalt, SoftSigner, WatchUpdate, halt_sends, real_backend, sync_saving_now,
+    FederationClient, SendHalt, Signer, SoftSigner, WatchUpdate, halt_sends, real_backend,
+    sync_saving_now,
 };
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
@@ -23,6 +25,7 @@ use fedimix_core::{
     RunningOperation, SendAmount, SendPreview, SendRequest, Settings, WalletKind,
 };
 use tempfile::TempDir;
+use tokio::sync::watch;
 
 const INVITE: &str = "fed1one";
 const SECOND_INVITE: &str = "fed1two";
@@ -3565,13 +3568,201 @@ async fn receive_waits_for_the_first_scan() {
     saving.chain.set_stalled(true);
     saving.chain.push_full_scan(first_scan(1));
     backend.setup_saving(DEVICE.into()).await.unwrap();
+    // An expected wait, not an error of Fedimix's.
     assert_eq!(
         backend.receive(on_chain()).await,
-        Err(FedimixError::Internal(SCANNING.into()))
+        Err(FedimixError::NotSetUp(SCANNING.into()))
     );
     saving.chain.set_stalled(false);
     wait_chain(&*backend, true).await;
     backend.receive(on_chain()).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+/// Nothing is scanning, so "still scanning" would be untrue.
+#[tokio::test]
+async fn receive_says_why_no_scan_can_finish() {
+    let saving = SavingHarness::new();
+    let backend = saving.open().await.unwrap();
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    wait_until("the problem", || async {
+        backend.saving_state().await.unwrap().problem.is_some()
+    })
+    .await;
+    assert_eq!(
+        backend.receive(on_chain()).await,
+        Err(FedimixError::NotSetUp(NO_SERVER.into()))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+/// A device that can stop in its first read, or fail in its second.
+struct ScriptedSigner {
+    inner: SoftSigner,
+    held: watch::Sender<bool>,
+    xpub_fails: AtomicBool,
+}
+
+impl ScriptedSigner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: SoftSigner::from_seed(&SEED, bitcoin::Network::Regtest),
+            held: watch::Sender::new(false),
+            xpub_fails: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl Signer for ScriptedSigner {
+    fn kind(&self) -> DeviceKind {
+        DeviceKind::Software
+    }
+
+    async fn fingerprint(&self) -> Result<String> {
+        let _ = self.held.subscribe().wait_for(|held| !held).await;
+        self.inner.fingerprint().await
+    }
+
+    async fn xpub(&self, path: &str) -> Result<String> {
+        if self.xpub_fails.swap(false, Ordering::SeqCst) {
+            return Err(FedimixError::DeviceNotConnected("Test device".into()));
+        }
+        self.inner.xpub(path).await
+    }
+
+    async fn sign(&self, psbt: &mut bitcoin::psbt::Psbt) -> Result<()> {
+        self.inner.sign(psbt).await
+    }
+}
+
+const SCRIPTED: &str = "software:scripted";
+
+fn with_scripted(saving: &SavingHarness) -> Arc<ScriptedSigner> {
+    let signer = ScriptedSigner::new();
+    saving
+        .devices
+        .add(SCRIPTED, "Scripted", DeviceKind::Software, signer.clone());
+    signer
+}
+
+#[tokio::test]
+async fn a_device_failing_between_its_keys_can_be_retried() {
+    let saving = SavingHarness::new();
+    let signer = with_scripted(&saving);
+    signer.xpub_fails.store(true, Ordering::SeqCst);
+    let backend = saving.with_server().await;
+    assert_eq!(
+        backend.setup_saving(SCRIPTED.into()).await,
+        Err(FedimixError::DeviceNotConnected("Test device".into()))
+    );
+    assert_eq!(backend.saving_state().await.unwrap().device, None);
+    assert!(!backend.spending_state().await.unwrap().saving_ready);
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(SCRIPTED.into()).await.unwrap();
+    wait_chain(&*backend, true).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_proxy_set_during_setup_ends_it() {
+    let saving = SavingHarness::new();
+    let signer = with_scripted(&saving);
+    signer.held.send_replace(true);
+    let backend = saving.with_server().await;
+    let setup = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { backend.setup_saving(SCRIPTED.into()).await })
+    };
+    wait_until("the device to open", || async {
+        saving.devices.connects() == 1
+    })
+    .await;
+    backend
+        .set_settings(Settings {
+            socks5_proxy: Some("127.0.0.1:9050".into()),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        within("the setup to end", setup).await.unwrap(),
+        Err(FedimixError::NotSetUp(_))
+    ));
+    assert_eq!(backend.saving_state().await.unwrap().device, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_ends_a_setup_waiting_at_the_device() {
+    let saving = SavingHarness::new();
+    let signer = with_scripted(&saving);
+    signer.held.send_replace(true);
+    let backend = saving.with_server().await;
+    let setup = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { backend.setup_saving(SCRIPTED.into()).await })
+    };
+    wait_until("the device to open", || async {
+        saving.devices.connects() == 1
+    })
+    .await;
+    within("shutdown", backend.shutdown()).await.unwrap();
+    let ended = within("the setup to end", setup).await.unwrap();
+    assert!(ended.is_err(), "{ended:?}");
+    // It wrote nothing: the folder opens not set up.
+    drop(backend);
+    let backend = saving.open().await.unwrap();
+    assert_eq!(backend.saving_state().await.unwrap().device, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_panic_in_a_sync_is_a_failed_sync() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    saving.chain.set_panics(true);
+    sync_saving_now(&backend);
+    wait_chain(&*backend, false).await;
+    let state = backend.saving_state().await.unwrap();
+    assert!(state.problem.is_some(), "{state:?}");
+    // The task lives on, and the next sync works.
+    saving.chain.set_panics(false);
+    sync_saving_now(&backend);
+    wait_chain(&*backend, true).await;
+    assert_eq!(backend.saving_state().await.unwrap().problem, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_sync_finishing_after_a_settings_change_counts_once() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let info = backend.receive(on_chain()).await.unwrap();
+    saving.chain.set_stalled(true);
+    saving
+        .chain
+        .push_sync(confirmed(payment(&info.payload, 25_000, 0), 2));
+    sync_saving_now(&backend);
+    backend
+        .set_settings(chain_settings("http://other.test"))
+        .await
+        .unwrap();
+    let other = ChainBackend::Esplora {
+        url: "http://other.test".into(),
+    };
+    wait_until("the new server", || async {
+        saving.last_asked() == Some((other.clone(), None))
+    })
+    .await;
+    saving.chain.set_stalled(false);
+    wait_until("the coin", || async {
+        backend.saving_state().await.unwrap().balance == Amount::from_sat(25_000)
+    })
+    .await;
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.coins.len(), 1);
+    assert_eq!(state.history.len(), 1);
     backend.shutdown().await.unwrap();
 }
 

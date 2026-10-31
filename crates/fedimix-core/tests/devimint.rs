@@ -1639,7 +1639,7 @@ async fn saving_sees_a_funded_address() {
             loop {
                 match backend.receive(request()).await {
                     Ok(info) => return info.payload,
-                    Err(FedimixError::Internal(_)) => {
+                    Err(FedimixError::NotSetUp(wait)) if wait.contains("scanning") => {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                     Err(e) => panic!("{server:?}: {e}"),

@@ -67,17 +67,19 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
     let spend = format::btc_short(s.for_spending);
     let moving = format::btc_short(s.moving);
     let is_moving = s.moving > Amount::ZERO;
+    // Money moves only with a scheduler; Saving being ready moves nothing.
+    let leaves = s.saving_ready && s.features.scheduler;
     let moving_link = format!("{moving} moving to Saving {CHEVRON}");
     let waiting = format!("{moving} waiting for Saving");
     if s.for_spending < s.target {
         let target = format!("{spend} of {} target", format::btc_short(s.target));
         return Caption {
-            text: if is_moving && !s.saving_ready {
+            text: if is_moving && !leaves {
                 format!("{target} {DOT} {waiting}")
             } else {
                 target
             },
-            queue_link: (is_moving && s.saving_ready).then_some(moving_link),
+            queue_link: (is_moving && leaves).then_some(moving_link),
             shows_refill: s.saving_ready,
             fraction: fraction(s.for_spending.msat, s.target.msat),
             shows_bar: true,
@@ -94,7 +96,7 @@ pub fn spending_caption(s: &SpendingState) -> Caption {
     }
     let total = s.for_spending.msat.saturating_add(s.moving.msat);
     let fraction = fraction(s.for_spending.msat, total);
-    if s.saving_ready {
+    if leaves {
         Caption {
             text: String::new(),
             queue_link: Some(format!("{spend} for spending {DOT} {moving_link}")),
@@ -630,6 +632,12 @@ pub fn history_may_have_more(snapshot_len: usize) -> bool {
 /// Whether pages loaded below `prev` still continue from the end of `next`.
 /// A new row pushes the last one out of the snapshot, which would leave a
 /// gap between it and the pages: they must be dropped then.
+/// Whether a failed page means its cursor left the wallet's history, so the
+/// pages held no longer line up.
+pub fn history_cursor_gone(e: &fedimix_core::FedimixError) -> bool {
+    matches!(e, fedimix_core::FedimixError::UnknownItem(_))
+}
+
 pub fn extra_pages_line_up(prev: &[HistoryItem], next: &[HistoryItem]) -> bool {
     prev.len() == next.len() && prev.iter().zip(next).all(|(a, b)| a.id == b.id)
 }
@@ -1329,6 +1337,44 @@ mod tests {
         assert_eq!(demo.button, "Set up");
         assert!(demo.button_enabled);
         assert_eq!(demo.caption, None);
+    }
+
+    /// Until Phase 4 has a scheduler nothing moves, whatever Saving's state.
+    #[test]
+    fn moving_reads_as_waiting_without_a_scheduler() {
+        let features = Features {
+            saving: true,
+            ..Features::NONE
+        };
+        let over = SpendingState {
+            features,
+            ..spending(0.05, 0.42, 0.05, true)
+        };
+        let caption = spending_caption(&over);
+        assert_eq!(caption.queue_link, None);
+        assert!(caption.text.contains("waiting for Saving"), "{caption:?}");
+        assert!(!caption.text.contains("moving"), "{caption:?}");
+
+        let under = SpendingState {
+            features,
+            for_spending: btc(0.01),
+            ..spending(0.01, 0.42, 0.05, true)
+        };
+        let caption = spending_caption(&under);
+        assert_eq!(caption.queue_link, None);
+        assert!(caption.text.contains("waiting for Saving"), "{caption:?}");
+        assert!(caption.shows_refill, "a refill needs no scheduler");
+
+        // With one, as in the demo, the link stands.
+        let caption = spending_caption(&spending(0.05, 0.42, 0.05, true));
+        assert!(caption.queue_link.is_some_and(|l| l.contains("moving")));
+    }
+
+    #[test]
+    fn a_lost_cursor_is_told_from_other_failures() {
+        use fedimix_core::FedimixError as E;
+        assert!(history_cursor_gone(&E::UnknownItem("txid".into())));
+        assert!(!history_cursor_gone(&E::Offline));
     }
 
     #[test]

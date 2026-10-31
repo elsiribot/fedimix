@@ -4,6 +4,7 @@
 //! Both backends go through the SOCKS5 proxy when one is set, and fail closed:
 //! a proxy that is down is an error, never a direct connection.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,13 +17,17 @@ use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{Transaction, Txid};
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
+use super::electrum_guard::Guarded;
 use crate::api::ChainBackend;
 use crate::error::{FedimixError, Result};
 
 /// How long one request to the chain server may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a whole scan or sync may take, however many requests it makes.
+/// How long a routine sync may take, however many requests it makes.
 const SCAN_DEADLINE: Duration = Duration::from_secs(5 * 60);
+/// How long a first scan may take. Nothing of a scan that overruns is kept, and
+/// Receive waits for one to finish, so a used wallet on a slow proxy needs room.
+const FIRST_SCAN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Esplora: how many requests a scan has in flight.
 const ESPLORA_PARALLEL: usize = 4;
 /// Electrum: how many scripts a scan asks for in one batch.
@@ -56,13 +61,11 @@ pub trait ChainClient: Send + Sync {
 /// `host:port`, `socks5://host:port` or `socks5h://host:port`. Nothing is
 /// requested here: an unreachable server shows on the first call.
 pub fn connect_chain(backend: &ChainBackend, proxy: Option<&str>) -> Result<Arc<dyn ChainClient>> {
+    require_server(backend)?;
     let proxy = proxy.map(proxy_host_port).transpose()?;
     match backend {
         ChainBackend::Esplora { url } => {
             let url = url.trim();
-            if url.is_empty() {
-                return Err(no_server());
-            }
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 return Err(FedimixError::NotSetUp(
                     "The Esplora address must start with http:// or https://.".into(),
@@ -78,9 +81,6 @@ pub fn connect_chain(backend: &ChainBackend, proxy: Option<&str>) -> Result<Arc<
         }
         ChainBackend::Electrum { url } => {
             let url = url.trim();
-            if url.is_empty() {
-                return Err(no_server());
-            }
             if !(url.starts_with("ssl://") || url.starts_with("tcp://")) {
                 return Err(FedimixError::NotSetUp(
                     "The Electrum address must start with ssl:// or tcp://.".into(),
@@ -90,13 +90,21 @@ pub fn connect_chain(backend: &ChainBackend, proxy: Option<&str>) -> Result<Arc<
                 url: url.to_string(),
                 proxy,
                 client: Mutex::new(None),
+                closed: AtomicBool::new(false),
             }))))
         }
     }
 }
 
-fn no_server() -> FedimixError {
-    FedimixError::NotSetUp("Enter a chain server in Settings.".into())
+/// Refuses a backend with no server named: regtest's default.
+pub fn require_server(backend: &ChainBackend) -> Result<()> {
+    let (ChainBackend::Esplora { url } | ChainBackend::Electrum { url }) = backend;
+    if url.trim().is_empty() {
+        return Err(FedimixError::NotSetUp(
+            "Enter a chain server in Settings.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// `host:port` of a proxy setting, with or without a `socks5://` or
@@ -255,7 +263,7 @@ impl ChainClient for EsploraChain {
         request: FullScanRequest<KeychainKind>,
         stop_gap: usize,
     ) -> Result<FullScanResponse<KeychainKind>> {
-        deadline(SCAN_DEADLINE, async {
+        deadline(FIRST_SCAN_DEADLINE, async {
             self.client
                 .full_scan(request, stop_gap, ESPLORA_PARALLEL)
                 .await
@@ -302,16 +310,40 @@ impl ChainClient for EsploraChain {
 
 // Electrum
 
-/// electrum-client blocks, so every call runs in `spawn_blocking`. A call
-/// whose future is dropped (a deadline, or shutdown) keeps its thread until
-/// the socket times out, up to 30 s per read; runtime shutdown waits for it. The
-/// connection is made on first use, and again after a failure, so an
-/// unreachable server is an error of a call, not of `connect_chain`.
+type ElectrumClient = BdkElectrumClient<Guarded>;
+
+/// electrum-client blocks, so every call runs in `spawn_blocking`, and dropping
+/// a future does not stop its thread by itself. So dropping a call closes the
+/// connection it may be using, and dropping the client closes it for good: see
+/// [`Guarded`]. The thread then sends nothing more. What cannot be recalled is a
+/// request already written (at most `ELECTRUM_BATCH` scripts) with its answer,
+/// up to `REQUEST_TIMEOUT`, or a connection being opened, which is closed
+/// unused. The library's own reconnect is off, so a thread can open no new
+/// socket. The connection is made on first use, and again after a failure, so
+/// an unreachable server is an error of a call, not of `connect_chain`.
 struct ElectrumChain {
     url: String,
     /// `host:port`.
     proxy: Option<String>,
-    client: Mutex<Option<Arc<BdkElectrumClient<electrum_client::Client>>>>,
+    client: Mutex<Option<Arc<ElectrumClient>>>,
+    /// The client was dropped: no connection may be used or opened.
+    closed: AtomicBool,
+}
+
+/// Held while a call runs. Dropped early, the call was abandoned.
+struct AbandonOnDrop {
+    chain: Arc<ElectrumChain>,
+    abandoned: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.abandoned.store(true, Ordering::SeqCst);
+            self.chain.close_connection();
+        }
+    }
 }
 
 fn electrum_error(error: &electrum_client::Error) -> FedimixError {
@@ -334,15 +366,22 @@ impl ElectrumChain {
     /// Runs `call` on a blocking thread with the connection.
     async fn call<T: Send + 'static>(
         self: &Arc<Self>,
-        call: impl FnOnce(
-            &BdkElectrumClient<electrum_client::Client>,
-        ) -> std::result::Result<T, electrum_client::Error>
+        call: impl FnOnce(&ElectrumClient) -> std::result::Result<T, electrum_client::Error>
         + Send
         + 'static,
     ) -> Result<T> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut guard = AbandonOnDrop {
+            chain: Arc::clone(self),
+            abandoned: Arc::clone(&abandoned),
+            finished: false,
+        };
+        let joined = tokio::task::spawn_blocking(move || {
             let client = this.connection()?;
+            if abandoned.load(Ordering::SeqCst) {
+                return Err(FedimixError::Offline);
+            }
             call(&client).map_err(|e| {
                 // A failed connection is not reused; a refusal says nothing about it.
                 if !matches!(e, electrum_client::Error::Protocol(_)) {
@@ -351,19 +390,36 @@ impl ElectrumChain {
                 electrum_error(&e)
             })
         })
-        .await
-        .map_err(|e| {
+        .await;
+        guard.finished = true;
+        joined.map_err(|e| {
             FedimixError::Internal(format!("The chain request stopped unexpectedly: {e}."))
         })?
     }
 
-    fn connection(&self) -> Result<Arc<BdkElectrumClient<electrum_client::Client>>> {
+    /// Stops the use of the connection in place. `try_lock`, as this runs on a
+    /// runtime worker and `connection` holds the lock while it connects; the
+    /// checks around that cover the case.
+    fn close_connection(&self) {
+        if let Ok(mut slot) = self.client.try_lock()
+            && let Some(client) = slot.take()
+        {
+            client.inner.close();
+        }
+    }
+
+    fn connection(&self) -> Result<Arc<ElectrumClient>> {
         let mut slot = self.client.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(FedimixError::Offline);
+        }
         if let Some(client) = &*slot {
             return Ok(Arc::clone(client));
         }
         let config = electrum_client::ConfigBuilder::new()
             .timeout(Some(REQUEST_TIMEOUT))
+            // Its retry reconnects inside a call, where nothing can stop it.
+            .retry(0)
             .socks5(
                 self.proxy
                     .as_deref()
@@ -372,7 +428,10 @@ impl ElectrumChain {
             .build();
         let client = electrum_client::Client::from_config(&self.url, config)
             .map_err(|e| electrum_error(&e))?;
-        let client = Arc::new(BdkElectrumClient::new(client));
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(FedimixError::Offline);
+        }
+        let client = Arc::new(BdkElectrumClient::new(Guarded::new(client)));
         *slot = Some(Arc::clone(&client));
         Ok(client)
     }
@@ -380,6 +439,13 @@ impl ElectrumChain {
 
 /// `ChainClient` for the shared `ElectrumChain`, which `call` needs as an `Arc`.
 struct ElectrumHandle(Arc<ElectrumChain>);
+
+impl Drop for ElectrumHandle {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.close_connection();
+    }
+}
 
 #[async_trait]
 impl ChainClient for ElectrumHandle {
@@ -389,7 +455,7 @@ impl ChainClient for ElectrumHandle {
         stop_gap: usize,
     ) -> Result<FullScanResponse<KeychainKind>> {
         deadline(
-            SCAN_DEADLINE,
+            FIRST_SCAN_DEADLINE,
             self.0
                 .call(move |c| c.full_scan(request, stop_gap, ELECTRUM_BATCH, true)),
         )
@@ -444,8 +510,128 @@ impl ChainClient for ElectrumHandle {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bdk_wallet::bitcoin::ScriptBuf;
 
     use super::*;
+
+    /// An Electrum server that answers every request but the handshake with an
+    /// empty list, a little slowly, and counts what reaches it.
+    struct StubServer {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        connections: Arc<AtomicUsize>,
+    }
+
+    fn stub_server() -> StubServer {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (seen, opened) = (Arc::clone(&requests), Arc::clone(&connections));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                opened.fetch_add(1, Ordering::SeqCst);
+                let seen = Arc::clone(&seen);
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(stream.try_clone().unwrap());
+                    for line in reader.lines() {
+                        let Ok(line) = line else { return };
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        // The handshake wants a name and a version.
+                        let result = if request["method"] == "server.version" {
+                            serde_json::json!(["stub", "1.4"])
+                        } else {
+                            serde_json::json!([])
+                        };
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": result,
+                        });
+                        if writeln!(stream, "{reply}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        StubServer {
+            url,
+            requests,
+            connections,
+        }
+    }
+
+    /// A scan that would run for a very long time.
+    fn endless_scan(
+        client: &Arc<dyn ChainClient>,
+    ) -> tokio::task::JoinHandle<Result<FullScanResponse<KeychainKind>>> {
+        let client = Arc::clone(client);
+        let spks = (0u32..).map(|index| (index, ScriptBuf::new_op_return([index as u8])));
+        let request = FullScanRequest::builder()
+            .spks_for_keychain(KeychainKind::External, spks)
+            .build();
+        tokio::spawn(async move { client.full_scan(request, usize::MAX >> 1).await })
+    }
+
+    async fn wait_for_requests(stub: &StubServer, count: usize) {
+        while stub.requests.load(Ordering::SeqCst) < count {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Nothing more reaches the server, past what was already written.
+    async fn assert_quiet(stub: &StubServer, when_stopped: usize) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let settled = stub.requests.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            stub.requests.load(Ordering::SeqCst),
+            settled,
+            "the scan went on"
+        );
+        assert!(
+            settled <= when_stopped + 2 * ELECTRUM_BATCH,
+            "{settled} requests after stopping at {when_stopped}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_client_stops_its_scan() {
+        let stub = stub_server();
+        let backend = ChainBackend::Electrum {
+            url: stub.url.clone(),
+        };
+        let client = connect_chain(&backend, None).unwrap();
+        let scan = endless_scan(&client);
+        wait_for_requests(&stub, 3 * ELECTRUM_BATCH).await;
+        scan.abort();
+        drop(client);
+        assert_quiet(&stub, stub.requests.load(Ordering::SeqCst)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_call_stops_and_the_next_connects_again() {
+        let stub = stub_server();
+        let backend = ChainBackend::Electrum {
+            url: stub.url.clone(),
+        };
+        let client = connect_chain(&backend, None).unwrap();
+        let scan = endless_scan(&client);
+        wait_for_requests(&stub, 3 * ELECTRUM_BATCH).await;
+        scan.abort();
+        assert_quiet(&stub, stub.requests.load(Ordering::SeqCst)).await;
+        assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
+        // The stub's answer is no fee rate; the point is that it was asked.
+        let _ = client.fee_rate_sat_vb(6).await;
+        assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn proxy_forms_normalise_to_host_port() {

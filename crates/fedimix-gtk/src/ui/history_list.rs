@@ -247,6 +247,15 @@ impl Inner {
                         inner.pages.borrow_mut().extend(page.items);
                         inner.more.set(page.more);
                     }
+                    // The row under the pages left the wallet's history, so
+                    // they no longer line up. Start again from the snapshot;
+                    // the event for that change brings a new one.
+                    Err(e) if present::history_cursor_gone(&e) => {
+                        inner.pages.borrow_mut().clear();
+                        inner.generation.set(generation + 1);
+                        let held = inner.snapshot.borrow().len();
+                        inner.more.set(present::history_may_have_more(held));
+                    }
                     Err(e) => ctx.toast(&present::user_message(&e)),
                 }
                 inner.render();
