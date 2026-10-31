@@ -13,6 +13,7 @@ demo:
 
 test:
     cargo test --workspace
+    scripts/check-no-soft-signer.sh
 
 # Smoke tests against devimint federations, once per module generation (slow)
 test-integration:

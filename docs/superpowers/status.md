@@ -20,7 +20,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-3 done: the dependencies and Phase 2 residuals, chain access (`saving::ChainClient` over Esplora or Electrum, `FakeChain` under `testing`), and the watch-only wallet (`saving::SavingWallet`: create/open from a `DeviceAccount`, sync, balance, coins, history, fresh receive addresses; `Labels` per outpoint; schema 5). No device and no sending yet. Next: Task 4 of the Phase 3 plan, devices and signing. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause is from reading.
+Phase 3 (Saving, hardware wallet), Tasks 1-4 done: the dependencies and Phase 2 residuals, chain access (`saving::ChainClient` over Esplora or Electrum, `FakeChain` under `testing`), and the watch-only wallet (`saving::SavingWallet`: create/open from a `DeviceAccount`, sync, balance, coins, history, fresh receive addresses; `Labels` per outpoint; schema 5). Task 4: `saving::HwiPort` (Ledger, Coldcard, Jade, BitBox02 through async-hwi; compile-only, never run against a device) behind `DevicePort`/`Signer`, and `SoftSigner` under `testing` only (`scripts/check-no-soft-signer.sh`, in `just test`). No sending yet. Next: Task 5 of the Phase 3 plan. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause is from reading.
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.
@@ -28,4 +28,4 @@ Phase 3 (Saving, hardware wallet), Tasks 1-3 done: the dependencies and Phase 2 
 - v2 reuses its deposit address until a payment to it is seen, and Receive says so. Phase 3's fresh change address needs either an upstream `next_receive_address` or a refusal of concurrent sends: decide before the Phase 3 design is final.
 - SOCKS5 for federation traffic: fedimint 0.13 has no upstream support, so a set proxy blocks federation connections (a sentence says so).
 - The seed sits in a plain 0600 file in the data folder; decide whether that is enough or it needs encryption.
-- Hardware wallet testing for Phase 3 needs a device and you.
+- Hardware wallet testing for Phase 3 needs a device and you. Untested by construction: Ledger signing (`Ledger::with_wallet` with the default `wpkh(@0/**)` policy, `hmac = None`: whether the Ledger app accepts it), BitBox02 pairing and PSBT pruning, Coldcard, Jade, and the sentences for "open the Bitcoin app" and a locked Ledger (matched from the client's status text). Jade's PIN step talks to Blockstream's PIN server outside any proxy.

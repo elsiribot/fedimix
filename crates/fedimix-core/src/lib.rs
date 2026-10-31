@@ -42,12 +42,12 @@ pub mod testing {
     };
     #[cfg(feature = "testing")]
     pub use crate::real::{Clock, SendHalt, halt_sends};
-    #[cfg(feature = "testing")]
-    pub use crate::saving::FakeChain;
     pub use crate::saving::{
-        ChainClient, DeviceAccount, Label, Labels, SavingWallet, SentRecord, SyncSummary, Tag,
-        connect_chain,
+        ChainClient, DeviceAccount, DevicePort, HwiPort, Label, Labels, SavingWallet, SentRecord,
+        Signer, SyncSummary, Tag, connect_chain,
     };
+    #[cfg(feature = "testing")]
+    pub use crate::saving::{FakeChain, SoftSigner};
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 
