@@ -12,9 +12,6 @@
 //! future cancels the wait at once; the call itself finishes on its own (see
 //! [`HwiSigner`] for what that means).
 
-// Used by the Saving operations from Task 5 on.
-#![allow(dead_code)]
-
 use std::str::FromStr;
 use std::sync::Arc;
 

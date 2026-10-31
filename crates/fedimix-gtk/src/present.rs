@@ -1018,6 +1018,8 @@ mod tests {
             in_flight: btc(0.42),
             coins: vec![],
             history: vec![],
+            chain_online: true,
+            problem: None,
         };
         assert_eq!(
             in_flight_line(&s),

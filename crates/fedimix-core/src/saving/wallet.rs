@@ -9,22 +9,25 @@
 //!
 //! The wallet sits behind a `Mutex` that is never held across an await: a sync
 //! takes its request out under the lock, waits for the chain without it, and
-//! applies the answer under the lock again.
+//! applies the answer under the lock again, on a blocking thread, as that write
+//! waits for a disk and for the store's connection.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bdk_wallet::Wallet;
 use bdk_wallet::bitcoin::bip32::{DerivationPath, Fingerprint, Xpub};
-use bdk_wallet::bitcoin::{self, Address, NetworkKind};
-use bdk_wallet::chain::ChainPosition;
+use bdk_wallet::bitcoin::constants::COINBASE_MATURITY;
+use bdk_wallet::bitcoin::{self, Address, NetworkKind, OutPoint, Txid};
 use bdk_wallet::chain::spk_client::{FullScanRequest, SyncRequest};
+use bdk_wallet::chain::{BlockId, ChainPosition};
 use bdk_wallet::rusqlite::{Connection, Transaction, TransactionBehavior};
 use bdk_wallet::{
-    ChangeSet, CreateWithPersistError, KeychainKind, LoadError, LoadMismatch, LoadWithPersistError,
-    PersistedWallet, Update, WalletPersister,
+    Balance, ChangeSet, CreateWithPersistError, KeychainKind, LoadError, LoadMismatch,
+    LoadWithPersistError, PersistedWallet, Update, WalletPersister,
 };
 
 use crate::api::{Amount, Coin, DeviceKind, HistoryItem, HistoryKind, HistoryStatus, Network};
@@ -55,8 +58,24 @@ pub struct DeviceAccount {
 pub struct SyncSummary {
     /// It was the first scan of this wallet (`stop_gap` 100), not a routine sync.
     pub full_scan: bool,
-    /// The wallet learned something new, and it is persisted.
+    /// The balance, the chain tip or the set of transactions moved, and it is
+    /// persisted. A pending transaction merely seen again is no change.
     pub changed: bool,
+}
+
+/// What the chain said, not yet applied. Waiting for it can be cancelled.
+pub(crate) struct Fetched {
+    full_scan: bool,
+    update: Update,
+}
+
+/// One moment of the wallet, read under one lock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavingSnapshot {
+    pub balance: Amount,
+    pub in_flight: Amount,
+    pub coins: Vec<Coin>,
+    pub history: Vec<HistoryItem>,
 }
 
 /// BDK's rusqlite persister, with the write lock taken when a transaction
@@ -102,9 +121,136 @@ struct Inner {
 }
 
 impl Inner {
-    /// Writes what the wallet has staged. Called after every change.
+    /// Writes what the wallet has staged.
     fn persist(&mut self) -> Result<bool> {
         self.wallet.persist(&mut self.db).map_err(db_err)
+    }
+
+    /// A wallet that never heard from a chain server knows only genesis.
+    fn first_scan_done(&self) -> bool {
+        self.wallet.latest_checkpoint().height() != 0
+    }
+
+    /// What a sync can change that anyone would notice.
+    fn view(&self) -> (Balance, BlockId, BTreeSet<Txid>) {
+        (
+            self.wallet.balance(),
+            self.wallet.latest_checkpoint().block_id(),
+            self.wallet
+                .transactions()
+                .map(|wtx| wtx.tx_node.txid)
+                .collect(),
+        )
+    }
+
+    /// The outpoints of coins past coinbase maturity, 100 confirmations, as
+    /// `Wallet::balance` counts it. Any coin not from a coinbase is mature.
+    fn mature_coins(&self) -> HashSet<String> {
+        let tip = self.wallet.latest_checkpoint().height();
+        let graph = self.wallet.tx_graph();
+        self.wallet
+            .list_unspent()
+            .filter(|utxo| {
+                let coinbase = graph
+                    .get_tx(utxo.outpoint.txid)
+                    .is_some_and(|tx| tx.is_coinbase());
+                let confirmed_at = utxo.chain_position.confirmation_height_upper_bound();
+                !coinbase
+                    || confirmed_at
+                        .is_some_and(|at| tip.saturating_sub(at) + 1 >= COINBASE_MATURITY)
+            })
+            .map(|utxo| utxo.outpoint.to_string())
+            .collect()
+    }
+
+    fn coins(&self, network: Network, labels: &Labels) -> Vec<Coin> {
+        let mut coins: Vec<Coin> = self
+            .wallet
+            .list_unspent()
+            .map(|utxo| {
+                let outpoint = utxo.outpoint.to_string();
+                let label = labels.get(&outpoint);
+                Coin {
+                    amount: sat(utxo.txout.value),
+                    tag: labels.tag(&outpoint).to_public(),
+                    received_at: position_time(&utxo.chain_position),
+                    address: Address::from_script(&utxo.txout.script_pubkey, btc_network(network))
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                    source_federation: label.and_then(|l| l.source_federation.clone()),
+                    frozen: label.is_some_and(|l| l.frozen),
+                    confirmed: utxo.chain_position.is_confirmed(),
+                    outpoint,
+                }
+            })
+            .collect();
+        coins.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| a.outpoint.cmp(&b.outpoint))
+        });
+        coins
+    }
+
+    fn history(&self, labels: &Labels) -> Vec<HistoryItem> {
+        let wallet = &self.wallet;
+        let mut items: Vec<HistoryItem> = wallet
+            .transactions()
+            .map(|wtx| {
+                let tx = &wtx.tx_node.tx;
+                let txid = wtx.tx_node.txid;
+                let (sent, received) = wallet.sent_and_received(tx);
+                let status = if wtx.chain_position.is_confirmed() {
+                    HistoryStatus::Complete
+                } else {
+                    HistoryStatus::Pending
+                };
+                let timestamp = position_time(&wtx.chain_position);
+                if sent.to_sat() == 0 {
+                    let unmixed = (0..tx.output.len() as u32).all(|vout| {
+                        let outpoint = OutPoint { txid, vout };
+                        !wallet.is_mine(tx.output[vout as usize].script_pubkey.clone())
+                            || labels.tag(&outpoint.to_string()) == Tag::Unmixed
+                    });
+                    return HistoryItem {
+                        id: txid.to_string(),
+                        kind: HistoryKind::Received { unmixed },
+                        amount: sat(received),
+                        incoming: true,
+                        status,
+                        timestamp,
+                        txid: Some(txid.to_string()),
+                        fee: None,
+                        session: None,
+                    };
+                }
+                let record = labels.sent(&txid.to_string());
+                let change = record.and_then(|r| r.change.clone());
+                let outputs: bitcoin::Amount = tx.output.iter().map(|o| o.value).sum();
+                // What left for someone else: all outputs, less what came
+                // back to this wallet and less change sent to Spending.
+                let to_spending = change
+                    .as_ref()
+                    .filter(|c| c.to_spending)
+                    .map_or(Amount::ZERO, |c| c.amount);
+                let amount = sat(outputs)
+                    .saturating_sub(sat(received))
+                    .saturating_sub(to_spending);
+                HistoryItem {
+                    id: txid.to_string(),
+                    kind: HistoryKind::Sent { change },
+                    amount,
+                    incoming: false,
+                    status,
+                    timestamp,
+                    txid: Some(txid.to_string()),
+                    fee: wallet.calculate_fee(tx).ok().map(sat),
+                    session: None,
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+        items
     }
 }
 
@@ -160,9 +306,10 @@ fn descriptors(account: &DeviceAccount, network: Network) -> Result<(String, Str
 }
 
 impl SavingWallet {
-    /// Stores the account and creates the wallet. Refused when Saving is
-    /// already set up. Nothing is written for an account that does not fit
-    /// `network`.
+    /// Stores the account and creates the wallet. Refused when another account
+    /// is stored; the same one carries on, as an earlier attempt may have
+    /// stopped between the two writes. Nothing is written for an account that
+    /// does not fit `network`.
     pub fn create(
         store_path: &Path,
         account: DeviceAccount,
@@ -170,7 +317,8 @@ impl SavingWallet {
     ) -> Result<SavingWallet> {
         descriptors(&account, network)?;
         let store = Store::open(store_path)?;
-        if !store.set_device_account(&account)? {
+        if !store.set_device_account(&account)? && store.device_account()? != Some(account.clone())
+        {
             return Err(FedimixError::NotSetUp(
                 "Saving is already set up with a hardware wallet.".into(),
             ));
@@ -241,50 +389,85 @@ impl SavingWallet {
     /// Asks the chain what changed and applies the answer. The first sync of a
     /// wallet is a full scan (`stop_gap` 100); later ones look only at the
     /// scripts already revealed. The lock is not held while waiting.
-    pub async fn sync(&self, chain: &dyn ChainClient) -> Result<SyncSummary> {
+    pub async fn sync(self: &Arc<Self>, chain: &dyn ChainClient) -> Result<SyncSummary> {
+        let fetched = self.fetch(chain).await?;
+        Arc::clone(self).apply(fetched).await
+    }
+
+    /// The asking half of [`Self::sync`]. Dropping it leaves nothing behind.
+    pub(crate) async fn fetch(&self, chain: &dyn ChainClient) -> Result<Fetched> {
         enum Request {
             Full(FullScanRequest<KeychainKind>),
             Routine(SyncRequest<(KeychainKind, u32)>),
         }
-        // A wallet that never heard from a chain server knows only genesis.
         let request = {
             let inner = self.lock();
-            if inner.wallet.latest_checkpoint().height() == 0 {
-                Request::Full(inner.wallet.start_full_scan().build())
-            } else {
+            if inner.first_scan_done() {
                 Request::Routine(inner.wallet.start_sync_with_revealed_spks().build())
+            } else {
+                Request::Full(inner.wallet.start_full_scan().build())
             }
         };
-        match request {
-            Request::Full(request) => {
-                let response = chain.full_scan(request, FULL_SCAN_STOP_GAP).await?;
-                let changed = self.apply_update(response.into())?;
-                Ok(SyncSummary {
-                    full_scan: true,
-                    changed,
-                })
-            }
-            Request::Routine(request) => {
-                let response = chain.sync(request).await?;
-                let changed = self.apply_update(response.into())?;
-                Ok(SyncSummary {
-                    full_scan: false,
-                    changed,
-                })
-            }
-        }
+        Ok(match request {
+            Request::Full(request) => Fetched {
+                full_scan: true,
+                update: chain.full_scan(request, FULL_SCAN_STOP_GAP).await?.into(),
+            },
+            Request::Routine(request) => Fetched {
+                full_scan: false,
+                update: chain.sync(request).await?.into(),
+            },
+        })
     }
 
-    /// Applies `update` and persists. `true` when anything changed.
+    /// The applying half of [`Self::sync`], on a blocking thread. It runs to
+    /// the end once started, so wait for it before letting go of the folder.
+    pub(crate) async fn apply(self: Arc<Self>, fetched: Fetched) -> Result<SyncSummary> {
+        let Fetched { full_scan, update } = fetched;
+        let changed = tokio::task::spawn_blocking(move || self.apply_update(update))
+            .await
+            .map_err(|_| {
+                FedimixError::Internal("Fedimix could not save what the chain server said.".into())
+            })??;
+        Ok(SyncSummary { full_scan, changed })
+    }
+
+    /// Whether the first scan has finished. Until then the address index knows
+    /// nothing of what the device used before.
+    pub fn first_scan_done(&self) -> bool {
+        self.lock().first_scan_done()
+    }
+
+    /// Applies `update`, and persists when it told the wallet something. What
+    /// else BDK staged is `last_seen` of a pending transaction, sent on every
+    /// sync; it stays staged and goes with the next real change, so a quiet
+    /// wallet does not write to disk each time.
     pub(crate) fn apply_update(&self, update: Update) -> Result<bool> {
         let mut inner = self.lock();
+        let before = inner.view();
         inner.wallet.apply_update(update).map_err(|_| {
             FedimixError::Internal(
-                "The chain server's answer does not continue the chain Fedimix last saw. Try again in a moment."
+                "The chain server is on a different chain from this wallet. Check the server in Settings."
                     .into(),
             )
         })?;
-        inner.persist()
+        let changed = inner.view() != before;
+        if changed {
+            inner.persist()?;
+        }
+        Ok(changed)
+    }
+
+    /// Balance, coins and history of one moment.
+    pub fn snapshot(&self, labels: &Labels) -> SavingSnapshot {
+        let inner = self.lock();
+        let balance = inner.wallet.balance();
+        SavingSnapshot {
+            balance: sat(balance.confirmed + balance.trusted_pending),
+            in_flight: sat(balance.untrusted_pending),
+            coins: inner.coins(self.network, labels),
+            history: inner.history(labels),
+        }
     }
 
     /// What is yours and settled, plus change from your own unconfirmed sends.
@@ -300,115 +483,31 @@ impl SavingWallet {
 
     /// Every coin the wallet owns, frozen and unconfirmed included.
     pub fn coins(&self, labels: &Labels) -> Vec<Coin> {
+        self.lock().coins(self.network, labels)
+    }
+
+    /// The coins a spend may pick: confirmed, mature and not frozen.
+    pub fn spendable_coins(&self, labels: &Labels) -> Vec<Coin> {
         let inner = self.lock();
-        let mut coins: Vec<Coin> = inner
-            .wallet
-            .list_unspent()
-            .map(|utxo| {
-                let outpoint = utxo.outpoint.to_string();
-                let label = labels.get(&outpoint);
-                Coin {
-                    amount: sat(utxo.txout.value),
-                    tag: labels.tag(&outpoint).to_public(),
-                    received_at: position_time(&utxo.chain_position),
-                    address: Address::from_script(
-                        &utxo.txout.script_pubkey,
-                        btc_network(self.network),
-                    )
-                    .map(|a| a.to_string())
-                    .unwrap_or_default(),
-                    source_federation: label.and_then(|l| l.source_federation.clone()),
-                    frozen: label.is_some_and(|l| l.frozen),
-                    outpoint,
-                }
-            })
-            .collect();
-        coins.sort_by(|a, b| {
-            b.received_at
-                .cmp(&a.received_at)
-                .then_with(|| a.outpoint.cmp(&b.outpoint))
-        });
+        let mature = inner.mature_coins();
+        let mut coins = inner.coins(self.network, labels);
+        coins.retain(|coin| !coin.frozen && coin.confirmed && mature.contains(&coin.outpoint));
         coins
     }
 
-    /// The coins a spend may pick: confirmed and not frozen.
-    pub fn spendable_coins(&self, labels: &Labels) -> Vec<Coin> {
-        let confirmed: std::collections::HashSet<String> = self
-            .lock()
-            .wallet
-            .list_unspent()
-            .filter(|u| u.chain_position.is_confirmed())
-            .map(|u| u.outpoint.to_string())
-            .collect();
-        self.coins(labels)
-            .into_iter()
-            .filter(|c| !c.frozen && confirmed.contains(&c.outpoint))
-            .collect()
+    /// Whether `outpoint` (`txid:vout`) is an unspent coin of this wallet.
+    pub fn has_coin(&self, outpoint: &str) -> bool {
+        OutPoint::from_str(outpoint).is_ok_and(|outpoint| {
+            let inner = self.lock();
+            inner.wallet.get_utxo(outpoint).is_some()
+        })
     }
 
     /// The wallet's transactions, newest first, from BDK's canonical view: a
     /// transaction the chain server dropped is no longer shown. A send nests
     /// where its change went when Fedimix recorded it (`Labels::record_sent`).
     pub fn history(&self, labels: &Labels) -> Vec<HistoryItem> {
-        let inner = self.lock();
-        let wallet = &inner.wallet;
-        let mut items: Vec<HistoryItem> = wallet
-            .transactions()
-            .map(|wtx| {
-                let tx = &wtx.tx_node.tx;
-                let txid = wtx.tx_node.txid;
-                let (sent, received) = wallet.sent_and_received(tx);
-                let status = if wtx.chain_position.is_confirmed() {
-                    HistoryStatus::Complete
-                } else {
-                    HistoryStatus::Pending
-                };
-                let timestamp = position_time(&wtx.chain_position);
-                if sent.to_sat() == 0 {
-                    let unmixed = (0..tx.output.len() as u32).all(|vout| {
-                        let outpoint = bitcoin::OutPoint { txid, vout };
-                        !wallet.is_mine(tx.output[vout as usize].script_pubkey.clone())
-                            || labels.tag(&outpoint.to_string()) == Tag::Unmixed
-                    });
-                    return HistoryItem {
-                        id: txid.to_string(),
-                        kind: HistoryKind::Received { unmixed },
-                        amount: sat(received),
-                        incoming: true,
-                        status,
-                        timestamp,
-                        txid: Some(txid.to_string()),
-                        fee: None,
-                        session: None,
-                    };
-                }
-                let record = labels.sent(&txid.to_string());
-                let change = record.and_then(|r| r.change.clone());
-                let outputs: bitcoin::Amount = tx.output.iter().map(|o| o.value).sum();
-                // What left for someone else: all outputs, less what came
-                // back to this wallet and less change sent to Spending.
-                let to_spending = change
-                    .as_ref()
-                    .filter(|c| c.to_spending)
-                    .map_or(Amount::ZERO, |c| c.amount);
-                let amount = sat(outputs)
-                    .saturating_sub(sat(received))
-                    .saturating_sub(to_spending);
-                HistoryItem {
-                    id: txid.to_string(),
-                    kind: HistoryKind::Sent { change },
-                    amount,
-                    incoming: false,
-                    status,
-                    timestamp,
-                    txid: Some(txid.to_string()),
-                    fee: wallet.calculate_fee(tx).ok().map(sat),
-                    session: None,
-                }
-            })
-            .collect();
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
-        items
+        self.lock().history(labels)
     }
 
     /// A receive address that was never given out before, and the choice is
@@ -458,17 +557,15 @@ fn position_time(position: &ChainPosition<bdk_wallet::chain::ConfirmationBlockTi
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bdk_wallet::bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::secp256k1::Secp256k1;
     use bdk_wallet::bitcoin::{
-        Address, Amount as BtcAmount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-        TxOut, Txid, Witness, absolute, transaction,
+        Amount as BtcAmount, BlockHash, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute, transaction,
     };
     use bdk_wallet::chain::spk_client::SyncResponse;
-    use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxUpdate};
+    use bdk_wallet::chain::{CheckPoint, ConfirmationBlockTime, TxUpdate};
     use std::str::FromStr;
 
     use super::*;
@@ -748,11 +845,170 @@ mod tests {
     }
 
     #[test]
-    fn creating_twice_is_refused() {
+    fn creating_on_another_account_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let _w = new_wallet(&dir);
-        let again = SavingWallet::create(&db(&dir), account(Network::Regtest), Network::Regtest);
+        let other = DeviceAccount {
+            fingerprint: "aabbccdd".into(),
+            ..account(Network::Regtest)
+        };
+        let again = SavingWallet::create(&db(&dir), other, Network::Regtest);
         assert!(matches!(again, Err(FedimixError::NotSetUp(_))), "{again:?}");
+    }
+
+    /// The account row commits before the wallet: a retry must get past it.
+    #[test]
+    fn a_failed_create_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        // As after a failed attach: the store has the account, BDK nothing.
+        Store::open(&db(&dir))
+            .unwrap()
+            .set_device_account(&account(Network::Regtest))
+            .unwrap();
+        let w = SavingWallet::create(&db(&dir), account(Network::Regtest), Network::Regtest);
+        assert!(w.unwrap().next_receive_address().is_ok());
+    }
+
+    #[test]
+    fn immature_coinbase_is_not_spendable() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        let address = w.next_receive_address().unwrap();
+        let coinbase = tx_paying(
+            TxIn {
+                previous_output: OutPoint::null(),
+                ..unique_input(0)
+            },
+            vec![(spk(&address), 5_000_000)],
+        );
+        show(&w, &coinbase, Some(5));
+        let labels = Labels::default();
+        assert_eq!(w.coins(&labels).len(), 1, "it is yours");
+        assert!(w.coins(&labels)[0].confirmed);
+        assert!(w.spendable_coins(&labels).is_empty(), "not yet");
+        // One block short of 100 confirmations, then the hundredth.
+        let advance = |height: u32| {
+            let block_id = BlockId {
+                height,
+                hash: BlockHash::from_byte_array([height as u8; 32]),
+            };
+            w.apply_update(Update {
+                chain: Some(w.tip().insert(block_id)),
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        advance(103);
+        assert!(w.spendable_coins(&labels).is_empty());
+        advance(104);
+        assert_eq!(w.spendable_coins(&labels).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sync_that_learns_nothing_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(new_wallet(&dir));
+        fund(&w, 0, 10_000, Some(1));
+        let (pending, _) = fund(&w, 1, 20_000, None);
+        let tx = w.lock().wallet.get_tx(pending.txid).unwrap().tx_node.tx;
+        let chain = FakeChain::new();
+        // The same transaction, seen again later: only `last_seen` moves.
+        let mut response = SyncResponse::default();
+        response.tx_update.txs = vec![tx];
+        response.tx_update.seen_ats = [(pending.txid, SEEN_AT + 60)].into();
+        chain.push_sync(response);
+        assert!(!w.sync(&chain).await.unwrap().changed);
+        assert!(w.lock().wallet.staged().is_some(), "held, not written");
+
+        // A new block is news, and what was held goes with it.
+        chain.push_sync(SyncResponse {
+            chain_update: Some(w.tip().insert(BlockId {
+                height: 2,
+                hash: BlockHash::from_byte_array([2; 32]),
+            })),
+            ..Default::default()
+        });
+        assert!(w.sync(&chain).await.unwrap().changed);
+        assert!(w.lock().wallet.staged().is_none());
+    }
+
+    #[test]
+    fn a_snapshot_agrees_with_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        let (settled, _) = fund(&w, 0, 10_000, Some(1));
+        let (pending, _) = fund(&w, 1, 20_000, None);
+        let snapshot = w.snapshot(&Labels::default());
+        assert_eq!(snapshot.balance, Amount::from_sat(10_000));
+        assert_eq!(snapshot.in_flight, Amount::from_sat(20_000));
+        assert_eq!(snapshot.history.len(), 2);
+        let confirmed = |outpoint: OutPoint| {
+            let coins = &snapshot.coins;
+            coins
+                .iter()
+                .find(|c| c.outpoint == outpoint.to_string())
+                .unwrap()
+                .confirmed
+        };
+        assert!(confirmed(settled));
+        assert!(!confirmed(pending));
+    }
+
+    #[test]
+    fn another_chain_points_at_the_server_in_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        fund(&w, 0, 10_000, Some(1));
+        let other = CheckPoint::new(BlockId {
+            height: 0,
+            hash: BlockHash::from_byte_array([9; 32]),
+        });
+        let err = w
+            .apply_update(Update {
+                chain: Some(other),
+                ..Default::default()
+            })
+            .unwrap_err();
+        let FedimixError::Internal(sentence) = err else {
+            panic!("{err:?}");
+        };
+        assert!(sentence.contains("server in Settings"), "{sentence}");
+        assert!(!sentence.contains("Try again"), "{sentence}");
+    }
+
+    /// A slow write must not stop the worker that runs everything else: this
+    /// runtime has one thread, and the ticks must go on during the write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn applying_leaves_the_async_worker_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(new_wallet(&dir));
+        let fetched = w.fetch(&FakeChain::new()).await.unwrap();
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let holder = Arc::clone(&w);
+        let held = std::thread::spawn(move || {
+            let _guard = holder.lock();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        is_locked.recv().unwrap();
+        let ticks = async {
+            let mut ticks = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks += 1;
+                if ticks == 5 {
+                    return ticks;
+                }
+            }
+        };
+        let apply = Arc::clone(&w).apply(fetched);
+        tokio::pin!(apply);
+        tokio::select! {
+            _ = &mut apply => panic!("applied before the lock was free"),
+            ticks = ticks => assert_eq!(ticks, 5),
+        }
+        apply.await.unwrap();
+        held.join().unwrap();
     }
 
     #[test]
@@ -881,10 +1137,10 @@ mod tests {
         assert_eq!(history[0].status, HistoryStatus::Complete);
     }
 
-    #[test]
-    fn dropped_unconfirmed_tx_leaves_history() {
+    #[tokio::test]
+    async fn dropped_unconfirmed_tx_leaves_history() {
         let dir = tempfile::tempdir().unwrap();
-        let w = new_wallet(&dir);
+        let w = Arc::new(new_wallet(&dir));
         fund(&w, 0, 10_000, Some(1));
         let (pending, _) = fund(&w, 1, 20_000, None);
         let labels = Labels::default();
@@ -898,7 +1154,7 @@ mod tests {
         let mut response = SyncResponse::default();
         response.tx_update.evicted_ats = [(pending.txid, SEEN_AT + 1_000)].into();
         chain.push_sync(response);
-        let summary = futures::executor::block_on(w.sync(&chain)).unwrap();
+        let summary = w.sync(&chain).await.unwrap();
         assert!(!summary.full_scan);
         assert!(summary.changed);
 
@@ -915,10 +1171,10 @@ mod tests {
         assert_eq!(w.history(&labels).len(), 1);
     }
 
-    #[test]
-    fn first_sync_is_a_full_scan_then_routine() {
+    #[tokio::test]
+    async fn first_sync_is_a_full_scan_then_routine() {
         let dir = tempfile::tempdir().unwrap();
-        let w = new_wallet(&dir);
+        let w = Arc::new(new_wallet(&dir));
         let chain = FakeChain::new();
         let tip = w.tip().insert(BlockId {
             height: 3,
@@ -928,22 +1184,24 @@ mod tests {
             chain_update: Some(tip),
             ..Default::default()
         });
-        let first = futures::executor::block_on(w.sync(&chain)).unwrap();
+        assert!(!w.first_scan_done());
+        let first = w.sync(&chain).await.unwrap();
         assert!(first.full_scan);
-        let second = futures::executor::block_on(w.sync(&chain)).unwrap();
+        assert!(w.first_scan_done());
+        let second = w.sync(&chain).await.unwrap();
         assert!(!second.full_scan);
         assert_eq!(chain.full_scans_made(), 1);
         assert_eq!(chain.scans_made(), 2);
     }
 
-    #[test]
-    fn offline_sync_changes_nothing() {
+    #[tokio::test]
+    async fn offline_sync_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let w = new_wallet(&dir);
+        let w = Arc::new(new_wallet(&dir));
         fund(&w, 0, 10_000, Some(1));
         let chain = FakeChain::new();
         chain.set_offline(true);
-        let err = futures::executor::block_on(w.sync(&chain)).unwrap_err();
+        let err = w.sync(&chain).await.unwrap_err();
         assert_eq!(err, FedimixError::Offline);
         assert_eq!(w.balance(), Amount::from_sat(10_000));
     }
@@ -986,7 +1244,8 @@ mod tests {
             .unwrap()
             .unwrap();
         // 150 revealed and persisted: the next one is the 151st.
-        let reference = new_wallet(&tempfile::tempdir().unwrap());
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = new_wallet(&reference_dir);
         let expected = (0..151)
             .map(|_| reference.next_receive_address().unwrap())
             .last();

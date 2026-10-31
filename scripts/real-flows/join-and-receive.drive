@@ -12,7 +12,8 @@ shot joined
 expect-not Write down your recovery words
 click Saving
 expect Connect a hardware wallet
-expect Available in a later version
+expect Set up
+expect-not Available in a later version
 shot saving
 click Spending
 expect-not Show cover traffic

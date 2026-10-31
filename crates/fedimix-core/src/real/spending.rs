@@ -13,6 +13,7 @@ pub(super) fn spending_state(
     federation: Option<FederationInfo>,
     total_balance: Amount,
     target: Amount,
+    saving_ready: bool,
     notes: Vec<NoteBucket>,
     history: Vec<HistoryItem>,
 ) -> SpendingState {
@@ -25,10 +26,13 @@ pub(super) fn spending_state(
         target,
         for_spending,
         moving,
-        saving_ready: false,
+        saving_ready,
         notes,
         history,
-        features: Features::NONE,
+        features: Features {
+            saving: true,
+            ..Features::NONE
+        },
     }
 }
 
@@ -40,15 +44,5 @@ pub(super) fn queue_state() -> QueueState {
         typical_exit_secs: 0,
         waiting_for_saving: true,
         items: Vec::new(),
-    }
-}
-
-pub(super) fn saving_state(history: Vec<HistoryItem>) -> SavingState {
-    SavingState {
-        device: None,
-        balance: Amount::ZERO,
-        in_flight: Amount::ZERO,
-        coins: Vec::new(),
-        history,
     }
 }

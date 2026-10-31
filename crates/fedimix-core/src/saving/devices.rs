@@ -6,9 +6,6 @@
 //! the `open` functions below has talked to a device. They follow the shapes in
 //! async-hwi 0.0.35's own sources and the Phase 3 spike.
 
-// Used by the Saving operations from Task 5 on.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;

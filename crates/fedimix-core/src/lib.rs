@@ -41,23 +41,33 @@ pub mod testing {
         LightningInvoice, LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
     #[cfg(feature = "testing")]
-    pub use crate::real::{Clock, SendHalt, halt_sends};
+    pub use crate::real::{ChainFactory, Clock, SendHalt, halt_sends, sync_saving_now};
     pub use crate::saving::{
         ChainClient, DeviceAccount, DevicePort, HwiPort, Label, Labels, SavingWallet, SentRecord,
         Signer, SyncSummary, Tag, connect_chain,
     };
     #[cfg(feature = "testing")]
-    pub use crate::saving::{FakeChain, SoftSigner};
+    pub use crate::saving::{FakeChain, FakeDevices, SoftSigner};
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 
-    /// [`crate::RealBackend`] over `port`, reading the time from `clock`.
+    /// [`crate::RealBackend`] over `port`, reading the time from `clock`, with
+    /// the real chain connector and no devices.
     #[cfg(feature = "testing")]
     pub async fn real_backend(
         config: crate::CoreConfig,
         port: std::sync::Arc<dyn FederationPort>,
         clock: Clock,
     ) -> crate::Result<std::sync::Arc<crate::RealBackend>> {
-        crate::RealBackend::with_port(config, port, clock).await
+        crate::RealBackend::build(
+            config,
+            port,
+            std::sync::Arc::new(|backend: &crate::ChainBackend, proxy: Option<&str>| {
+                connect_chain(backend, proxy)
+            }),
+            std::sync::Arc::new(FakeDevices::new()),
+            clock,
+        )
+        .await
     }
 }

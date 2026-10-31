@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{Transaction, Txid};
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
+use tokio::sync::watch;
 
 use super::ChainClient;
 use crate::error::{FedimixError, Result};
@@ -28,6 +29,7 @@ struct State {
 #[derive(Default)]
 pub struct FakeChain {
     state: Mutex<State>,
+    stalled: watch::Sender<bool>,
 }
 
 impl FakeChain {
@@ -39,7 +41,9 @@ impl FakeChain {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn check_online(&self) -> Result<()> {
+    /// Waits out a stall, then answers as the server is now.
+    async fn check_online(&self) -> Result<()> {
+        let _ = self.stalled.subscribe().wait_for(|stalled| !stalled).await;
         if self.state().offline {
             Err(FedimixError::Offline)
         } else {
@@ -49,6 +53,12 @@ impl FakeChain {
 
     pub fn set_offline(&self, offline: bool) {
         self.state().offline = offline;
+    }
+
+    /// While stalled, a scan or sync hangs without an answer, as a server that
+    /// accepted the connection and went quiet does.
+    pub fn set_stalled(&self, stalled: bool) {
+        self.stalled.send_replace(stalled);
     }
 
     pub fn set_fee_rate(&self, rate: Option<f64>) {
@@ -93,7 +103,7 @@ impl ChainClient for FakeChain {
         _request: FullScanRequest<KeychainKind>,
         _stop_gap: usize,
     ) -> Result<FullScanResponse<KeychainKind>> {
-        self.check_online()?;
+        self.check_online().await?;
         let mut state = self.state();
         state.scans_made += 1;
         state.full_scans_made += 1;
@@ -101,14 +111,14 @@ impl ChainClient for FakeChain {
     }
 
     async fn sync(&self, _request: SyncRequest<(KeychainKind, u32)>) -> Result<SyncResponse> {
-        self.check_online()?;
+        self.check_online().await?;
         let mut state = self.state();
         state.scans_made += 1;
         Ok(state.syncs.pop_front().unwrap_or_default())
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
-        self.check_online()?;
+        self.check_online().await?;
         let mut state = self.state();
         state.broadcasts.push(tx.clone());
         state.known.insert(tx.compute_txid());
@@ -116,12 +126,12 @@ impl ChainClient for FakeChain {
     }
 
     async fn fee_rate_sat_vb(&self, _target_blocks: u16) -> Result<Option<f64>> {
-        self.check_online()?;
+        self.check_online().await?;
         Ok(self.state().fee_rate)
     }
 
     async fn tx_seen(&self, txid: Txid) -> Result<bool> {
-        self.check_online()?;
+        self.check_online().await?;
         Ok(self.state().known.contains(&txid))
     }
 }

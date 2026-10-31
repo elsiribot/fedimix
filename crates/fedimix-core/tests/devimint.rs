@@ -15,13 +15,15 @@ use fedimint_core::PeerId;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
 use fedimix_core::testing::{
-    DataDirLock, DepositEvent, FederationClient, FederationPort, FedimintPort, Seed, SendHalt,
-    Watch, WatchKind, WatchUpdate, connect_chain, halt_sends,
+    ChainFactory, DataDirLock, DepositEvent, FakeDevices, FederationClient, FederationPort,
+    FedimintPort, Seed, SendHalt, SoftSigner, Watch, WatchKind, WatchUpdate, connect_chain,
+    halt_sends, sync_saving_now,
 };
 use fedimix_core::{
-    Amount, Backend, ChainBackend, CoreConfig, Event, EventStream, FedimixError, HistoryItem,
-    HistoryStatus, Network, Notice, OperationState, RealBackend, ReceiveInfo, ReceiveMethod,
-    ReceiveRequest, SendAmount, SendPreview, SendRequest, WalletKind,
+    Amount, Backend, ChainBackend, CoreConfig, DeviceKind, Event, EventStream, FedimixError,
+    HistoryItem, HistoryKind, HistoryStatus, Network, Notice, OperationState, PrivacyTag,
+    RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest, SendAmount, SendPreview, SendRequest,
+    Settings, WalletKind,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -1597,4 +1599,84 @@ async fn proxy_down_fails_closed() {
         connections.fetch_add(1, Ordering::SeqCst);
     }
     assert_eq!(connections.load(Ordering::SeqCst), 0, "a direct connection");
+}
+
+/// Setup from a software device, the first scan, a Receive address paid from
+/// bitcoind, and the coin on the Saving tab, against both kinds of server.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn saving_sees_a_funded_address() {
+    const SAT: u64 = 70_000;
+    for server in [esplora(), electrum()] {
+        let (dir, config) = folder();
+        let devices = Arc::new(FakeDevices::new());
+        let seed: [u8; 32] = rand::random();
+        devices.add(
+            "software:test",
+            "Test device",
+            DeviceKind::Software,
+            Arc::new(SoftSigner::from_seed(&seed, bitcoin::Network::Regtest)),
+        );
+        let factory: ChainFactory = Arc::new(connect_chain);
+        let port = Arc::new(FedimintPort::new(dir.path()));
+        let backend = RealBackend::with_ports(config, port, factory, devices)
+            .await
+            .unwrap();
+        backend
+            .set_settings(Settings {
+                chain_backend: server.clone(),
+                ..Settings::for_network(Network::Regtest)
+            })
+            .await
+            .unwrap();
+        backend.setup_saving("software:test".into()).await.unwrap();
+
+        let request = || ReceiveRequest {
+            wallet: WalletKind::Saving,
+            method: ReceiveMethod::OnChain,
+        };
+        let address = tokio::time::timeout(PATIENCE, async {
+            loop {
+                match backend.receive(request()).await {
+                    Ok(info) => return info.payload,
+                    Err(FedimixError::Internal(_)) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("{server:?}: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("the first scan ends");
+
+        fund(&address, SAT);
+        mine(1);
+        tokio::time::timeout(PATIENCE, async {
+            loop {
+                sync_saving_now(&backend);
+                let state = backend.saving_state().await.unwrap();
+                if state.balance == Amount::from_sat(SAT) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{server:?}: the funded address is seen"));
+
+        let state = backend.saving_state().await.unwrap();
+        assert!(state.chain_online, "{server:?}");
+        assert_eq!(state.problem, None);
+        assert_eq!(state.coins.len(), 1);
+        assert_eq!(state.coins[0].address, address);
+        assert_eq!(state.coins[0].tag, PrivacyTag::Unmixed);
+        assert!(state.coins[0].confirmed);
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].status, HistoryStatus::Complete);
+        assert_eq!(
+            state.history[0].kind,
+            HistoryKind::Received { unmixed: true }
+        );
+        backend.shutdown().await.unwrap();
+    }
 }

@@ -553,6 +553,7 @@ impl State {
                             address: fixtures::address_for(n),
                             source_federation: None,
                             frozen: false,
+                            confirmed: true,
                         });
                         Some(SentChange {
                             amount: *amount,
@@ -652,6 +653,7 @@ impl State {
             address: fixtures::address_for(n),
             source_federation,
             frozen: false,
+            confirmed: true,
         });
         let spending_item = self.history_item(
             HistoryKind::ToSaving {
@@ -837,6 +839,8 @@ impl Backend for DemoBackend {
             in_flight: st.in_flight,
             coins: st.coins.clone(),
             history: newest(&st.saving_history),
+            chain_online: true,
+            problem: None,
         })
     }
 

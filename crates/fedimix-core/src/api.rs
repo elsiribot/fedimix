@@ -239,6 +239,8 @@ pub struct Coin {
     pub address: String,
     pub source_federation: Option<String>,
     pub frozen: bool,
+    /// In a block. `coins` can sum above `balance` while this is false.
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +250,12 @@ pub struct SavingState {
     pub in_flight: Amount,
     pub coins: Vec<Coin>,
     pub history: Vec<HistoryItem>,
+    /// The last sync reached the chain server. While false, the numbers above
+    /// are the last ones known.
+    pub chain_online: bool,
+    /// What the user can do about the chain server, as a sentence. Being
+    /// offline is not one: waiting cures that.
+    pub problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

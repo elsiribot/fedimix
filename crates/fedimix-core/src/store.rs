@@ -869,10 +869,6 @@ impl Store {
         Ok(n == 1)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
-    )]
     pub(crate) fn saving_labels(&self) -> Result<Labels> {
         let mut coins = HashMap::new();
         let mut stmt = self
@@ -931,38 +927,46 @@ impl Store {
         Ok(Labels::from_rows(coins, sent))
     }
 
+    /// Sets the tag and source of `outpoint`, and leaves `frozen` alone.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
+        expect(dead_code, reason = "the Saving send of Task 6 uses it")
     )]
-    pub(crate) fn put_saving_label(&self, outpoint: &str, label: &Label) -> Result<()> {
-        let (tag, estimate) = match label.tag.map(Tag::to_parts) {
-            Some((name, estimate)) => (Some(name), estimate),
-            None => (None, None),
-        };
-        let tx = begin(&self.conn)?;
-        tx.execute(
-            "INSERT INTO saving_labels (outpoint, tag, estimate, source_federation, frozen)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(outpoint) DO UPDATE SET tag = excluded.tag,
-                estimate = excluded.estimate,
-                source_federation = excluded.source_federation,
-                frozen = excluded.frozen",
-            params![
-                outpoint,
-                tag,
-                estimate,
-                label.source_federation,
-                label.frozen
-            ],
-        )
-        .map_err(db_err)?;
-        tx.commit().map_err(db_err)
+    pub(crate) fn set_saving_tag(
+        &self,
+        outpoint: &str,
+        tag: Tag,
+        source_federation: Option<&str>,
+    ) -> Result<()> {
+        let (tag, estimate) = tag.to_parts();
+        self.conn
+            .execute(
+                "INSERT INTO saving_labels (outpoint, tag, estimate, source_federation, frozen)
+                 VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(outpoint) DO UPDATE SET tag = excluded.tag,
+                    estimate = excluded.estimate,
+                    source_federation = excluded.source_federation",
+                params![outpoint, tag, estimate, source_federation],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Sets `frozen` of `outpoint`, and leaves its tag and source alone.
+    pub(crate) fn set_saving_frozen(&self, outpoint: &str, frozen: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO saving_labels (outpoint, frozen) VALUES (?1, ?2)
+                 ON CONFLICT(outpoint) DO UPDATE SET frozen = excluded.frozen",
+                params![outpoint, frozen],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
+        expect(dead_code, reason = "the Saving send of Task 6 uses it")
     )]
     pub(crate) fn put_saving_sent(&self, txid: &str, sent: &SentRecord) -> Result<()> {
         let (msat, to_spending) = match &sent.change {

@@ -7,6 +7,7 @@
 
 mod events;
 mod receive;
+mod saving;
 mod send;
 mod spending;
 
@@ -20,6 +21,9 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use self::events::{Events, left_open, supervise};
+#[cfg(feature = "testing")]
+pub use self::saving::sync_saving_now;
+use self::saving::{ChainTarget, SavingLive, supervise_saving};
 use self::send::{HeldSend, Submitting};
 #[cfg(feature = "testing")]
 pub use self::send::{SendHalt, halt_sends};
@@ -29,6 +33,7 @@ use crate::config::CoreConfig;
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream};
 use crate::federation::{FederationClient, FederationPort, FederationPreview, FedimintPort};
+use crate::saving::{ChainClient, DevicePort, HwiPort, SavingWallet, connect_chain};
 use crate::seed::{DataDirLock, Seed};
 use crate::store::{FederationRow, Store, Watch};
 
@@ -40,6 +45,11 @@ const SATS_SUPPLY: u64 = 2_100_000_000_000_000;
 
 /// The time in Unix seconds. Injected so tests are deterministic.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
+/// Makes the chain client for a server and a proxy. Injected so tests need no
+/// server.
+pub type ChainFactory =
+    Arc<dyn Fn(&ChainBackend, Option<&str>) -> Result<Arc<dyn ChainClient>> + Send + Sync>;
 
 /// Whether federation connections may exist. Every task and join follows this,
 /// so one change reaches them all.
@@ -146,6 +156,8 @@ fn check_ranges(settings: &Settings) -> Result<()> {
 struct Core {
     config: CoreConfig,
     port: Arc<dyn FederationPort>,
+    chain_factory: ChainFactory,
+    devices: Arc<dyn DevicePort>,
     seed: Seed,
     /// `false` when the seed is older than the store: the store was lost, so
     /// this seed may have been used at a federation the store does not list.
@@ -153,6 +165,13 @@ struct Core {
     clock: Clock,
     store: Mutex<Store>,
     state: Mutex<State>,
+    saving: Mutex<SavingLive>,
+    /// Held through a setup, which can wait for the user at the device.
+    saving_setup: tokio::sync::Mutex<()>,
+    /// Ends the Saving sync task's wait between syncs.
+    saving_wake: Notify,
+    /// The chain server and proxy in force, so a change reaches the sync task.
+    chain: watch::Sender<ChainTarget>,
     /// Sends between their row and the end of `pay_invoice` or `withdraw`. A
     /// watch channel, so `shutdown` can wait for it to empty.
     submitting: watch::Sender<Submitting>,
@@ -356,6 +375,13 @@ impl Core {
             recovery_words_shown: settings.recovery_words_shown || shown,
             ..settings.clone()
         })?;
+        // As stored, which is what a restart would read.
+        let target = ChainTarget::of(&store.settings()?);
+        self.chain.send_if_modified(|chain| {
+            let changed = *chain != target;
+            *chain = target;
+            changed
+        });
         self.gate.send_if_modified(|gate| {
             let next = if *gate == Gate::Stopped {
                 Gate::Stopped
@@ -424,13 +450,30 @@ impl RealBackend {
     /// Reads the data folder and returns. Federations connect in the
     /// background, so this works with no network. Needs a tokio runtime.
     pub async fn open(config: CoreConfig) -> Result<Arc<RealBackend>> {
-        let port = Arc::new(FedimintPort::new(Path::new(&config.data_dir)));
-        Self::with_port(config, port, Arc::new(system_clock)).await
+        let dir = Path::new(&config.data_dir);
+        let port = Arc::new(FedimintPort::new(dir));
+        let devices = Arc::new(HwiPort::new(dir, config.network));
+        let chain_factory =
+            Arc::new(|backend: &ChainBackend, proxy: Option<&str>| connect_chain(backend, proxy));
+        Self::build(config, port, chain_factory, devices, Arc::new(system_clock)).await
     }
 
-    pub(crate) async fn with_port(
+    /// [`Self::open`] over the given seams.
+    #[cfg(feature = "testing")]
+    pub async fn with_ports(
         config: CoreConfig,
         port: Arc<dyn FederationPort>,
+        chain_factory: ChainFactory,
+        devices: Arc<dyn DevicePort>,
+    ) -> Result<Arc<RealBackend>> {
+        Self::build(config, port, chain_factory, devices, Arc::new(system_clock)).await
+    }
+
+    pub(crate) async fn build(
+        config: CoreConfig,
+        port: Arc<dyn FederationPort>,
+        chain_factory: ChainFactory,
+        devices: Arc<dyn DevicePort>,
         clock: Clock,
     ) -> Result<Arc<RealBackend>> {
         let dir = PathBuf::from(&config.data_dir);
@@ -449,16 +492,27 @@ impl RealBackend {
         let store = Store::open(&db)?;
         store.bind_network(config.network)?;
         let seed_born_with_store = store.seed_born_with_store(seed_is_new)?;
-        let gate = Gate::of(&store.settings()?);
+        let settings = store.settings()?;
+        let gate = Gate::of(&settings);
+        let chain = ChainTarget::of(&settings);
         let rows = store.federations()?;
+        let account = store.device_account()?;
+        let saving = SavingLive::opened(account.as_ref(), SavingWallet::open(&db, config.network));
+        let saving_wallet = saving.wallet();
         let core = Arc::new(Core {
             config,
             port,
+            chain_factory,
+            devices,
             seed,
             seed_born_with_store,
             clock,
             store: Mutex::new(store),
             state: Mutex::default(),
+            saving: Mutex::new(saving),
+            saving_setup: tokio::sync::Mutex::default(),
+            saving_wake: Notify::new(),
+            chain: watch::Sender::new(chain),
             submitting: watch::Sender::default(),
             #[cfg(feature = "testing")]
             halt: Mutex::default(),
@@ -467,10 +521,13 @@ impl RealBackend {
             supervisors: tokio::sync::Mutex::default(),
             lock: Mutex::new(Some(lock)),
         });
-        let supervisors = rows
+        let mut supervisors: Vec<_> = rows
             .into_iter()
             .map(|row| tokio::spawn(supervise(Arc::clone(&core), row.id)))
             .collect();
+        if let Some(wallet) = saving_wallet {
+            supervisors.push(tokio::spawn(supervise_saving(Arc::clone(&core), wallet)));
+        }
         *core.supervisors.lock().await = supervisors;
         Ok(Arc::new(RealBackend { core }))
     }
@@ -491,16 +548,12 @@ impl Backend for RealBackend {
     }
 
     async fn saving_state(&self) -> Result<SavingState> {
-        Ok(spending::saving_state(self.core.store().history_page(
-            WalletKind::Saving,
-            None,
-            None,
-            SNAPSHOT_HISTORY,
-        )?))
+        self.core.saving_state()
     }
 
     async fn spending_state(&self) -> Result<SpendingState> {
         let core = &self.core;
+        let saving_ready = core.saving().is_set_up();
         let (rows, active, target) = {
             let store = core.store();
             (
@@ -517,6 +570,7 @@ impl Backend for RealBackend {
                 None,
                 total_balance,
                 target,
+                saving_ready,
                 Vec::new(),
                 Vec::new(),
             ));
@@ -536,6 +590,7 @@ impl Backend for RealBackend {
             Some(federation),
             total_balance,
             target,
+            saving_ready,
             notes,
             history,
         ))
@@ -574,11 +629,11 @@ impl Backend for RealBackend {
     }
 
     async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
-        Ok(Vec::new())
+        self.core.detect_devices().await
     }
 
-    async fn setup_saving(&self, _device_id: String) -> Result<()> {
-        Err(saving_not_set_up())
+    async fn setup_saving(&self, device_id: String) -> Result<()> {
+        self.core.setup_saving(&device_id).await
     }
 
     async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo> {
@@ -623,8 +678,8 @@ impl Backend for RealBackend {
         }
     }
 
-    async fn set_coin_frozen(&self, _outpoint: String, _frozen: bool) -> Result<()> {
-        Err(saving_not_set_up())
+    async fn set_coin_frozen(&self, outpoint: String, frozen: bool) -> Result<()> {
+        self.core.set_coin_frozen(&outpoint, frozen)
     }
 
     async fn history(
@@ -633,23 +688,20 @@ impl Backend for RealBackend {
         before: Option<String>,
         limit: u32,
     ) -> Result<HistoryPage> {
-        let store = self.core.store();
-        let federation = match wallet {
-            WalletKind::Saving => None,
-            WalletKind::Spending => match store.active_federation()? {
-                Some(id) => Some(id),
-                None => {
-                    return Ok(HistoryPage {
-                        items: Vec::new(),
-                        more: false,
-                    });
-                }
-            },
-        };
         let limit = limit as usize;
+        if wallet == WalletKind::Saving {
+            return self.core.saving_history(before.as_deref(), limit);
+        }
+        let store = self.core.store();
+        let Some(federation) = store.active_federation()? else {
+            return Ok(HistoryPage {
+                items: Vec::new(),
+                more: false,
+            });
+        };
         let mut items = store.history_page(
             wallet,
-            federation.as_deref(),
+            Some(&federation),
             before.as_deref(),
             limit.saturating_add(1),
         )?;
@@ -691,10 +743,13 @@ mod tests {
             data_dir: dir.path().to_str().unwrap().to_string(),
             network: Network::Regtest,
         };
-        let backend =
-            RealBackend::with_port(config, port, Arc::new(move || clock.load(Ordering::SeqCst)))
-                .await
-                .unwrap();
+        let backend = crate::testing::real_backend(
+            config,
+            port,
+            Arc::new(move || clock.load(Ordering::SeqCst)),
+        )
+        .await
+        .unwrap();
         client.set_online(false);
         backend.join_federation("fed1one".into()).await.unwrap();
         time.store(200, Ordering::SeqCst);

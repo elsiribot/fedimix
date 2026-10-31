@@ -3,7 +3,9 @@
 //! and which outgoing transactions sent change to Spending.
 //!
 //! A [`Labels`] is a snapshot read from the store; its setters write through
-//! first, so a crash never leaves the snapshot ahead of the database.
+//! first, so a crash never leaves the snapshot ahead of the database. Each
+//! write names only the columns it changes, so an older snapshot cannot undo
+//! what another one wrote.
 
 use std::collections::HashMap;
 
@@ -38,7 +40,7 @@ impl Tag {
 
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
+        expect(dead_code, reason = "the Saving send of Task 6 uses it")
     )]
     /// The stored name and estimate.
     pub(crate) fn to_parts(self) -> (&'static str, Option<u32>) {
@@ -50,10 +52,6 @@ impl Tag {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
-    )]
     /// `None` for a name this version does not know; the coin then reads as
     /// unlabelled rather than failing the whole wallet.
     pub(crate) fn from_parts(name: &str, estimate: Option<u32>) -> Option<Tag> {
@@ -91,10 +89,6 @@ pub struct Labels {
 }
 
 impl Labels {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
-    )]
     pub(crate) fn from_rows(
         coins: HashMap<String, Label>,
         sent: HashMap<String, SentRecord>,
@@ -102,10 +96,6 @@ impl Labels {
         Labels { coins, sent }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
-    )]
     pub(crate) fn load(store: &Store) -> Result<Labels> {
         store.saving_labels()
     }
@@ -129,7 +119,7 @@ impl Labels {
 
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
+        expect(dead_code, reason = "the Saving send of Task 6 uses it")
     )]
     pub(crate) fn set_tag(
         &mut self,
@@ -138,29 +128,22 @@ impl Labels {
         tag: Tag,
         source_federation: Option<String>,
     ) -> Result<()> {
-        let mut label = self.coins.get(outpoint).cloned().unwrap_or_default();
+        store.set_saving_tag(outpoint, tag, source_federation.as_deref())?;
+        let label = self.coins.entry(outpoint.to_string()).or_default();
         label.tag = Some(tag);
         label.source_federation = source_federation;
-        store.put_saving_label(outpoint, &label)?;
-        self.coins.insert(outpoint.to_string(), label);
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
-    )]
     pub(crate) fn set_frozen(&mut self, store: &Store, outpoint: &str, frozen: bool) -> Result<()> {
-        let mut label = self.coins.get(outpoint).cloned().unwrap_or_default();
-        label.frozen = frozen;
-        store.put_saving_label(outpoint, &label)?;
-        self.coins.insert(outpoint.to_string(), label);
+        store.set_saving_frozen(outpoint, frozen)?;
+        self.coins.entry(outpoint.to_string()).or_default().frozen = frozen;
         Ok(())
     }
 
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "RealBackend uses it from Task 5")
+        expect(dead_code, reason = "the Saving send of Task 6 uses it")
     )]
     /// Notes that the transaction `txid` is a send Fedimix built, with where
     /// its change went. Task 6 calls this before it broadcasts.
@@ -174,5 +157,37 @@ impl Labels {
         store.put_saving_sent(txid, &record)?;
         self.sent.insert(txid.to_string(), record);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes change only what they name, so an older snapshot undoes nothing.
+    #[test]
+    fn a_stale_snapshot_keeps_what_others_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fedimix.db")).unwrap();
+        let outpoint = format!("{:064x}:0", 1);
+        let mut stale = Labels::load(&store).unwrap();
+        let mut other = Labels::load(&store).unwrap();
+        other.set_frozen(&store, &outpoint, true).unwrap();
+        stale
+            .set_tag(&store, &outpoint, Tag::SmallChange, Some("fed".into()))
+            .unwrap();
+        let read = Labels::load(&store).unwrap();
+        assert!(read.is_frozen(&outpoint), "the tag undid the freeze");
+        assert_eq!(read.tag(&outpoint), Tag::SmallChange);
+
+        // And the other way round.
+        let mut stale = Labels::load(&store).unwrap();
+        other
+            .set_tag(&store, &outpoint, Tag::Anonymity { estimate: 9 }, None)
+            .unwrap();
+        stale.set_frozen(&store, &outpoint, false).unwrap();
+        let read = Labels::load(&store).unwrap();
+        assert_eq!(read.tag(&outpoint), Tag::Anonymity { estimate: 9 });
+        assert!(!read.is_frozen(&outpoint));
     }
 }

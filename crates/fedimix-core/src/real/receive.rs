@@ -14,8 +14,8 @@ use futures::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use super::Core;
 use super::send::{is_send, resolve_intent};
-use super::{Core, saving_not_set_up};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, Notice};
@@ -92,7 +92,7 @@ impl Core {
 
     pub(super) async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo> {
         if request.wallet == WalletKind::Saving {
-            return Err(saving_not_set_up());
+            return self.saving_receive(&request.method);
         }
         let federation = self
             .store()

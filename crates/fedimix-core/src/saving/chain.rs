@@ -96,7 +96,7 @@ pub fn connect_chain(backend: &ChainBackend, proxy: Option<&str>) -> Result<Arc<
 }
 
 fn no_server() -> FedimixError {
-    FedimixError::NotSetUp("Choose a chain server in Settings.".into())
+    FedimixError::NotSetUp("Enter a chain server in Settings.".into())
 }
 
 /// `host:port` of a proxy setting, with or without a `socks5://` or

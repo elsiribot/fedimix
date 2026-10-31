@@ -1,25 +1,33 @@
 //! `RealBackend` over the scripted federation.
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bdk_wallet::bitcoin::hashes::Hash as _;
+use bdk_wallet::bitcoin::{
+    self, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+};
+use bdk_wallet::chain::spk_client::{FullScanResponse, SyncResponse};
+use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use fedimix_core::testing::{
-    DepositEvent, FakeClient, FakePort, FederationClient, SendHalt, WatchUpdate, halt_sends,
-    real_backend,
+    ChainClient, ChainFactory, DepositEvent, FakeChain, FakeClient, FakeDevices, FakePort,
+    FederationClient, SendHalt, SoftSigner, WatchUpdate, halt_sends, real_backend, sync_saving_now,
 };
 use fedimix_core::{
-    Amount, Backend, ChangeDestination, CoreConfig, Event, EventStream, Features, FedimixError,
-    HistoryItem, HistoryKind, HistoryStatus, Network, NoteBucket, Notice, OperationKind,
-    OperationState, ReceiveMethod, ReceiveRequest, Result, RunningOperation, SendAmount,
-    SendPreview, SendRequest, Settings, WalletKind,
+    Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
+    Features, FedimixError, HistoryItem, HistoryKind, HistoryStatus, Network, NoteBucket, Notice,
+    OperationKind, OperationState, PrivacyTag, ReceiveMethod, ReceiveRequest, Result,
+    RunningOperation, SendAmount, SendPreview, SendRequest, Settings, WalletKind,
 };
 use tempfile::TempDir;
 
 const INVITE: &str = "fed1one";
 const SECOND_INVITE: &str = "fed1two";
 const RESTORING: &str = "Fedimix is still restoring your wallet. Try again when it has finished.";
+const SET_UP_FIRST: &str = "Set up Saving with a hardware wallet first.";
 const PROXY_SENTENCE: &str =
     "Fedimix cannot reach federations through a proxy yet. Clear the proxy in Settings to connect.";
 /// Longer than anything here takes unless it is broken.
@@ -477,8 +485,14 @@ async fn saving_methods_report_not_set_up() {
     let not_set_up = Err::<(), _>(FedimixError::NotSetUp(
         "Saving arrives in a later version.".into(),
     ));
-    assert_eq!(backend.setup_saving("device".into()).await, not_set_up);
-    assert_eq!(backend.set_coin_frozen("o".into(), true).await, not_set_up);
+    assert_eq!(
+        backend.setup_saving("device".into()).await,
+        Err(FedimixError::DeviceNotConnected("hardware wallet".into()))
+    );
+    assert_eq!(
+        backend.set_coin_frozen("o".into(), true).await,
+        Err(FedimixError::NotSetUp(SET_UP_FIRST.into()))
+    );
     assert_eq!(backend.prepare_refill().await.map(|_| ()), not_set_up);
     assert_eq!(
         backend.confirm_refill("p".into()).await.map(|_| ()),
@@ -1345,9 +1359,7 @@ async fn receive_needs_spending_and_a_federation() {
     };
     assert_eq!(
         backend.receive(saving).await,
-        Err(FedimixError::NotSetUp(
-            "Saving arrives in a later version.".into()
-        ))
+        Err(FedimixError::NotSetUp(SET_UP_FIRST.into()))
     );
     assert_eq!(
         backend.receive(address_request()).await,
@@ -1549,7 +1561,13 @@ async fn the_real_backend_offers_no_later_features() {
     let harness = Harness::new();
     let backend = harness.open().await.unwrap();
     let state = backend.spending_state().await.unwrap();
-    assert_eq!(state.features, Features::NONE);
+    assert_eq!(
+        state.features,
+        Features {
+            saving: true,
+            ..Features::NONE
+        }
+    );
     backend.shutdown().await.unwrap();
 }
 
@@ -3100,5 +3118,694 @@ async fn a_settled_send_keeps_the_amount_of_its_row() {
     assert_eq!(states.last(), Some(&OperationState::Done));
     wait_status(&*backend, &id, HistoryStatus::Complete).await;
     assert_eq!(row_of(&rows(&*backend).await, &id).amount, sat(200));
+    backend.shutdown().await.unwrap();
+}
+
+// ---- Saving ----
+
+const CHAIN_URL: &str = "http://chain.test";
+const DEVICE: &str = "software:one";
+const SEED: [u8; 32] = [7; 32];
+const SCANNING: &str = "Fedimix is still scanning your device's history.";
+const NO_SERVER: &str = "Enter a chain server in Settings.";
+const JADE_PROXY: &str =
+    "Jade needs Blockstream's PIN server, which cannot use your proxy. Clear the proxy to use it.";
+
+type Real = Arc<fedimix_core::RealBackend>;
+
+type ChainAsked = (ChainBackend, Option<String>);
+
+struct SavingHarness {
+    harness: Harness,
+    chain: Arc<FakeChain>,
+    devices: Arc<FakeDevices>,
+    /// What the backend asked the chain factory for, in order.
+    asked: Arc<Mutex<Vec<ChainAsked>>>,
+}
+
+fn chain_settings(url: &str) -> Settings {
+    Settings {
+        chain_backend: ChainBackend::Esplora { url: url.into() },
+        ..Settings::for_network(Network::Regtest)
+    }
+}
+
+fn soft_signer(network: bitcoin::Network) -> Arc<SoftSigner> {
+    Arc::new(SoftSigner::from_seed(&SEED, network))
+}
+
+fn block(height: u32) -> BlockId {
+    BlockId {
+        height,
+        hash: BlockHash::from_byte_array([height as u8 + 1; 32]),
+    }
+}
+
+/// A chain from regtest's genesis up to `height`.
+fn chain_to(height: u32) -> CheckPoint {
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+    let mut tip = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.block_hash(),
+    });
+    for h in 1..=height {
+        tip = tip.insert(block(h));
+    }
+    tip
+}
+
+fn first_scan(height: u32) -> FullScanResponse<bdk_wallet::KeychainKind> {
+    FullScanResponse {
+        chain_update: Some(chain_to(height)),
+        ..Default::default()
+    }
+}
+
+/// A payment of `sat` to `address`; `n` makes it unique.
+fn payment(address: &str, sat: u64, n: u32) -> Transaction {
+    let address = bitcoin::Address::from_str(address)
+        .unwrap()
+        .assume_checked();
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([n as u8 + 1; 32]),
+                vout: n,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: bitcoin::Amount::from_sat(sat),
+            script_pubkey: address.script_pubkey(),
+        }],
+    }
+}
+
+/// The sync that shows `tx` in a block at `height`.
+fn confirmed(tx: Transaction, height: u32) -> SyncResponse {
+    let txid = tx.compute_txid();
+    let mut tx_update = TxUpdate::default();
+    tx_update.txs = vec![Arc::new(tx)];
+    tx_update.anchors = [(
+        ConfirmationBlockTime {
+            block_id: block(height),
+            confirmation_time: 1_000 + u64::from(height),
+        },
+        txid,
+    )]
+    .into();
+    SyncResponse {
+        tx_update,
+        chain_update: Some(chain_to(height)),
+    }
+}
+
+/// The sync that shows `tx` in the mempool, seen at `at`.
+fn in_mempool(tx: Transaction, at: u64, height: u32) -> SyncResponse {
+    let txid = tx.compute_txid();
+    let mut tx_update = TxUpdate::default();
+    tx_update.txs = vec![Arc::new(tx)];
+    tx_update.seen_ats = [(txid, at)].into();
+    SyncResponse {
+        tx_update,
+        chain_update: Some(chain_to(height)),
+    }
+}
+
+fn on_chain() -> ReceiveRequest {
+    ReceiveRequest {
+        wallet: WalletKind::Saving,
+        method: ReceiveMethod::OnChain,
+    }
+}
+
+impl SavingHarness {
+    fn new() -> Self {
+        let devices = Arc::new(FakeDevices::new());
+        devices.add(
+            DEVICE,
+            "Test device",
+            DeviceKind::Software,
+            soft_signer(bitcoin::Network::Regtest),
+        );
+        Self {
+            harness: Harness::new(),
+            chain: Arc::new(FakeChain::new()),
+            devices,
+            asked: Arc::default(),
+        }
+    }
+
+    async fn open(&self) -> Result<Real> {
+        let config = CoreConfig {
+            data_dir: self.harness.dir.path().to_str().unwrap().to_string(),
+            network: Network::Regtest,
+        };
+        let chain = Arc::clone(&self.chain);
+        let asked = Arc::clone(&self.asked);
+        let factory: ChainFactory = Arc::new(move |backend, proxy| {
+            asked
+                .lock()
+                .unwrap()
+                .push((backend.clone(), proxy.map(str::to_string)));
+            Ok(Arc::clone(&chain) as Arc<dyn ChainClient>)
+        });
+        fedimix_core::RealBackend::with_ports(
+            config,
+            self.harness.port.clone(),
+            factory,
+            self.devices.clone(),
+        )
+        .await
+    }
+
+    /// Open, with a chain server set, and not set up.
+    async fn with_server(&self) -> Real {
+        let backend = self.open().await.unwrap();
+        backend
+            .set_settings(chain_settings(CHAIN_URL))
+            .await
+            .unwrap();
+        backend
+    }
+
+    /// Set up, with the first scan done at height 1.
+    async fn ready(&self) -> Real {
+        let backend = self.with_server().await;
+        self.chain.push_full_scan(first_scan(1));
+        backend.setup_saving(DEVICE.into()).await.unwrap();
+        wait_chain(&*backend, true).await;
+        backend
+    }
+
+    /// Pays the next address of `backend` and waits to see the money.
+    async fn fund(&self, backend: &Real, sat: u64, n: u32) -> String {
+        let info = backend.receive(on_chain()).await.unwrap();
+        let tx = payment(&info.payload, sat, n);
+        let outpoint = format!("{}:0", tx.compute_txid());
+        self.chain.push_sync(confirmed(tx, 2 + n));
+        sync_saving_now(backend);
+        wait_until("the funded coin", || async {
+            let state = backend.saving_state().await.unwrap();
+            state.coins.iter().any(|c| c.outpoint == outpoint)
+        })
+        .await;
+        outpoint
+    }
+
+    fn last_asked(&self) -> Option<ChainAsked> {
+        self.asked.lock().unwrap().last().cloned()
+    }
+}
+
+async fn wait_chain(backend: &dyn Backend, online: bool) {
+    wait_until("the chain's online state", || async {
+        backend.saving_state().await.unwrap().chain_online == online
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn setup_stores_the_account_and_never_a_private_key() {
+    let saving = SavingHarness::new();
+    let backend = saving.with_server().await;
+    let events = backend.subscribe();
+    assert!(!backend.spending_state().await.unwrap().saving_ready);
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    wait_event(&events, &Event::SavingChanged).await;
+
+    let state = backend.saving_state().await.unwrap();
+    let device = state.device.unwrap();
+    assert_eq!(device.name, "Test device");
+    assert_eq!(device.kind, DeviceKind::Software);
+    assert!(device.connected);
+    assert!(backend.spending_state().await.unwrap().saving_ready);
+    assert_eq!(saving.devices.connects(), 1);
+    backend.shutdown().await.unwrap();
+
+    let dir = saving.harness.dir.path();
+    let mut account_seen = false;
+    for name in ["fedimix.db", "fedimix.db-wal"] {
+        let bytes = std::fs::read(dir.join(name)).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("prv"), "{name} holds a private key");
+        account_seen |= text.contains("tpub");
+    }
+    assert!(account_seen, "the account's public key is stored");
+}
+
+#[tokio::test]
+async fn setup_twice_is_refused() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    assert_eq!(
+        backend.setup_saving(DEVICE.into()).await,
+        Err(FedimixError::NotSetUp(
+            "Saving is already set up with a hardware wallet.".into()
+        ))
+    );
+    // The refusal needed no device.
+    assert_eq!(saving.devices.connects(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_device_on_the_wrong_kind_of_network_gets_a_sentence() {
+    let saving = SavingHarness::new();
+    saving.devices.add(
+        "software:main",
+        "Main device",
+        DeviceKind::Software,
+        soft_signer(bitcoin::Network::Bitcoin),
+    );
+    let backend = saving.with_server().await;
+    assert_eq!(
+        backend.setup_saving("software:main".into()).await,
+        Err(FedimixError::NotSetUp(
+            "The hardware wallet account is for the main network, but Fedimix is running on a test network."
+                .into()
+        ))
+    );
+    assert_eq!(backend.saving_state().await.unwrap().device, None);
+    // Nothing was stored, so the right device can still be set up.
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reads_do_not_wait_for_the_chain() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    saving.chain.set_stalled(true);
+    sync_saving_now(&backend);
+    let quickly = Duration::from_secs(1);
+    tokio::time::timeout(quickly, async {
+        backend.saving_state().await.unwrap();
+        backend.spending_state().await.unwrap();
+        backend.history(WalletKind::Saving, None, 10).await.unwrap();
+        backend.receive(on_chain()).await.unwrap();
+    })
+    .await
+    .expect("reads answer while the chain hangs");
+    // A hung server does not hold up closing either.
+    within("shutdown", backend.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
+async fn chain_offline_shows_last_balance() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let events = backend.subscribe();
+    let outpoint = saving.fund(&backend, 50_000, 0).await;
+    wait_event(&events, &Event::SavingChanged).await;
+
+    saving.chain.set_offline(true);
+    sync_saving_now(&backend);
+    wait_chain(&*backend, false).await;
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.balance, Amount::from_sat(50_000));
+    assert_eq!(state.coins[0].outpoint, outpoint);
+    assert_eq!(state.problem, None, "waiting cures being offline");
+    assert_eq!(drain(&events).await, [Event::SavingChanged]);
+
+    saving.chain.set_offline(false);
+    sync_saving_now(&backend);
+    wait_chain(&*backend, true).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_sync_that_learns_nothing_sends_no_event() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let events = backend.subscribe();
+    let info = backend.receive(on_chain()).await.unwrap();
+    let tx = payment(&info.payload, 20_000, 0);
+    saving.chain.push_sync(in_mempool(tx.clone(), 1_000, 1));
+    sync_saving_now(&backend);
+    wait_until("the pending coin", || async {
+        !backend.saving_state().await.unwrap().coins.is_empty()
+    })
+    .await;
+    wait_event(&events, &Event::SavingChanged).await;
+    let made = saving.chain.scans_made();
+    // The same transaction, seen again later.
+    saving.chain.push_sync(in_mempool(tx, 2_000, 1));
+    sync_saving_now(&backend);
+    wait_until("the second sync", || async {
+        saving.chain.scans_made() > made
+    })
+    .await;
+    assert_eq!(drain(&events).await, []);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_survives_restart() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let outpoint = saving.fund(&backend, 50_000, 0).await;
+    let events = backend.subscribe();
+    backend
+        .set_coin_frozen(outpoint.clone(), true)
+        .await
+        .unwrap();
+    wait_event(&events, &Event::SavingChanged).await;
+    assert!(backend.saving_state().await.unwrap().coins[0].frozen);
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = saving.open().await.unwrap();
+    let state = backend.saving_state().await.unwrap();
+    assert!(state.coins[0].frozen);
+    assert_eq!(
+        state.balance,
+        Amount::from_sat(50_000),
+        "frozen stays yours"
+    );
+    backend.set_coin_frozen(outpoint, false).await.unwrap();
+    assert!(!backend.saving_state().await.unwrap().coins[0].frozen);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn freezing_an_unknown_coin_is_refused() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    for outpoint in ["nonsense", &format!("{:064x}:0", 9)] {
+        assert_eq!(
+            backend.set_coin_frozen(outpoint.to_string(), true).await,
+            Err(FedimixError::UnknownItem(outpoint.to_string()))
+        );
+    }
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn saving_receive_is_a_fresh_address_labelled_unmixed() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let first = backend.receive(on_chain()).await.unwrap();
+    let second = backend.receive(on_chain()).await.unwrap();
+    assert_ne!(first.payload, second.payload);
+    assert!(first.payload.starts_with("bcrt1q"), "{first:?}");
+    assert_eq!(first.uri, format!("bitcoin:{}", first.payload));
+    assert!(!first.address_repeats);
+    assert_eq!(first.expires_at, None);
+    assert_eq!(first.min_deposit, None);
+
+    saving
+        .chain
+        .push_sync(confirmed(payment(&second.payload, 30_000, 0), 2));
+    sync_saving_now(&backend);
+    wait_until("the coin", || async {
+        !backend.saving_state().await.unwrap().coins.is_empty()
+    })
+    .await;
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.coins[0].tag, PrivacyTag::Unmixed);
+    assert_eq!(state.coins[0].address, second.payload);
+    assert!(state.coins[0].confirmed);
+    assert_eq!(
+        state.history[0].kind,
+        HistoryKind::Received { unmixed: true }
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn saving_cannot_receive_over_lightning() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let request = ReceiveRequest {
+        wallet: WalletKind::Saving,
+        method: ReceiveMethod::Lightning {
+            amount: Amount::from_sat(1_000),
+            description: String::new(),
+            expiry_secs: 60,
+        },
+    };
+    assert!(matches!(
+        backend.receive(request).await,
+        Err(FedimixError::NotSetUp(_))
+    ));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receive_waits_for_the_first_scan() {
+    let saving = SavingHarness::new();
+    let backend = saving.with_server().await;
+    saving.chain.set_stalled(true);
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    assert_eq!(
+        backend.receive(on_chain()).await,
+        Err(FedimixError::Internal(SCANNING.into()))
+    );
+    saving.chain.set_stalled(false);
+    wait_chain(&*backend, true).await;
+    backend.receive(on_chain()).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn proxy_applies_to_the_chain() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let server = ChainBackend::Esplora {
+        url: CHAIN_URL.into(),
+    };
+    assert_eq!(saving.last_asked(), Some((server.clone(), None)));
+    let proxy = "127.0.0.1:9050".to_string();
+    backend
+        .set_settings(Settings {
+            socks5_proxy: Some(proxy.clone()),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    wait_until("the client through the proxy", || async {
+        saving.last_asked() == Some((server.clone(), Some(proxy.clone())))
+    })
+    .await;
+    wait_chain(&*backend, true).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // And from the first sync after a restart.
+    saving.asked.lock().unwrap().clear();
+    let backend = saving.open().await.unwrap();
+    wait_chain(&*backend, true).await;
+    assert_eq!(saving.last_asked(), Some((server, Some(proxy))));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_new_chain_server_is_used_without_a_restart() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    // The old server hangs: the change must not wait for it.
+    saving.chain.set_stalled(true);
+    sync_saving_now(&backend);
+    backend
+        .set_settings(chain_settings("http://other.test"))
+        .await
+        .unwrap();
+    let other = ChainBackend::Esplora {
+        url: "http://other.test".into(),
+    };
+    wait_until("the new server", || async {
+        saving.last_asked() == Some((other.clone(), None))
+    })
+    .await;
+    saving.chain.set_stalled(false);
+    wait_chain(&*backend, true).await;
+    // A save that changes neither server nor proxy does not reconnect.
+    let count = saving.asked.lock().unwrap().len();
+    backend
+        .set_settings(Settings {
+            anonymity_target: 7,
+            ..chain_settings("http://other.test")
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(saving.asked.lock().unwrap().len(), count);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_chain_server_is_a_problem_and_no_sync() {
+    let saving = SavingHarness::new();
+    let backend = saving.open().await.unwrap();
+    let events = backend.subscribe();
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    wait_until("the problem", || async {
+        backend.saving_state().await.unwrap().problem.as_deref() == Some(NO_SERVER)
+    })
+    .await;
+    wait_event(&events, &Event::SavingChanged).await;
+    let state = backend.saving_state().await.unwrap();
+    assert!(!state.chain_online);
+    assert!(saving.asked.lock().unwrap().is_empty());
+    assert_eq!(saving.chain.scans_made(), 0);
+
+    // Naming one is enough.
+    saving.chain.push_full_scan(first_scan(1));
+    backend
+        .set_settings(chain_settings(CHAIN_URL))
+        .await
+        .unwrap();
+    wait_chain(&*backend, true).await;
+    assert_eq!(backend.saving_state().await.unwrap().problem, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_on_another_chain_points_at_settings() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    saving.chain.push_sync(SyncResponse {
+        tx_update: TxUpdate::default(),
+        chain_update: Some(CheckPoint::new(BlockId {
+            height: 0,
+            hash: BlockHash::from_byte_array([9; 32]),
+        })),
+    });
+    sync_saving_now(&backend);
+    wait_chain(&*backend, false).await;
+    let problem = backend.saving_state().await.unwrap().problem.unwrap();
+    assert!(problem.contains("Settings"), "{problem}");
+    assert!(!problem.contains("Try again"), "{problem}");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn jade_is_not_offered_through_a_proxy() {
+    let saving = SavingHarness::new();
+    saving.devices.add(
+        "jade:port",
+        "Jade",
+        DeviceKind::Jade,
+        soft_signer(bitcoin::Network::Regtest),
+    );
+    let backend = saving.with_server().await;
+    let kinds = |found: Vec<fedimix_core::DeviceInfo>| {
+        found.into_iter().map(|d| d.kind).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(backend.detect_devices().await.unwrap()),
+        [DeviceKind::Software, DeviceKind::Jade]
+    );
+    backend
+        .set_settings(Settings {
+            socks5_proxy: Some("127.0.0.1:9050".into()),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        kinds(backend.detect_devices().await.unwrap()),
+        [DeviceKind::Software]
+    );
+    assert_eq!(
+        backend.setup_saving("jade:port".into()).await,
+        Err(FedimixError::NotSetUp(JADE_PROXY.into()))
+    );
+    assert_eq!(saving.devices.connects(), 0, "the device was not opened");
+    assert_eq!(backend.saving_state().await.unwrap().device, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_device_shows_the_last_poll() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let connected = || async {
+        backend
+            .saving_state()
+            .await
+            .unwrap()
+            .device
+            .unwrap()
+            .connected
+    };
+    assert!(connected().await);
+    let events = backend.subscribe();
+    saving.devices.remove(DEVICE);
+    assert!(connected().await, "nothing polled yet");
+    backend.detect_devices().await.unwrap();
+    assert!(!connected().await);
+    wait_event(&events, &Event::SavingChanged).await;
+    assert_eq!(drain(&events).await, []);
+    backend.detect_devices().await.unwrap();
+    assert_eq!(drain(&events).await, [], "no change, no event");
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // After a restart the device is known by name and not seen yet.
+    let backend = saving.open().await.unwrap();
+    let device = backend.saving_state().await.unwrap().device.unwrap();
+    assert_eq!(device.name, "Test device");
+    assert!(!device.connected);
+    assert!(backend.spending_state().await.unwrap().saving_ready);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_set_up_wallet_syncs_from_open() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let outpoint = saving.fund(&backend, 40_000, 0).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    let made = saving.chain.scans_made();
+
+    let backend = saving.open().await.unwrap();
+    assert!(!backend.saving_state().await.unwrap().chain_online);
+    assert_eq!(
+        backend.saving_state().await.unwrap().coins[0].outpoint,
+        outpoint
+    );
+    wait_chain(&*backend, true).await;
+    assert!(saving.chain.scans_made() > made);
+    assert_eq!(saving.chain.full_scans_made(), 1, "one first scan for ever");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn saving_history_pages_over_the_wallet() {
+    let saving = SavingHarness::new();
+    let backend = saving.ready().await;
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let outpoint = saving.fund(&backend, 10_000 + u64::from(n), n).await;
+        ids.push(outpoint.split(':').next().unwrap().to_string());
+    }
+    ids.reverse();
+    let first = backend.history(WalletKind::Saving, None, 2).await.unwrap();
+    let seen: Vec<_> = first.items.iter().map(|i| i.id.clone()).collect();
+    assert_eq!(seen, ids[..2]);
+    assert!(first.more);
+    let last = backend
+        .history(WalletKind::Saving, Some(seen[1].clone()), 2)
+        .await
+        .unwrap();
+    assert_eq!(last.items.len(), 1);
+    assert_eq!(last.items[0].id, ids[2]);
+    assert!(!last.more);
+    assert_eq!(
+        backend
+            .history(WalletKind::Saving, Some("gone".into()), 2)
+            .await,
+        Err(FedimixError::UnknownItem("gone".into()))
+    );
     backend.shutdown().await.unwrap();
 }

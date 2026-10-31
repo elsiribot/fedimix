@@ -167,6 +167,7 @@ inner() {
     rm -rf "$root/target/screenshots/real"
     mkdir -p "$root/target/screenshots/real"
     echo "$started"
+    export FEDIMIX_CHAIN_URL="http://127.0.0.1:$FM_PORT_ESPLORA"
     start_sway
     flow join-and-receive 0 "DRIVE OK"
     [[ -n "$paid" ]] || { echo "LND paid no invoice" >&2; return 1; }

@@ -11,15 +11,18 @@ action app.settings
 expect Recovery words
 expect-not Anonymity target
 expect-not Budget (sat per month)
-expect-not Hardware wallet
+expect Hardware wallet
 shot settings
 scroll-end
 shot settings-end
-# Without Saving the balance stands alone: a target would imply money on its way.
+# Regtest names no chain server, and Settings saves nothing until one is set.
+type-env "Server URL" FEDIMIX_CHAIN_URL
+apply Server URL
+# Above the target, what is left waits for a Saving that is not set up.
 type "Target (BTC)" 0.001
 wait 800
 click Back
-expect-not waiting for Saving
+expect waiting for Saving
 expect-not moving to Saving
-expect-not Set up Saving
+expect Set up Saving
 shot waiting-for-saving

@@ -184,10 +184,13 @@
               FM_ESPLORA_BASE_EXECUTABLE = "${fmPkgs.esplora-electrs}/bin/esplora";
               # (inputsFrom merges the default shellHook, but not env vars.)
               inherit (default) LIBCLANG_PATH;
-              # librocksdb needs libstdc++ at test time. The script sets it for
-              # the `cargo test` step only, so devimint's daemons, built from
-              # another nixpkgs, never load it.
-              FEDIMIX_TEST_LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
+              # librocksdb needs libstdc++ at test time, and hidapi libudev. The
+              # script sets it for the `cargo test` step only, so devimint's
+              # daemons, built from another nixpkgs, never load it.
+              FEDIMIX_TEST_LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+                pkgs.stdenv.cc.cc.lib
+                pkgs.udev
+              ];
               # The same for the app itself, in `scripts/test-real-ui.sh`.
               FEDIMIX_UI_LD_LIBRARY_PATH = default.LD_LIBRARY_PATH;
             };

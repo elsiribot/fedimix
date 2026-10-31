@@ -5,7 +5,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## What works (commands run in `nix develop`)
 - `just run [--data-dir PATH] [--network bitcoin|signet|regtest]`: the real wallet. `just demo`: the complete UI over the demo backend.
 - `just clippy`, `just fmt`, `just test` (includes `tests/real_backend.rs` over a fake port).
-- `just test-integration`: devimint, both module sets, 29 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
+- `just test-integration`: devimint, both module sets, 30 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
 - `just test-real-ui`: the real binary through Join, Lightning receive and send, restart, lock, wrong network, under headless sway.
 - `just interact-demo`, `just screenshot-all`: scripted demo flows and screenshots at 480 and 360 px.
 - `nix build` / `just build-nix`: wrapped release binary plus flake checks. Release build from clean: 7 min 16 s, 88 MiB, 64 MiB stripped.
@@ -20,7 +20,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-4 done: the dependencies and Phase 2 residuals, chain access (`saving::ChainClient` over Esplora or Electrum, `FakeChain` under `testing`), and the watch-only wallet (`saving::SavingWallet`: create/open from a `DeviceAccount`, sync, balance, coins, history, fresh receive addresses; `Labels` per outpoint; schema 5). Task 4: `saving::HwiPort` (Ledger, Coldcard, Jade, BitBox02 through async-hwi; compile-only, never run against a device) behind `DevicePort`/`Signer`, and `SoftSigner` under `testing` only (`scripts/check-no-soft-signer.sh`, in `just test`). No sending yet. Next: Task 5 of the Phase 3 plan. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause is from reading.
+Phase 3 (Saving, hardware wallet), Tasks 1-4 done: the dependencies and Phase 2 residuals, chain access (`saving::ChainClient` over Esplora or Electrum, `FakeChain` under `testing`), and the watch-only wallet (`saving::SavingWallet`: create/open from a `DeviceAccount`, sync, balance, coins, history, fresh receive addresses; `Labels` per outpoint; schema 5). Task 4: `saving::HwiPort` (Ledger, Coldcard, Jade, BitBox02 through async-hwi; compile-only, never run against a device) behind `DevicePort`/`Signer`, and `SoftSigner` under `testing` only (`scripts/check-no-soft-signer.sh`, in `just test`). Task 5: `RealBackend` runs Saving: `setup_saving`, `detect_devices` (no Jade through a proxy), a sync task (60 s, 10 s while money moves, backoff to 5 min, reconnect on a Settings change), `saving_state` with `chain_online` and `problem`, Saving Receive after the first scan, `set_coin_frozen`, paged Saving history. `features.saving` is on, so the real UI shows the Saving tab and server rows ahead of Task 8. No sending yet. Next: Task 6 of the Phase 3 plan. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause is from reading.
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.

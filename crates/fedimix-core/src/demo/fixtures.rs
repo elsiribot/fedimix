@@ -85,6 +85,7 @@ fn coin(n: usize, amount: f64, tag: PrivacyTag, age_secs: u64) -> Coin {
         address: address_for(n),
         source_federation: from_spending.then(|| FEDERATION_NAME.to_string()),
         frozen: false,
+        confirmed: true,
     }
 }
 
