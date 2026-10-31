@@ -175,10 +175,45 @@ pub(super) fn refused(reason: &str) -> FedimixError {
     FedimixError::Internal(format!("{REFUSED} {reason}."))
 }
 
-/// Whether the server answered and said no. Everything else leaves open
-/// whether a broadcast got through.
+/// The words of a node judging a transaction, by consensus or by policy.
+/// Anything else from a server (busy, a daemon timeout, a proxy's error page)
+/// says nothing about the transaction, however final it sounds.
+const JUDGEMENTS: [&str; 15] = [
+    "bad-txns",
+    "bad-witness",
+    "missing-inputs",
+    "missingorspent",
+    "txn-mempool-conflict",
+    "insufficient fee",
+    "min relay fee",
+    "mempool min fee",
+    "min-fee-not-met",
+    "mempool full",
+    "script-verify",
+    "non-final",
+    "non-bip68-final",
+    "too-long-mempool-chain",
+    "dust",
+];
+
+/// Whether a server judged the transaction and said no. Every other failure
+/// leaves open whether a broadcast got through.
 pub fn is_refusal(error: &FedimixError) -> bool {
-    matches!(error, FedimixError::Internal(sentence) if sentence.starts_with(REFUSED))
+    matches!(error, FedimixError::TxRejected(_))
+}
+
+/// A refusal of a broadcast, typed: a judgement, or `error` as it came.
+fn verdict(error: FedimixError) -> FedimixError {
+    if let FedimixError::Internal(sentence) = &error
+        && let Some(reason) = sentence.strip_prefix(REFUSED)
+    {
+        let lower = reason.to_lowercase();
+        if JUDGEMENTS.iter().any(|word| lower.contains(word)) {
+            let reason = reason.trim().trim_end_matches('.');
+            return FedimixError::TxRejected(reason.to_string());
+        }
+    }
+    error
 }
 
 fn says_already_known(error: &FedimixError) -> bool {
@@ -186,7 +221,8 @@ fn says_already_known(error: &FedimixError) -> bool {
         return false;
     };
     let sentence = sentence.to_lowercase();
-    is_refusal(error) && ALREADY_KNOWN.iter().any(|known| sentence.contains(known))
+    sentence.starts_with(&REFUSED.to_lowercase())
+        && ALREADY_KNOWN.iter().any(|known| sentence.contains(known))
 }
 
 fn bad_setup() -> FedimixError {
@@ -213,7 +249,7 @@ async fn already_known(
     }
     match chain.tx_seen(tx.compute_txid()).await {
         Ok(true) => Ok(()),
-        _ => Err(error),
+        _ => Err(verdict(error)),
     }
 }
 
@@ -319,6 +355,14 @@ impl ChainClient for EsploraChain {
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         match self.client.broadcast(tx).await {
             Ok(()) => Ok(()),
+            // Only a 400 carries a node's answer; others come from anything
+            // standing in the way, such as a proxy or a wrong address.
+            Err(esplora_client::Error::HttpResponse { status, .. }) if status != 400 => {
+                let unknown = FedimixError::Internal(format!(
+                    "The chain server answered with status {status}."
+                ));
+                already_known(self, tx, unknown).await
+            }
             Err(e) => already_known(self, tx, esplora_error(&e)).await,
         }
     }
@@ -691,14 +735,25 @@ mod tests {
                 "{known}"
             );
         }
-        let no = refused("bad-txns-inputs-missingorspent");
-        assert!(is_refusal(&no));
+        let no = refused("bad-txns-inputs-missingorspent.");
+        let judged = FedimixError::TxRejected("bad-txns-inputs-missingorspent".into());
         assert_eq!(
             already_known(&chain, &tx, no.clone()).await,
-            Err(no.clone())
+            Err(judged.clone())
         );
+        assert!(is_refusal(&judged));
+        // What judges nothing stays as it came, so it is retried.
+        for unclear in [
+            refused("server busy"),
+            refused("<html>404 Not Found</html>"),
+            refused("daemon error: timed out"),
+            unreadable(),
+        ] {
+            let reply = already_known(&chain, &tx, unclear.clone()).await;
+            assert_eq!(reply, Err(unclear));
+            assert!(!is_refusal(&reply.unwrap_err()));
+        }
         assert!(!is_refusal(&FedimixError::Offline));
-        assert!(!is_refusal(&unreadable()));
         assert_eq!(
             already_known(&chain, &tx, FedimixError::Offline).await,
             Err(FedimixError::Offline)
@@ -710,6 +765,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(already_known(&chain, &tx, no).await, Ok(()));
+        assert!(!is_refusal(&refused("bad-txns-inputs-missingorspent")));
     }
 
     #[test]

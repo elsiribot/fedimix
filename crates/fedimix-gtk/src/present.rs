@@ -330,6 +330,7 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         HistoryStatus::Pending => "pending".to_string(),
         HistoryStatus::Failed => "failed".to_string(),
         HistoryStatus::Refunded => "refunded".to_string(),
+        HistoryStatus::Stalled => "not confirmed, may still go through".to_string(),
         HistoryStatus::Expired => "expired".to_string(),
     };
     HistoryRowView {
@@ -449,7 +450,9 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::UnknownItem(_) => "This item is no longer available".to_string(),
         E::DeviceNotConnected(device) => format!("Connect your {device}"),
         E::Offline => "You are offline. Reconnect and try again".to_string(),
-        E::ProxyUnsupported | E::WrongNetwork { .. } => e.to_string(),
+        E::ProxyUnsupported | E::WrongNetwork { .. } | E::TxRejected(_) | E::SendInDoubt => {
+            e.to_string()
+        }
         E::PreviewExpired => "This review expired. Check the details and try again".to_string(),
         E::DeviceRejected => "The device rejected the transaction".to_string(),
         E::Cancelled => "Cancelled".to_string(),
@@ -1159,6 +1162,10 @@ mod tests {
         assert_eq!(trailing(HistoryStatus::Pending), "pending");
         assert_eq!(trailing(HistoryStatus::Failed), "failed");
         assert_eq!(trailing(HistoryStatus::Refunded), "refunded");
+        assert_eq!(
+            trailing(HistoryStatus::Stalled),
+            "not confirmed, may still go through"
+        );
         assert_eq!(trailing(HistoryStatus::Expired), "expired");
     }
 

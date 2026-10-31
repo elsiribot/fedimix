@@ -192,6 +192,9 @@ pub enum HistoryStatus {
     Refunded,
     /// An invoice nobody paid in time.
     Expired,
+    /// A Saving send no server holds now, which may still confirm: a miner can
+    /// have it. Never stored; read from the signed transaction.
+    Stalled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -391,7 +394,7 @@ pub struct SendPreview {
     pub amount: Amount,
     pub fee: Amount,
     /// The id of the federation this pays from, whichever is active by the time
-    /// it is confirmed. `None` for Saving.
+    /// it is confirmed. For Saving, the federation that takes the change, if any.
     pub federation: Option<String>,
     pub inputs: Vec<SendInput>,
     pub change: ChangeDestination,

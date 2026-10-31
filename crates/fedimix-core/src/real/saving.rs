@@ -6,7 +6,6 @@
 //! [`SavingLive`]. The `saving` lock nests with no other, and no lock is held
 //! across an await.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,8 +73,8 @@ pub(super) struct SavingLive {
     pub(super) op: Option<SavingOp>,
     /// Counts operations started, so a preview from before one is stale.
     pub(super) generation: u64,
-    /// How many rebroadcasts in a row a server refused, by operation.
-    pub(super) refusals: HashMap<String, u32>,
+    /// The last operation, so cancelling one that just ended is no error.
+    pub(super) last_op: Option<String>,
 }
 
 impl SavingLive {
@@ -196,6 +195,7 @@ impl Core {
             state.in_flight = snapshot.in_flight;
             state.coins = snapshot.coins;
             state.history = snapshot.history;
+            self.add_stalled(&wallet, &labels, &mut state.history)?;
             state.history.truncate(SNAPSHOT_HISTORY);
         }
         Ok(state)
@@ -210,6 +210,7 @@ impl Core {
         };
         let labels = Labels::load(&self.store())?;
         let mut items = wallet.history(&labels);
+        self.add_stalled(&wallet, &labels, &mut items)?;
         if let Some(before) = before {
             let position = items.iter().position(|item| item.id == before);
             let position = position.ok_or_else(|| FedimixError::UnknownItem(before.to_string()))?;
@@ -451,8 +452,10 @@ pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>)
                 Ok(summary) => {
                     failures = 0;
                     // After a sync that worked, as it reads the wallet's view.
+                    // This client is the old route once the settings change.
                     let tended = tokio::select! {
                         () = stopping(&mut gate) => return Ok(()),
+                        _ = target.changed() => continue 'connect,
                         tended = core.tend_signed(&wallet, &*chain) => tended,
                     };
                     core.note_chain(true, None, summary.changed || tended);

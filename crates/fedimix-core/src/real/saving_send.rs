@@ -10,14 +10,20 @@
 //! - `Signed` is an operation still running, also across a restart: it is
 //!   broadcast until a server has it, and no other Saving operation can start.
 //! - `Seen` went out. A lagging server can forget it, which frees its coins in
-//!   BDK's view, so they stay out of selection here, and it is rebroadcast.
+//!   BDK's view, so they stay out of selection here, and it is rebroadcast. It
+//!   stays open until 6 blocks deep, as a reorg can undo less.
+//! - `Stalled` went out, or may have, and no server takes it now. A miner can
+//!   still have it, so nothing frees its coins: no count, no timer, no refusal.
+//!   It stays on show, is rebroadcast, and the next send must spend its coins,
+//!   so that at most one of the two can confirm.
 //! - A rebroadcast cannot pay twice: it is the same transaction.
 //!
-//! Only a server's own refusal ends a send. Anything else leaves open whether
-//! the transaction got through, so it is tried again, and each try asks the
-//! server first. Each try also makes its own chain client, from the settings in
-//! force: closing a client for an abandoned sync ends other calls on it (see
-//! `saving::electrum_guard`), and none of those can be a broadcast this way.
+//! Only two things end a send for good: a confirmed conflict 6 blocks deep, and
+//! a node's judgement on a first attempt, when nothing of ours has left. A reply
+//! that judges nothing is retried. The first broadcast makes a chain client per
+//! attempt from the settings in force, so closing the sync's client for an
+//! abandoned call cannot touch it. A rebroadcast uses the sync's client, and a
+//! change of settings ends it with the sync (`supervise_saving`).
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -42,6 +48,7 @@ use crate::error::{FedimixError, Result};
 use crate::event::Event;
 use crate::saving::{
     ChainClient, DeviceAccount, Labels, SavingWallet, SendPlan, Signer, TxPosition, is_refusal,
+    sort_history,
 };
 use crate::store::{SignedState, SignedTx};
 
@@ -53,12 +60,9 @@ const REGTEST_FEE_RATE: u32 = 2;
 const CHANGE_MARGIN: u64 = 2;
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
-/// After an attempt with no answer, how many refusals in a row end a send. A
-/// server can refuse what it took a moment ago, while its index catches up.
-const DOUBTFUL_REFUSALS: u32 = 4;
-/// How many refused rebroadcasts in a row, one per sync, make a `Seen`
-/// transaction dropped. Fewer would take a lagging server's word for it.
-const REFUSALS_TO_DROP: u32 = 6;
+/// How deep a block must lie before no reorg is to be expected: a transaction
+/// or a conflict there settles a stored transaction.
+const SETTLED_DEPTH: u32 = 6;
 
 const SAME_ADDRESS: &str =
     "Your last change is still reaching Spending. Try again in a few minutes.";
@@ -67,6 +71,11 @@ const ONE_AT_A_TIME: &str =
 const ON_CHAIN_ONLY: &str = "Saving sends on chain, not over Lightning.";
 const WHOLE_SATS: &str = "An on-chain amount must be a whole number of sats.";
 const ZERO_FEE_RATE: &str = "The fee rate must be at least 1 sat/vB.";
+const HUGE_FEE_RATE: &str = "This fee rate is too high.";
+const OWN_ADDRESS: &str =
+    "This is your federation's deposit address. To move Saving into Spending, use Refill.";
+const REPLACES: &str = "An earlier payment has not confirmed and may still go through. This send spends the same coins, so only one of the two can confirm.";
+const FROZEN_STALLED: &str = "A coin you froze is tied to a payment that has not confirmed. Unfreeze it to send: the next send must spend it, so that only one of the two can confirm.";
 const NO_ESTIMATE: &str =
     "The chain server has no fee estimate right now. Enter a fee rate, or try again later.";
 const NO_FEDERATION: &str = "No federation is active, so the change stays in Saving.";
@@ -123,7 +132,7 @@ fn internal(sentence: &str) -> FedimixError {
     FedimixError::Internal(sentence.to_string())
 }
 
-/// `None` for an amount with a part of a sat in it.
+/// Refused for an amount with a part of a sat in it.
 fn to_btc(amount: Amount) -> Result<bitcoin::Amount> {
     if !amount.msat.is_multiple_of(1000) {
         return Err(FedimixError::InvalidAmount(WHOLE_SATS.into()));
@@ -168,9 +177,11 @@ impl Core {
 
     async fn saving_fee_rate(&self, requested: Option<u64>) -> Result<FeeRate> {
         if let Some(rate) = requested {
+            if rate == 0 {
+                return Err(FedimixError::InvalidAmount(ZERO_FEE_RATE.into()));
+            }
             return FeeRate::from_sat_per_vb(rate)
-                .filter(|_| rate > 0)
-                .ok_or_else(|| FedimixError::InvalidAmount(ZERO_FEE_RATE.into()));
+                .ok_or_else(|| FedimixError::InvalidAmount(HUGE_FEE_RATE.into()));
         }
         let estimate = self
             .chain_client()?
@@ -214,13 +225,69 @@ impl Core {
     /// The coins signed away by a transaction not yet settled, whatever the
     /// wallet's view says about them now.
     fn locked_outpoints(&self) -> Result<HashSet<OutPoint>> {
+        self.locked_by_others("")
+    }
+
+    /// The same, leaving out the transaction `id`.
+    fn locked_by_others(&self, id: &str) -> Result<HashSet<OutPoint>> {
         let rows = self.store().open_signed()?;
         let mut locked = HashSet::new();
-        for row in &rows {
+        let holding = rows
+            .iter()
+            .filter(|row| row.id != id && row.state != SignedState::Stalled);
+        for row in holding {
             let tx = tx_of(row)?;
             locked.extend(tx.input.iter().map(|input| input.previous_output));
         }
         Ok(locked)
+    }
+
+    /// What the next send must spend, so that it conflicts with every stalled
+    /// send: their coins, but for those a running send has spent already.
+    fn stalled_inputs(&self, wallet: &SavingWallet) -> Result<Vec<OutPoint>> {
+        let rows = self.store().open_signed()?;
+        let locked = self.locked_outpoints()?;
+        let mut inputs = Vec::new();
+        for row in rows.iter().filter(|row| row.state == SignedState::Stalled) {
+            let tx = tx_of(row)?;
+            inputs.extend(tx.input.iter().map(|input| input.previous_output));
+        }
+        inputs.retain(|outpoint| {
+            !locked.contains(outpoint) && wallet.has_coin(&outpoint.to_string())
+        });
+        inputs.sort();
+        inputs.dedup();
+        Ok(inputs)
+    }
+
+    /// Adds the sends that are stalled to a list from the wallet, which no
+    /// longer shows them. One a later send replaced has that send's row: the two
+    /// spend the same coin.
+    pub(super) fn add_stalled(
+        &self,
+        wallet: &SavingWallet,
+        labels: &Labels,
+        items: &mut Vec<HistoryItem>,
+    ) -> Result<()> {
+        let rows = self.store().open_signed()?;
+        let locked = self.locked_outpoints()?;
+        for row in rows.iter().filter(|row| row.state == SignedState::Stalled) {
+            let tx = tx_of(row)?;
+            if !tx.input.iter().any(|i| locked.contains(&i.previous_output)) {
+                items.push(wallet.stalled_item(&tx, row.created_at, labels));
+            }
+        }
+        sort_history(items);
+        Ok(())
+    }
+
+    /// A Jade's PIN step cannot use the proxy: better said at the review.
+    fn refuse_jade_behind_proxy(&self, account: Option<&DeviceAccount>) -> Result<()> {
+        let jade = account.is_some_and(|account| account.kind == DeviceKind::Jade);
+        if jade && self.chain.borrow().proxy.is_some() {
+            return Err(FedimixError::NotSetUp(JADE_PROXY.into()));
+        }
+        Ok(())
     }
 
     fn refuse_if_busy(&self) -> Result<()> {
@@ -245,8 +312,24 @@ impl Core {
         self.ensure_running()?;
         let wallet = self.scanned_wallet()?;
         self.refuse_if_busy()?;
+        let account = self.store().device_account()?;
+        self.refuse_jade_behind_proxy(account.as_ref())?;
         let fee_rate = self.saving_fee_rate(request.fee_rate_sat_vb).await?;
-        let federation = self.change_federation().await?;
+        // A send of everything makes no change, so it needs no federation.
+        let federation = if amount.is_some() {
+            self.change_federation().await?
+        } else {
+            None
+        };
+        // Paying it would hide the rest of the coin, and Refill does this job.
+        let paying_federation = federation
+            .as_ref()
+            .is_some_and(|(federation, _)| federation.address == destination.normalized);
+        if paying_federation
+            || (amount.is_some() && self.store().change_address_used(&destination.normalized)?)
+        {
+            return Err(FedimixError::InvalidDestination(OWN_ADDRESS.into()));
+        }
         let to = self.checked_script(&destination.normalized)?;
         let change_to = federation
             .as_ref()
@@ -255,15 +338,27 @@ impl Core {
 
         let labels = Labels::load(&self.store())?;
         let locked = self.locked_outpoints()?;
+        let must_spend = self.stalled_inputs(&wallet)?;
+        if must_spend
+            .iter()
+            .any(|outpoint| labels.is_frozen(&outpoint.to_string()))
+        {
+            return Err(FedimixError::NotSetUp(FROZEN_STALLED.into()));
+        }
+        let mut notes = Vec::new();
+        if !must_spend.is_empty() {
+            notes.push(REPLACES.to_string());
+        }
         let mut plan = SendPlan {
             to,
             amount,
             fee_rate,
             change_to,
             locked,
+            must_spend,
+            only_must_spend: false,
         };
         let first = wallet.build_send(&labels, &plan)?;
-        let mut notes = Vec::new();
         let (built, federation, change) = match (amount, federation, first.change) {
             (Some(_), Some((federation, margin)), Some((_, value))) if from_btc(value) > margin => {
                 let change = ChangeDestination::Spending {
@@ -272,7 +367,16 @@ impl Core {
                 (first, Some(federation), change)
             }
             (Some(_), federation, Some(_)) => {
+                // The same coins: others could leave large change here.
                 plan.change_to = None;
+                plan.must_spend = first
+                    .psbt
+                    .unsigned_tx
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output)
+                    .collect();
+                plan.only_must_spend = true;
                 let built = wallet.build_send(&labels, &plan)?;
                 if federation.is_none() {
                     notes.push(NO_FEDERATION.to_string());
@@ -313,7 +417,7 @@ impl Core {
         let held_back = wallet.balance().saturating_sub(usable);
         if held_back > Amount::ZERO {
             notes.push(format!(
-                "{held_back} of your balance cannot be sent yet: it is frozen or still unconfirmed."
+                "{held_back} of your balance cannot be sent yet: it is frozen, still unconfirmed, or tied to a send that has not settled."
             ));
         }
         let paid = built
@@ -328,7 +432,7 @@ impl Core {
             destination: destination.normalized,
             amount: paid.map_or(Amount::ZERO, |output| from_btc(output.value)),
             fee: from_btc(built.fee),
-            federation: None,
+            federation: federation.as_ref().map(|f| f.id.clone()),
             inputs,
             change,
             notes,
@@ -362,11 +466,8 @@ impl Core {
         if held.expires_at <= (self.clock)() {
             return Err(FedimixError::PreviewExpired);
         }
+        self.check_active(held)?;
         if let Some(federation) = &held.federation {
-            let active = self.store().active_federation()?;
-            if active.as_deref() != Some(&federation.id) {
-                return Err(FedimixError::PreviewExpired);
-            }
             self.ensure_open()?;
             self.connected(&federation.id)?;
             if self.store().change_address_used(&federation.address)? {
@@ -379,8 +480,31 @@ impl Core {
             let outpoint = input.previous_output.to_string();
             usable.iter().any(|coin| coin.outpoint == outpoint)
         });
-        if !still_usable {
+        // A send that stalled since the preview must be conflicted too.
+        let spent: HashSet<OutPoint> = held
+            .psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect();
+        let conflicts = self
+            .stalled_inputs(wallet)?
+            .iter()
+            .all(|outpoint| spent.contains(outpoint));
+        if !still_usable || !conflicts {
             return Err(FedimixError::PreviewExpired);
+        }
+        Ok(())
+    }
+
+    /// Change must reach the federation that is active now.
+    fn check_active(&self, held: &HeldSaving) -> Result<()> {
+        if let Some(federation) = &held.federation {
+            let active = self.store().active_federation()?;
+            if active.as_deref() != Some(&federation.id) {
+                return Err(FedimixError::PreviewExpired);
+            }
         }
         Ok(())
     }
@@ -396,6 +520,7 @@ impl Core {
             return Err(FedimixError::PreviewExpired);
         }
         live.generation += 1;
+        live.last_op = Some(id.to_string());
         live.op = Some(SavingOp {
             id: id.to_string(),
             state: OperationState::AwaitingDevice,
@@ -440,19 +565,22 @@ impl Core {
         self.report(id, state, None);
     }
 
-    /// Ends the wait at the device. `false` for an id that is not a Saving send.
-    pub(super) fn cancel_saving(&self, id: &str) -> bool {
-        if !id.starts_with("saving-") {
-            return false;
-        }
-        let mut live = self.saving();
-        if let Some(op) = live.op.as_mut().filter(|op| op.id == id)
-            && op.state != OperationState::Broadcasting
+    /// Ends the wait at the device. `false` for an id that is no Saving send.
+    pub(super) fn cancel_saving(&self, id: &str) -> Result<bool> {
         {
-            op.cancelled = true;
-            op.cancel.notify_one();
+            let mut live = self.saving();
+            if let Some(op) = live.op.as_mut().filter(|op| op.id == id) {
+                if op.state != OperationState::Broadcasting {
+                    op.cancelled = true;
+                    op.cancel.notify_one();
+                }
+                return Ok(true);
+            }
+            if live.last_op.as_deref() == Some(id) {
+                return Ok(true);
+            }
         }
-        true
+        self.store().is_signed(id)
     }
 
     /// From here on the send cannot be cancelled; `false` if it was just now.
@@ -498,9 +626,7 @@ impl Core {
         account: &DeviceAccount,
         expires_at: Timestamp,
     ) -> Result<Arc<dyn Signer>> {
-        if account.kind == DeviceKind::Jade && self.chain.borrow().proxy.is_some() {
-            return Err(FedimixError::NotSetUp(JADE_PROXY.into()));
-        }
+        self.refuse_jade_behind_proxy(Some(account))?;
         loop {
             if expires_at <= (self.clock)() {
                 return Err(FedimixError::PreviewExpired);
@@ -601,6 +727,7 @@ impl Core {
         };
         let stored = match signed {
             Ok(psbt) if !same_as_reviewed(&psbt, &held.psbt, held.fee) => Err(internal(TAMPERED)),
+            Ok(_) if self.check_active(&held).is_err() => Err(FedimixError::PreviewExpired),
             Ok(psbt) => match wallet.finalize(psbt) {
                 Ok(tx) if tx.compute_txid() != held.psbt.unsigned_tx.compute_txid() => {
                     Err(internal(TAMPERED))
@@ -677,7 +804,6 @@ impl Core {
         let mut gate = self.gate.subscribe();
         let mut target = self.chain.subscribe();
         let mut delay = FIRST_RETRY;
-        let mut refusals = 0;
         loop {
             let attempt = tokio::select! {
                 attempt = self.reach_server(wallet, tx, doubt) => attempt,
@@ -689,12 +815,18 @@ impl Core {
             };
             match attempt {
                 Ok(()) => break,
+                // Nothing of ours left: the node judged our only attempt.
+                Err(error) if is_refusal(&error) && !doubt => {
+                    self.end_signed(row, SignedState::Dropped, OperationState::Failed { error })
+                        .await;
+                    return;
+                }
+                // It may be out there, so a refusal proves nothing.
                 Err(error) if is_refusal(&error) => {
-                    refusals += 1;
-                    if !doubt || refusals >= DOUBTFUL_REFUSALS {
-                        self.give_up(row, error);
-                        return;
-                    }
+                    let error = FedimixError::SendInDoubt;
+                    self.end_signed(row, SignedState::Stalled, OperationState::Failed { error })
+                        .await;
+                    return;
                 }
                 Err(error) => {
                     doubt = true;
@@ -716,94 +848,113 @@ impl Core {
         self.reached_server(wallet, row, tx).await;
     }
 
+    /// Writes `state`, trying until it holds: what the user is told next must
+    /// be what a restart finds. `false` when Fedimix stopped first, and the row
+    /// then says the send still runs, which the next start takes up.
+    async fn write_state(&self, id: &str, state: SignedState) -> bool {
+        let mut gate = self.gate.subscribe();
+        loop {
+            let Err(e) = self.store().set_signed_state(id, state) else {
+                return true;
+            };
+            eprintln!("fedimix: saving the state of {id}: {e}");
+            tokio::select! {
+                () = tokio::time::sleep(FIRST_RETRY) => {}
+                () = stopping(&mut gate) => return false,
+            }
+        }
+    }
+
     /// The server has it, whatever fails from here: no failure is reported.
     async fn reached_server(&self, wallet: &Arc<SavingWallet>, row: &SignedTx, tx: &Transaction) {
         let txid = tx.compute_txid();
         if wallet.tx_position(txid) == TxPosition::Absent {
             insert_sent(wallet, tx).await;
         }
-        if let Err(e) = self.store().set_signed_state(&row.id, SignedState::Seen) {
-            eprintln!("fedimix: saving that {} went out: {e}", row.id);
+        if self.write_state(&row.id, SignedState::Seen).await {
+            self.finish_op(&row.id, OperationState::Done, Some(txid.to_string()));
+            self.events.emit(&Event::SavingChanged);
+            self.saving_wake.notify_one();
         }
-        self.finish_op(&row.id, OperationState::Done, Some(txid.to_string()));
-        self.events.emit(&Event::SavingChanged);
-        self.saving_wake.notify_one();
     }
 
-    /// The server's word: the send ends, and its coins and address are free.
-    fn give_up(&self, row: &SignedTx, error: FedimixError) {
-        if let Err(e) = self.store().set_signed_state(&row.id, SignedState::Dropped) {
-            eprintln!("fedimix: saving that {} was refused: {e}", row.id);
+    /// Ends the operation, the row first.
+    async fn end_signed(&self, row: &SignedTx, state: SignedState, outcome: OperationState) {
+        if self.write_state(&row.id, state).await {
+            self.finish_op(&row.id, outcome, None);
+            self.events.emit(&Event::SavingChanged);
         }
-        self.finish_op(&row.id, OperationState::Failed { error }, None);
-        self.events.emit(&Event::SavingChanged);
     }
 
-    /// Looks after what went out, once a sync has brought the wallet up to date.
-    /// Whether anything changed. A transaction the server forgot is sent again,
-    /// and only a server that keeps refusing it ends it.
+    /// Looks after what went out, once a sync has brought the wallet up to
+    /// date. Whether anything changed. The store decides everything here, so a
+    /// restart loses nothing. `Signed` rows belong to `settle`.
     pub(super) async fn tend_signed(
         &self,
         wallet: &Arc<SavingWallet>,
         chain: &dyn ChainClient,
     ) -> bool {
-        let rows = match self.store().open_signed() {
-            Ok(rows) => rows,
-            Err(e) => {
-                eprintln!("fedimix: reading stored Saving transactions: {e}");
-                return false;
-            }
-        };
-        let mut changed = false;
-        for row in rows {
-            let Ok(tx) = tx_of(&row) else {
-                eprintln!("fedimix: {UNREADABLE_TX} ({})", row.id);
-                continue;
-            };
-            match wallet.tx_position(tx.compute_txid()) {
-                TxPosition::Confirmed => {
-                    self.note_settled(&row, SignedState::Confirmed);
-                }
-                // A write that failed after the broadcast is made up for here.
-                TxPosition::Pending if row.state == SignedState::Signed => {
-                    self.note_settled(&row, SignedState::Seen);
-                }
-                TxPosition::Pending => {
-                    self.saving().refusals.remove(&row.id);
-                }
-                // `settle` has this one.
-                TxPosition::Absent if row.state == SignedState::Signed => {}
-                TxPosition::Absent => match chain.broadcast(&tx).await {
-                    Ok(()) => {
-                        insert_sent(wallet, &tx).await;
-                        self.saving().refusals.remove(&row.id);
-                        changed = true;
-                    }
-                    Err(error) if is_refusal(&error) => {
-                        let refusals = {
-                            let mut live = self.saving();
-                            let refusals = live.refusals.entry(row.id.clone()).or_default();
-                            *refusals += 1;
-                            *refusals
-                        };
-                        if refusals >= REFUSALS_TO_DROP {
-                            eprintln!("fedimix: send {} was dropped: {error}", row.id);
-                            self.note_settled(&row, SignedState::Dropped);
-                            changed = true;
-                        }
-                    }
-                    // Says nothing about the transaction.
-                    Err(_) => {}
-                },
-            }
-        }
-        changed
+        let tended = self.tend_rows(wallet, chain).await;
+        tended.unwrap_or_else(|e| {
+            eprintln!("fedimix: looking after stored Saving transactions: {e}");
+            false
+        })
     }
 
-    fn note_settled(&self, row: &SignedTx, state: SignedState) {
-        self.saving().refusals.remove(&row.id);
-        if let Err(e) = self.store().set_signed_state(&row.id, state) {
-            eprintln!("fedimix: saving what became of {}: {e}", row.id);
+    async fn tend_rows(&self, wallet: &Arc<SavingWallet>, chain: &dyn ChainClient) -> Result<bool> {
+        let rows = self.store().open_signed()?;
+        let mut changed = false;
+        for row in rows.iter().filter(|row| row.state != SignedState::Signed) {
+            let tx = tx_of(row)?;
+            let next = match wallet.tx_position(tx.compute_txid()) {
+                TxPosition::Confirmed { depth } if depth >= SETTLED_DEPTH => {
+                    Some(SignedState::Confirmed)
+                }
+                TxPosition::Confirmed { .. } | TxPosition::Pending => Some(SignedState::Seen),
+                TxPosition::Absent => self.tend_absent(wallet, chain, row, &tx).await?,
+            };
+            if let Some(next) = next.filter(|next| *next != row.state) {
+                self.store().set_signed_state(&row.id, next)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// A send the wallet's view does not show. Forgotten and conflicted look
+    /// alike there, so this asks for the proof, then offers it to the server.
+    async fn tend_absent(
+        &self,
+        wallet: &Arc<SavingWallet>,
+        chain: &dyn ChainClient,
+        row: &SignedTx,
+        tx: &Transaction,
+    ) -> Result<Option<SignedState>> {
+        if wallet
+            .conflict_depth(tx)
+            .is_some_and(|depth| depth >= SETTLED_DEPTH)
+        {
+            return Ok(Some(SignedState::Dropped));
+        }
+        // Replaced by the send that holds its coin, or about to be: a send now
+        // running must spend its coins. Reviving it would race that send, which
+        // cannot pay twice but is not what the user chose.
+        let locked = self.locked_by_others(&row.id)?;
+        let replaced = tx.input.iter().any(|i| locked.contains(&i.previous_output));
+        if replaced || (row.state == SignedState::Stalled && self.saving().op.is_some()) {
+            return Ok(None);
+        }
+        match chain.broadcast(tx).await {
+            Ok(()) => {
+                insert_sent(wallet, tx).await;
+                Ok(Some(SignedState::Seen))
+            }
+            // Nobody answered, so this says nothing yet.
+            Err(FedimixError::Offline) => Ok(None),
+            Err(error) => {
+                eprintln!("fedimix: rebroadcasting {}: {error}", row.id);
+                Ok(Some(SignedState::Stalled))
+            }
         }
     }
 }

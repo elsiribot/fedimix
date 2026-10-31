@@ -1901,7 +1901,8 @@ async fn saving_send_small_change_stays() {
     let min_deposit = address(&backend).await.min_deposit.unwrap();
     // At the margin, the largest change that stays.
     let wanted = min_deposit.as_sat() * 2;
-    eprintln!("min_deposit {min_deposit:?}, change {wanted}");
+    let v1 = std::env::var("FEDIMIX_EXPECT_MODULES").unwrap() == "v1";
+    eprintln!("MIN_DEPOSIT v1={v1} {min_deposit:?}, change {wanted}");
 
     let payee = btc("getnewaddress");
     let probe = backend
@@ -1917,26 +1918,64 @@ async fn saving_send_small_change_stays() {
     let txid = sent(&backend, preview).await;
     wait_for_transaction(&txid).await;
     mine(1);
-    match change {
-        ChangeDestination::SmallChange { amount: change } => {
-            wait_saving(&backend, |state| {
-                state.coins.len() == 1
-                    && state.coins[0].confirmed
-                    && state.coins[0].tag == PrivacyTag::SmallChange
-                    && state.coins[0].amount == change
-            })
-            .await;
-            assert_eq!(backend.saving_state().await.unwrap().balance, change);
-        }
-        // The margin is below dust where the federation's fee is that low.
-        ChangeDestination::None if wanted < DUST_SAT => {
-            wait_saving(&backend, |state| {
-                state.coins.is_empty() && state.history[0].status == HistoryStatus::Complete
-            })
-            .await;
-        }
-        other => panic!("{other:?}"),
+    if wanted < DUST_SAT {
+        // No small change can exist with this federation: the margin is below
+        // what an output may hold. The rest went to the fee, as the preview said.
+        assert_eq!(change, ChangeDestination::None, "{wanted}");
+        assert!(!v1, "v1's minimum leaves room for small change");
+        wait_saving(&backend, |state| {
+            state.coins.is_empty() && state.history[0].status == HistoryStatus::Complete
+        })
+        .await;
+        backend.shutdown().await.unwrap();
+        small_change_coin_with_no_federation().await;
+        return;
     }
+    let ChangeDestination::SmallChange { amount: change } = change else {
+        panic!("{wanted} sat fits an output, so it must stay: {change:?}");
+    };
+    wait_small_coin(&backend, change).await;
+    backend.shutdown().await.unwrap();
+}
+
+async fn wait_small_coin(backend: &RealBackend, change: Amount) {
+    wait_saving(backend, |state| {
+        state.coins.len() == 1
+            && state.coins[0].confirmed
+            && state.coins[0].tag == PrivacyTag::SmallChange
+            && state.coins[0].amount == change
+    })
+    .await;
+    assert_eq!(backend.saving_state().await.unwrap().balance, change);
+}
+
+/// A real small-change coin where the federation's margin leaves no room for
+/// one: with no active federation, all change stays.
+async fn small_change_coin_with_no_federation() {
+    const COIN: u64 = 300_000;
+    let wallet = SavingWallet::new();
+    let backend = wallet.open().await.unwrap();
+    backend
+        .set_settings(Settings {
+            chain_backend: electrum(),
+            ..Settings::for_network(Network::Regtest)
+        })
+        .await
+        .unwrap();
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    fund_saving(&backend, COIN).await;
+    let payee = btc("getnewaddress");
+    let preview = backend
+        .prepare_send(from_saving(&payee, 100_000))
+        .await
+        .unwrap();
+    let ChangeDestination::SmallChange { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    let txid = sent(&backend, preview).await;
+    wait_for_transaction(&txid).await;
+    mine(1);
+    wait_small_coin(&backend, change).await;
     backend.shutdown().await.unwrap();
 }
 

@@ -199,66 +199,82 @@ impl Inner {
         coins
     }
 
-    fn history(&self, labels: &Labels) -> Vec<HistoryItem> {
+    /// One row: what `tx` did to this wallet.
+    fn item(
+        &self,
+        tx: &Transaction,
+        status: HistoryStatus,
+        timestamp: u64,
+        labels: &Labels,
+    ) -> HistoryItem {
         let wallet = &self.wallet;
-        let mut items: Vec<HistoryItem> = wallet
+        let txid = tx.compute_txid();
+        let (sent, received) = wallet.sent_and_received(tx);
+        if sent.to_sat() == 0 {
+            let unmixed = (0..tx.output.len() as u32).all(|vout| {
+                let outpoint = OutPoint { txid, vout };
+                !wallet.is_mine(tx.output[vout as usize].script_pubkey.clone())
+                    || labels.tag(&outpoint.to_string()) == Tag::Unmixed
+            });
+            return HistoryItem {
+                id: txid.to_string(),
+                kind: HistoryKind::Received { unmixed },
+                amount: sat(received),
+                incoming: true,
+                status,
+                timestamp,
+                txid: Some(txid.to_string()),
+                fee: None,
+                session: None,
+            };
+        }
+        let record = labels.sent(&txid.to_string());
+        let change = record.and_then(|r| r.change.clone());
+        let outputs: bitcoin::Amount = tx.output.iter().map(|o| o.value).sum();
+        // What left for someone else: all outputs, less what came
+        // back to this wallet and less change sent to Spending.
+        let to_spending = change
+            .as_ref()
+            .filter(|c| c.to_spending)
+            .map_or(Amount::ZERO, |c| c.amount);
+        let amount = sat(outputs)
+            .saturating_sub(sat(received))
+            .saturating_sub(to_spending);
+        HistoryItem {
+            id: txid.to_string(),
+            kind: HistoryKind::Sent { change },
+            amount,
+            incoming: false,
+            status,
+            timestamp,
+            txid: Some(txid.to_string()),
+            fee: wallet.calculate_fee(tx).ok().map(sat),
+            session: None,
+        }
+    }
+
+    fn history(&self, labels: &Labels) -> Vec<HistoryItem> {
+        let mut items: Vec<HistoryItem> = self
+            .wallet
             .transactions()
             .map(|wtx| {
-                let tx = &wtx.tx_node.tx;
-                let txid = wtx.tx_node.txid;
-                let (sent, received) = wallet.sent_and_received(tx);
                 let status = if wtx.chain_position.is_confirmed() {
                     HistoryStatus::Complete
                 } else {
                     HistoryStatus::Pending
                 };
                 let timestamp = position_time(&wtx.chain_position);
-                if sent.to_sat() == 0 {
-                    let unmixed = (0..tx.output.len() as u32).all(|vout| {
-                        let outpoint = OutPoint { txid, vout };
-                        !wallet.is_mine(tx.output[vout as usize].script_pubkey.clone())
-                            || labels.tag(&outpoint.to_string()) == Tag::Unmixed
-                    });
-                    return HistoryItem {
-                        id: txid.to_string(),
-                        kind: HistoryKind::Received { unmixed },
-                        amount: sat(received),
-                        incoming: true,
-                        status,
-                        timestamp,
-                        txid: Some(txid.to_string()),
-                        fee: None,
-                        session: None,
-                    };
-                }
-                let record = labels.sent(&txid.to_string());
-                let change = record.and_then(|r| r.change.clone());
-                let outputs: bitcoin::Amount = tx.output.iter().map(|o| o.value).sum();
-                // What left for someone else: all outputs, less what came
-                // back to this wallet and less change sent to Spending.
-                let to_spending = change
-                    .as_ref()
-                    .filter(|c| c.to_spending)
-                    .map_or(Amount::ZERO, |c| c.amount);
-                let amount = sat(outputs)
-                    .saturating_sub(sat(received))
-                    .saturating_sub(to_spending);
-                HistoryItem {
-                    id: txid.to_string(),
-                    kind: HistoryKind::Sent { change },
-                    amount,
-                    incoming: false,
-                    status,
-                    timestamp,
-                    txid: Some(txid.to_string()),
-                    fee: wallet.calculate_fee(tx).ok().map(sat),
-                    session: None,
-                }
+                self.item(&wtx.tx_node.tx, status, timestamp, labels)
             })
             .collect();
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+        sort_history(&mut items);
         items
     }
+}
+
+/// Newest first.
+pub(crate) fn sort_history(items: &mut [HistoryItem]) {
+    items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
 }
 
 pub struct SavingWallet {
@@ -566,6 +582,13 @@ impl SavingWallet {
         match plan.amount {
             Some(amount) => {
                 builder.add_recipient(plan.to.clone(), amount);
+                if !plan.must_spend.is_empty() {
+                    let added = builder.add_utxos(&plan.must_spend);
+                    added.map_err(|_| FedimixError::PreviewExpired)?;
+                }
+                if plan.only_must_spend {
+                    builder.manually_selected_only();
+                }
                 if let Some(change_to) = &plan.change_to {
                     builder.drain_to(change_to.clone());
                 }
@@ -626,11 +649,45 @@ impl SavingWallet {
     }
 
     pub(crate) fn tx_position(&self, txid: Txid) -> TxPosition {
-        match self.lock().wallet.get_tx(txid) {
-            Some(tx) if tx.chain_position.is_confirmed() => TxPosition::Confirmed,
-            Some(_) => TxPosition::Pending,
+        let inner = self.lock();
+        let tip = inner.wallet.latest_checkpoint().height();
+        let position = inner.wallet.get_tx(txid).map(|tx| tx.chain_position);
+        match position {
+            Some(position) => match position.confirmation_height_upper_bound() {
+                Some(height) if position.is_confirmed() => TxPosition::Confirmed {
+                    depth: tip.saturating_sub(height) + 1,
+                },
+                _ => TxPosition::Pending,
+            },
             None => TxPosition::Absent,
         }
+    }
+
+    /// How deep the deepest confirmed transaction lies that spends a coin of
+    /// `tx` and is not `tx`: the only proof that `tx` can never confirm. `Absent`
+    /// says no such thing, as a transaction merely forgotten is absent too.
+    pub(crate) fn conflict_depth(&self, tx: &Transaction) -> Option<u32> {
+        let inputs: HashSet<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
+        let txid = tx.compute_txid();
+        let inner = self.lock();
+        let tip = inner.wallet.latest_checkpoint().height();
+        inner
+            .wallet
+            .transactions()
+            .filter(|other| other.tx_node.txid != txid)
+            .filter(|other| {
+                let spent = &other.tx_node.tx.input;
+                spent.iter().any(|i| inputs.contains(&i.previous_output))
+            })
+            .filter(|other| other.chain_position.is_confirmed())
+            .filter_map(|other| other.chain_position.confirmation_height_upper_bound())
+            .map(|height| tip.saturating_sub(height) + 1)
+            .max()
+    }
+
+    /// The history row of a stalled send, which BDK's view no longer lists.
+    pub(crate) fn stalled_item(&self, tx: &Transaction, at: u64, labels: &Labels) -> HistoryItem {
+        self.lock().item(tx, HistoryStatus::Stalled, at, labels)
     }
 
     #[cfg(test)]
@@ -663,6 +720,10 @@ pub(crate) struct SendPlan {
     pub change_to: Option<ScriptBuf>,
     /// Coins signed away by a stored transaction, whatever the chain says now.
     pub locked: HashSet<OutPoint>,
+    /// Coins this send must spend.
+    pub must_spend: Vec<OutPoint>,
+    /// Spend `must_spend` and nothing else.
+    pub only_must_spend: bool,
 }
 
 /// An unsigned send.
@@ -677,7 +738,10 @@ pub(crate) struct BuiltSend {
 /// Where the wallet's canonical view has a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxPosition {
-    Confirmed,
+    /// In a block, `depth` of them counting its own.
+    Confirmed {
+        depth: u32,
+    },
     Pending,
     Absent,
 }
@@ -1363,6 +1427,8 @@ mod tests {
                     fee_rate: FeeRate::from_sat_per_vb_u32(2),
                     change_to,
                     locked: HashSet::new(),
+                    must_spend: Vec::new(),
+                    only_must_spend: false,
                 },
             )
             .unwrap();

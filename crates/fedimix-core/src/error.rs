@@ -41,6 +41,14 @@ pub enum FedimixError {
     /// Exits wait out the online grace period (spec section 1).
     #[error("exits wait until the app has been online for a while")]
     GracePeriod,
+    /// A chain server judged a transaction and said no. Payload is its reason.
+    #[error("The chain server refused this transaction: {0}.")]
+    TxRejected(String),
+    /// A server refused a send that an earlier attempt may have delivered.
+    #[error(
+        "The server refused this send, but an earlier try may have reached the network, so it could still confirm. Your next send spends the same coins, so only one of them can."
+    )]
+    SendInDoubt,
     #[error("internal error: {0}")]
     Internal(String),
 }

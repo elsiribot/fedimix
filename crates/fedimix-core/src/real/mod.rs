@@ -691,7 +691,7 @@ impl Backend for RealBackend {
     /// Spending starts at `Broadcasting`, past the point of cancelling. A Saving
     /// send can be cancelled until then.
     async fn cancel_operation(&self, id: OperationId) -> Result<()> {
-        if self.core.cancel_saving(&id) || self.core.store().is_send(&id)? {
+        if self.core.cancel_saving(&id)? || self.core.store().is_send(&id)? {
             Ok(())
         } else {
             Err(FedimixError::UnknownItem(id))

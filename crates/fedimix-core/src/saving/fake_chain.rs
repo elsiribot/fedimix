@@ -20,8 +20,10 @@ pub enum BroadcastGoes {
     Offline,
     /// Reached the server, and the connection dropped before the answer.
     AnswerLost,
-    /// The server said no.
+    /// The server judged the transaction and said no.
     Refused,
+    /// The server answered with something that judges nothing.
+    Unclear,
 }
 
 #[derive(Default)]
@@ -49,6 +51,7 @@ struct State {
 pub struct FakeChain {
     state: Mutex<State>,
     stalled: watch::Sender<bool>,
+    broadcasts_held: watch::Sender<bool>,
 }
 
 impl FakeChain {
@@ -81,6 +84,11 @@ impl FakeChain {
         self.stalled.send_replace(stalled);
     }
 
+    /// While set, `broadcast` alone hangs.
+    pub fn hold_broadcasts(&self, held: bool) {
+        self.broadcasts_held.send_replace(held);
+    }
+
     /// While set, every call panics, as a bug in a client library would.
     pub fn set_panics(&self, panics: bool) {
         self.state().panics = panics;
@@ -108,6 +116,11 @@ impl FakeChain {
     /// The next `broadcast`s go like this, in order.
     pub fn script_broadcasts(&self, script: impl IntoIterator<Item = BroadcastGoes>) {
         self.state().broadcast_script.extend(script);
+    }
+
+    /// Forgets what `script_broadcasts` left: from now on the server accepts.
+    pub fn clear_broadcast_script(&self) {
+        self.state().broadcast_script.clear();
     }
 
     /// The server lost `txid`: it forgets it, and stops listing it.
@@ -173,6 +186,11 @@ impl ChainClient for FakeChain {
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.check_online().await?;
+        let _ = self
+            .broadcasts_held
+            .subscribe()
+            .wait_for(|held| !held)
+            .await;
         let mut state = self.state();
         let txid = tx.compute_txid();
         let goes = state.broadcast_script.pop_front();
@@ -180,7 +198,12 @@ impl ChainClient for FakeChain {
             return Err(FedimixError::Offline);
         }
         if goes == Some(BroadcastGoes::Refused) {
-            return Err(refused("bad-txns-inputs-missingorspent"));
+            return Err(FedimixError::TxRejected(
+                "bad-txns-inputs-missingorspent".into(),
+            ));
+        }
+        if goes == Some(BroadcastGoes::Unclear) {
+            return Err(refused("server busy"));
         }
         state.broadcasts.push(tx.clone());
         state.known.insert(txid);

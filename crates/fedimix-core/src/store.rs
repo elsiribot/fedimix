@@ -196,11 +196,14 @@ pub struct Watch {
 
 /// How far a signed transaction has come. `Signed` is an operation still
 /// running: no server is known to have it. `Seen` went out and may yet be lost,
-/// so its coins stay signed away. The last two are final.
+/// so its coins stay signed away. `Stalled` is held by no server we can reach
+/// and may still confirm: the next send must spend its coins. The last two are
+/// final: `Confirmed` is 6 blocks deep, and `Dropped` cannot confirm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignedState {
     Signed,
     Seen,
+    Stalled,
     Confirmed,
     Dropped,
 }
@@ -210,6 +213,7 @@ impl SignedState {
         match self {
             Self::Signed => "signed",
             Self::Seen => "seen",
+            Self::Stalled => "stalled",
             Self::Confirmed => "confirmed",
             Self::Dropped => "dropped",
         }
@@ -219,6 +223,7 @@ impl SignedState {
         Ok(match s {
             "signed" => Self::Signed,
             "seen" => Self::Seen,
+            "stalled" => Self::Stalled,
             "confirmed" => Self::Confirmed,
             "dropped" => Self::Dropped,
             other => return Err(db_err(format!("unknown signed state {other:?}"))),
@@ -1043,12 +1048,16 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, tx_hex, state, change_address, created_at FROM saving_signed
-                 WHERE state IN (?1, ?2) ORDER BY created_at, id",
+                 WHERE state IN (?1, ?2, ?3) ORDER BY created_at, id",
             )
             .map_err(db_err)?;
         let rows = stmt
             .query_map(
-                [SignedState::Signed.as_str(), SignedState::Seen.as_str()],
+                [
+                    SignedState::Signed.as_str(),
+                    SignedState::Seen.as_str(),
+                    SignedState::Stalled.as_str(),
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -1084,14 +1093,30 @@ impl Store {
         Ok(())
     }
 
-    /// Whether a transaction that may still be paid went to `address`. One that
-    /// was dropped never paid it, and a v2 address stays until it is paid.
+    /// Whether `address` is spoken for. One that was dropped never paid it. A
+    /// stalled one does not count: the send that asks here spends its coins, so
+    /// only one of the two can pay the address.
     pub(crate) fn change_address_used(&self, address: &str) -> Result<bool> {
         self.conn
             .query_row(
                 "SELECT EXISTS (SELECT 1 FROM saving_signed
-                    WHERE change_address = ?1 AND state != ?2)",
-                [address, SignedState::Dropped.as_str()],
+                    WHERE change_address = ?1 AND state NOT IN (?2, ?3))",
+                [
+                    address,
+                    SignedState::Dropped.as_str(),
+                    SignedState::Stalled.as_str(),
+                ],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+    }
+
+    /// Whether `id` is a stored transaction.
+    pub(crate) fn is_signed(&self, id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM saving_signed WHERE id = ?1)",
+                [id],
                 |r| r.get(0),
             )
             .map_err(db_err)
@@ -1650,6 +1675,17 @@ mod tests {
             .unwrap();
         assert!(store.change_address_used("address").unwrap());
         assert_eq!(store.open_signed().unwrap().len(), 1);
+        store
+            .set_signed_state("saving-1", SignedState::Stalled)
+            .unwrap();
+        assert!(!store.change_address_used("address").unwrap());
+        assert_eq!(
+            store.open_signed().unwrap().len(),
+            1,
+            "it may still confirm"
+        );
+        assert!(store.is_signed("saving-1").unwrap());
+        assert!(!store.is_signed("saving-2").unwrap());
         store
             .set_signed_state("saving-1", SignedState::Confirmed)
             .unwrap();

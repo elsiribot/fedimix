@@ -20,7 +20,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - A send against real hardware or a public server; a dropped send is exercised with fakes only. Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-6 done: chain access, the watch-only wallet, devices (`HwiPort`, compile-only; `SoftSigner` under `testing`), `RealBackend` Saving state and sync, and Task 6: `prepare_send`/`confirm_send`/`cancel_operation` for Saving, with change to a federation deposit address, small change kept, and the signed transaction stored before broadcast (`saving_signed`, schema 6), rebroadcast until settled. The core sends; GTK's Send and Refill arrive in Task 8. Next: Task 7 (refill). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
+Phase 3 (Saving, hardware wallet), Tasks 1-6 done: chain access, the watch-only wallet, devices (`HwiPort`, compile-only; `SoftSigner` under `testing`), `RealBackend` Saving state and sync, and Task 6: `prepare_send`/`confirm_send`/`cancel_operation` for Saving, with change to a federation deposit address, small change kept, and the signed transaction stored before broadcast (`saving_signed`, schema 6), rebroadcast until settled; a send no server takes is held as stalled and the next send spends its coins. The core sends; GTK's Send and Refill arrive in Task 8. Next: Task 7 (refill). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.
