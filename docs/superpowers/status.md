@@ -1,9 +1,9 @@
 # Status
 
-Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 2 Tasks 1 (the review residuals N1-N7, N9, N10, O5) and 2 (fedimint 0.13 in the build, devimint smoke test) are done. The whole UI runs over `DemoBackend`. There is no real backend yet, and the app only starts with `--demo`.
+Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 2 Tasks 1 (the review residuals N1-N7, N9, N10, O5), 2 (fedimint 0.13 in the build, devimint smoke test) and 3 (store, seed, data dir lock) are done. The whole UI runs over `DemoBackend`. There is no real backend yet, and the app only starts with `--demo`.
 
 ## What works (commands run in `nix develop`)
-- `just clippy`, `just test` (45 core unit, 4 demo-flow, 17 operation, 69 gtk unit tests).
+- `just clippy`, `just test` (57 core unit, 4 demo-flow, 17 operation, 69 gtk unit tests).
 - `nix build` (fails if the binary cannot load its libraries; `result/bin/fedimix --demo` was started once under headless sway with a clean environment), or `just build-nix` for that plus `nix flake check` (clippy, fmt, tests on the same source).
 - `just test-integration` (slow; devimint with both module sets, each runs `smoke_join_and_read_modules`: join a federation with RocksDB, balance 0). Uses `nix develop .#integration --accept-flake-config`; plain `nix develop` does not touch fedimint.
 - `just demo` / `just run`; `--demo-scenario funded|below-target|no-saving|first-run|offline|exit-deferred|long-names|device-disconnected|preview-expiry|device-rejects|send-stuck`, `--demo-page ...`.
@@ -23,7 +23,7 @@ Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 
 
 ## Next
 Phase 2: real Fedimint backend. A build and devimint spike is running; the plan follows from it. The plan owns bootstrap (open/shutdown/seed), paged history and the network setting.
-Phase 2 Task 3 onward. Still open from the re-review: O1-O4 (not in Task 1) and N8 (accepted).
+Phase 2 Task 4 onward. Persistence (`store.rs`, `seed.rs`, `CoreConfig`/`Network`) exists but nothing calls it until the real backend. Still open from the re-review: O1-O4 (not in Task 1) and N8 (accepted).
 
 ## Needs user
 Nothing.

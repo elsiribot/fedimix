@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::FedimixError;
 
 /// Amounts from this many sats up display in BTC, smaller ones in sat.
@@ -9,7 +11,7 @@ const DISPLAY_BTC_FROM_SAT: u64 = 100_000;
 const SATS_PER_BTC: u64 = 100_000_000;
 
 /// Amount in millisatoshis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct Amount {
     pub msat: u64,
 }
@@ -134,7 +136,7 @@ pub struct FederationInfo {
     pub anonymity_estimate: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HistoryKind {
     FromSpending { denomination: Amount },
     Sent { change: Option<SentChange> },
@@ -147,13 +149,13 @@ pub enum HistoryKind {
 }
 
 /// `to_spending == false` means "small change".
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SentChange {
     pub amount: Amount,
     pub to_spending: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HistoryStatus {
     Pending,
     Confirming {
@@ -168,7 +170,7 @@ pub enum HistoryStatus {
     Expired,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryItem {
     pub id: String,
     pub kind: HistoryKind,
@@ -361,19 +363,27 @@ pub struct ReceiveInfo {
     pub expires_at: Option<Timestamp>,
 }
 
+/// The Bitcoin network a data folder belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Bitcoin,
+    Signet,
+    Regtest,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SuggestedFederation {
     pub name: String,
     pub invite: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChainBackend {
     Esplora { url: String },
     Electrum { url: String },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub spending_target: Amount,
     pub anonymity_target: u32,

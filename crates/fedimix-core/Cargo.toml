@@ -8,14 +8,18 @@ publish.workspace = true
 [dependencies]
 async-channel.workspace = true
 async-trait.workspace = true
+fedimint-bip39.workspace = true
+fedimint-client.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 tokio.workspace = true
 # The smoke test (tests/devimint.rs) uses fedimint directly; no other code does yet.
-fedimint-bip39.workspace = true
-fedimint-client.workspace = true
 fedimint-connectors.workspace = true
 fedimint-core.workspace = true
 fedimint-lnv2-client.workspace = true
@@ -24,5 +28,4 @@ fedimint-mintv2-client.workspace = true
 fedimint-rocksdb.workspace = true
 fedimint-wallet-client.workspace = true
 fedimint-walletv2-client.workspace = true
-rand.workspace = true
 tempfile.workspace = true
