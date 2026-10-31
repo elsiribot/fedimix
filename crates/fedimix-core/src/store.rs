@@ -1,5 +1,6 @@
 //! SQLite persistence: settings, federations, history, watches and cursors.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -7,11 +8,13 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::api::{
-    ChainBackend, HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind,
+    Amount, ChainBackend, DeviceKind, HistoryItem, HistoryStatus, Network, SentChange, Settings,
+    Timestamp, WalletKind,
 };
 use crate::error::{FedimixError, Result};
+use crate::saving::{DeviceAccount, Label, Labels, SentRecord, Tag};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -47,13 +50,38 @@ CREATE TABLE cursors (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// The Saving tables (schema 5). Only public data: the device's account xpub,
+/// never a private key. The BDK tables beside them are BDK's own.
+const SAVING_SCHEMA: &str = "
+CREATE TABLE saving_device (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    xpub TEXT NOT NULL,
+    path TEXT NOT NULL
+);
+CREATE TABLE saving_labels (
+    outpoint TEXT PRIMARY KEY,
+    tag TEXT,
+    estimate INTEGER,
+    source_federation TEXT,
+    frozen INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE saving_sent (
+    txid TEXT PRIMARY KEY,
+    change_msat INTEGER,
+    to_spending INTEGER NOT NULL DEFAULT 0
+);
+";
+
 /// A write transaction that takes the write lock up front, so it waits for the
 /// busy timeout instead of failing halfway.
 fn begin(conn: &Connection) -> Result<Transaction<'_>> {
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_err)
 }
 
-fn db_err(e: impl std::fmt::Display) -> FedimixError {
+pub(crate) fn db_err(e: impl std::fmt::Display) -> FedimixError {
     FedimixError::Internal(format!(
         "Fedimix could not read or write its database: {e}."
     ))
@@ -91,6 +119,7 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
                 "ALTER TABLE federations ADD COLUMN has_lightning INTEGER NOT NULL DEFAULT 1;",
             )
             .map_err(db_err),
+        4 => tx.execute_batch(SAVING_SCHEMA).map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -288,6 +317,7 @@ impl Store {
             )
             .map_err(db_err)?;
             tx.execute_batch(SCHEMA).map_err(db_err)?;
+            tx.execute_batch(SAVING_SCHEMA).map_err(db_err)?;
             tx.execute(
                 "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
                 [SCHEMA_VERSION],
@@ -788,6 +818,192 @@ impl Store {
     }
 }
 
+/// Saving: the device account and the privacy labels.
+impl Store {
+    pub(crate) fn device_account(&self) -> Result<Option<DeviceAccount>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kind, name, fingerprint, xpub, path FROM saving_device WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_err)?;
+        row.map(|(kind, name, fingerprint, xpub, path)| {
+            Ok(DeviceAccount {
+                kind: device_kind_parse(&kind)?,
+                name,
+                fingerprint,
+                xpub,
+                path,
+            })
+        })
+        .transpose()
+    }
+
+    /// `false` when an account is already stored; nothing is changed then.
+    pub(crate) fn set_device_account(&self, account: &DeviceAccount) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO saving_device (id, kind, name, fingerprint, xpub, path)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    device_kind_str(account.kind),
+                    account.name,
+                    account.fingerprint,
+                    account.xpub,
+                    account.path
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(n == 1)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "RealBackend uses it from Task 5")
+    )]
+    pub(crate) fn saving_labels(&self) -> Result<Labels> {
+        let mut coins = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT outpoint, tag, estimate, source_federation, frozen FROM saving_labels")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(db_err)?;
+        for row in rows {
+            let (outpoint, tag, estimate, source_federation, frozen) = row.map_err(db_err)?;
+            let tag = tag.and_then(|name| {
+                Tag::from_parts(&name, estimate.and_then(|e| u32::try_from(e).ok()))
+            });
+            coins.insert(
+                outpoint,
+                Label {
+                    tag,
+                    source_federation,
+                    frozen,
+                },
+            );
+        }
+        let mut sent = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT txid, change_msat, to_spending FROM saving_sent")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(db_err)?;
+        for row in rows {
+            let (txid, change, to_spending) = row.map_err(db_err)?;
+            let change = change.map(|msat| SentChange {
+                amount: Amount {
+                    msat: from_db(msat),
+                },
+                to_spending,
+            });
+            sent.insert(txid, SentRecord { change });
+        }
+        Ok(Labels::from_rows(coins, sent))
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "RealBackend uses it from Task 5")
+    )]
+    pub(crate) fn put_saving_label(&self, outpoint: &str, label: &Label) -> Result<()> {
+        let (tag, estimate) = match label.tag.map(Tag::to_parts) {
+            Some((name, estimate)) => (Some(name), estimate),
+            None => (None, None),
+        };
+        let tx = begin(&self.conn)?;
+        tx.execute(
+            "INSERT INTO saving_labels (outpoint, tag, estimate, source_federation, frozen)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(outpoint) DO UPDATE SET tag = excluded.tag,
+                estimate = excluded.estimate,
+                source_federation = excluded.source_federation,
+                frozen = excluded.frozen",
+            params![
+                outpoint,
+                tag,
+                estimate,
+                label.source_federation,
+                label.frozen
+            ],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "RealBackend uses it from Task 5")
+    )]
+    pub(crate) fn put_saving_sent(&self, txid: &str, sent: &SentRecord) -> Result<()> {
+        let (msat, to_spending) = match &sent.change {
+            Some(c) => (Some(to_db(c.amount.msat)), c.to_spending),
+            None => (None, false),
+        };
+        let tx = begin(&self.conn)?;
+        tx.execute(
+            "INSERT INTO saving_sent (txid, change_msat, to_spending) VALUES (?1, ?2, ?3)
+             ON CONFLICT(txid) DO UPDATE SET change_msat = excluded.change_msat,
+                to_spending = excluded.to_spending",
+            params![txid, msat, to_spending],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+}
+
+fn device_kind_str(kind: DeviceKind) -> &'static str {
+    match kind {
+        DeviceKind::Ledger => "ledger",
+        DeviceKind::Trezor => "trezor",
+        DeviceKind::Coldcard => "coldcard",
+        DeviceKind::Jade => "jade",
+        DeviceKind::BitBox => "bitbox",
+        DeviceKind::Software => "software",
+    }
+}
+
+fn device_kind_parse(s: &str) -> Result<DeviceKind> {
+    Ok(match s {
+        "ledger" => DeviceKind::Ledger,
+        "trezor" => DeviceKind::Trezor,
+        "coldcard" => DeviceKind::Coldcard,
+        "jade" => DeviceKind::Jade,
+        "bitbox" => DeviceKind::BitBox,
+        "software" => DeviceKind::Software,
+        other => return Err(db_err(format!("unknown device kind {other:?}"))),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,7 +1416,10 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "ALTER TABLE watches DROP COLUMN operation;
+                    "DROP TABLE saving_device;
+                     DROP TABLE saving_labels;
+                     DROP TABLE saving_sent;
+                     ALTER TABLE watches DROP COLUMN operation;
                      ALTER TABLE federations DROP COLUMN joined_session;
                      ALTER TABLE federations DROP COLUMN has_lightning;
                      UPDATE schema_version SET version = 1;",
@@ -1223,7 +1442,10 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "ALTER TABLE federations DROP COLUMN joined_session;
+                    "DROP TABLE saving_device;
+                     DROP TABLE saving_labels;
+                     DROP TABLE saving_sent;
+                     ALTER TABLE federations DROP COLUMN joined_session;
                      ALTER TABLE federations DROP COLUMN has_lightning;
                      UPDATE schema_version SET version = 2;",
                 )
@@ -1232,6 +1454,27 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.federations().unwrap()[0].joined_session, None);
         assert!(store.federations().unwrap()[0].has_lightning);
+    }
+
+    #[test]
+    fn a_version_4_database_gains_the_saving_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE saving_device;
+                     DROP TABLE saving_labels;
+                     DROP TABLE saving_sent;
+                     UPDATE schema_version SET version = 4;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.device_account(), Ok(None));
+        assert!(store.saving_labels().is_ok());
     }
 
     #[test]

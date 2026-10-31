@@ -20,7 +20,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-2 done: the dependencies and Phase 2 residuals, and chain access (`saving::ChainClient` over Esplora or Electrum, through a SOCKS5 proxy that fails closed; `FakeChain` under `testing`; devimint tests for equal balances, double broadcast and the closed proxy). Next: Task 3 of the Phase 3 plan, the watch-only wallet. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause (a shot outlasting a 300 ms state) is from reading.
+Phase 3 (Saving, hardware wallet), Tasks 1-3 done: the dependencies and Phase 2 residuals, chain access (`saving::ChainClient` over Esplora or Electrum, `FakeChain` under `testing`), and the watch-only wallet (`saving::SavingWallet`: create/open from a `DeviceAccount`, sync, balance, coins, history, fresh receive addresses; `Labels` per outpoint; schema 5). No device and no sending yet. Next: Task 4 of the Phase 3 plan, devices and signing. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause is from reading.
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.

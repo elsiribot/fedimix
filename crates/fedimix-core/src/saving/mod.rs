@@ -4,7 +4,11 @@
 mod chain;
 #[cfg(feature = "testing")]
 mod fake_chain;
+mod labels;
+mod wallet;
 
 pub use chain::{ChainClient, connect_chain};
 #[cfg(feature = "testing")]
 pub use fake_chain::FakeChain;
+pub use labels::{Label, Labels, SentRecord, Tag};
+pub use wallet::{DeviceAccount, SavingWallet, SyncSummary};

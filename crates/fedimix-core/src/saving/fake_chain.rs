@@ -20,6 +20,7 @@ struct State {
     known: HashSet<Txid>,
     broadcasts: Vec<Transaction>,
     scans_made: usize,
+    full_scans_made: usize,
 }
 
 /// Answers from a queue: an empty response when the queue is empty. `offline`
@@ -74,6 +75,11 @@ impl FakeChain {
         self.state().broadcasts.clone()
     }
 
+    /// How many of those were full scans.
+    pub fn full_scans_made(&self) -> usize {
+        self.state().full_scans_made
+    }
+
     /// How many scans and syncs were asked for.
     pub fn scans_made(&self) -> usize {
         self.state().scans_made
@@ -90,6 +96,7 @@ impl ChainClient for FakeChain {
         self.check_online()?;
         let mut state = self.state();
         state.scans_made += 1;
+        state.full_scans_made += 1;
         Ok(state.full_scans.pop_front().unwrap_or_default())
     }
 
