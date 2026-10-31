@@ -8,12 +8,13 @@ pub mod destination;
 pub mod error;
 pub mod event;
 pub mod handle;
-// The only code that touches the Fedimint client; RealBackend arrives in Task 6.
+// The only code that touches the Fedimint client. Receive and send arrive in
+// Tasks 7-8 and use the rest of it.
 #[allow(dead_code)]
 mod federation;
-// Persistence for the real backend (Phase 2); nothing calls it until Tasks 5-6.
-#[allow(dead_code)]
+mod real;
 mod seed;
+// Watches and cursors are for Tasks 7-8.
 #[allow(dead_code)]
 mod store;
 
@@ -27,15 +28,30 @@ pub use destination::{
 pub use error::{FedimixError, Result};
 pub use event::{Event, EventStream, Notice};
 pub use handle::Fedimix;
+pub use real::RealBackend;
 
-/// For `tests/devimint.rs` only, which cannot reach crate-private items. Not an
-/// API: nothing here may name a fedimint or bitcoin type.
+/// For the integration tests only, which cannot reach crate-private items and
+/// do not see `cfg(test)` code. Not an API: nothing here may name a fedimint or
+/// bitcoin type.
 #[doc(hidden)]
 pub mod testing {
+    use std::sync::Arc;
+
+    pub use crate::federation::fake::{FakeClient, FakePort};
     pub use crate::federation::{
         DepositEvent, FederationClient, FederationPort, FederationPreview, FedimintPort,
         LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
+    pub use crate::real::Clock;
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
+
+    /// [`crate::RealBackend`] over `port`, reading the time from `clock`.
+    pub async fn real_backend(
+        config: crate::CoreConfig,
+        port: Arc<dyn FederationPort>,
+        clock: Clock,
+    ) -> crate::Result<Arc<crate::RealBackend>> {
+        crate::RealBackend::with_port(config, port, clock).await
+    }
 }

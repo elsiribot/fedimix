@@ -3,7 +3,7 @@
 //! by calling `open` again.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -60,7 +60,7 @@ impl<T: Clone + Send + Sync + 'static> Log<T> {
 }
 
 /// A scripted federation.
-pub(crate) struct FakeClient {
+pub struct FakeClient {
     id: String,
     name: String,
     balance: watch::Sender<Amount>,
@@ -87,10 +87,12 @@ pub(crate) struct FakeClient {
     watches: Mutex<HashMap<String, Arc<Log<WatchUpdate>>>>,
     deposits: Log<DepositEvent>,
     shutdowns: AtomicU32,
+    /// The next balance stream panics when polled.
+    panic_next_stream: AtomicBool,
 }
 
 impl FakeClient {
-    pub(crate) fn new(id: &str, name: &str) -> Arc<Self> {
+    pub fn new(id: &str, name: &str) -> Arc<Self> {
         Arc::new(Self {
             id: id.to_string(),
             name: name.to_string(),
@@ -114,82 +116,88 @@ impl FakeClient {
             watches: Mutex::default(),
             deposits: Log::new(),
             shutdowns: AtomicU32::new(0),
+            panic_next_stream: AtomicBool::new(false),
         })
     }
 
-    pub(crate) fn set_balance(&self, balance: Amount) {
+    pub fn set_balance(&self, balance: Amount) {
         self.balance.send_replace(balance);
     }
 
-    pub(crate) fn set_online(&self, online: bool) {
+    pub fn set_online(&self, online: bool) {
         self.online.send_replace(online);
     }
 
-    pub(crate) fn set_notes(&self, notes: Vec<NoteBucket>) {
+    pub fn set_notes(&self, notes: Vec<NoteBucket>) {
         *self.notes.lock().unwrap() = notes;
     }
 
-    pub(crate) fn set_min_deposit(&self, min_deposit: Result<Amount>) {
+    pub fn set_min_deposit(&self, min_deposit: Result<Amount>) {
         *self.min_deposit.lock().unwrap() = min_deposit;
     }
 
     /// `false` acts like the generation with `deposits()` and no watch id.
-    pub(crate) fn set_deposit_watches(&self, on: bool) {
+    pub fn set_deposit_watches(&self, on: bool) {
         *self.deposit_watches.lock().unwrap() = on;
     }
 
-    pub(crate) fn set_lightning_fee(&self, fee: Amount) {
+    pub fn set_lightning_fee(&self, fee: Amount) {
         *self.lightning_fee.lock().unwrap() = fee;
     }
 
-    pub(crate) fn set_withdraw_fee(&self, fee: Amount) {
+    pub fn set_withdraw_fee(&self, fee: Amount) {
         *self.withdraw_fee.lock().unwrap() = fee;
     }
 
     /// Makes `invoice` payable for `amount`.
-    pub(crate) fn add_invoice(&self, invoice: &str, amount: Amount) {
+    pub fn add_invoice(&self, invoice: &str, amount: Amount) {
         self.invoice_amounts
             .lock()
             .unwrap()
             .insert(invoice.to_string(), amount);
     }
 
-    pub(crate) fn fail_next_invoice(&self, error: FedimixError) {
+    pub fn fail_next_invoice(&self, error: FedimixError) {
         self.invoice_errors.lock().unwrap().push_back(error);
     }
 
     /// Errors the next `lightning_quote` or `withdraw_quote`.
-    pub(crate) fn fail_next_quote(&self, error: FedimixError) {
+    pub fn fail_next_quote(&self, error: FedimixError) {
         self.quote_errors.lock().unwrap().push_back(error);
     }
 
-    pub(crate) fn fail_next_pay(&self, error: FedimixError) {
+    pub fn fail_next_pay(&self, error: FedimixError) {
         self.pay_errors.lock().unwrap().push_back(error);
     }
 
-    pub(crate) fn fail_next_withdraw(&self, error: FedimixError) {
+    pub fn fail_next_withdraw(&self, error: FedimixError) {
         self.withdraw_errors.lock().unwrap().push_back(error);
     }
 
     /// Appends to what `watch` yields for this id, also for a later watch.
-    pub(crate) fn push_update(&self, id: &str, update: WatchUpdate) {
+    pub fn push_update(&self, id: &str, update: WatchUpdate) {
         self.log_of(id).push(update);
     }
 
-    pub(crate) fn push_deposit(&self, event: DepositEvent) {
+    pub fn push_deposit(&self, event: DepositEvent) {
         self.deposits.push(event);
     }
 
+    /// Makes the next balance stream panic, as a bug in a task would.
+    pub fn panic_next_stream(&self) {
+        self.panic_next_stream.store(true, Ordering::SeqCst);
+    }
+
     /// Invoices paid, in order.
-    pub(crate) fn paid(&self) -> Vec<String> {
+    pub fn paid(&self) -> Vec<String> {
         self.paid.lock().unwrap().clone()
     }
 
-    pub(crate) fn withdrawn(&self) -> Vec<WithdrawQuote> {
+    pub fn withdrawn(&self) -> Vec<WithdrawQuote> {
         self.withdrawn.lock().unwrap().clone()
     }
 
-    pub(crate) fn shutdowns(&self) -> u32 {
+    pub fn shutdowns(&self) -> u32 {
         self.shutdowns.load(Ordering::SeqCst)
     }
 
@@ -247,6 +255,9 @@ impl FederationClient for FakeClient {
     }
 
     fn balance_changes(&self) -> BoxStream<'static, Amount> {
+        if self.panic_next_stream.swap(false, Ordering::SeqCst) {
+            return stream::once(async { panic!("the balance stream panicked") }).boxed();
+        }
         changes(self.balance.subscribe(), self.alive.subscribe())
     }
 
@@ -386,22 +397,20 @@ where
 
 /// A port over scripted federations, keyed by invite.
 #[derive(Default)]
-pub(crate) struct FakePort {
+pub struct FakePort {
     invites: Mutex<HashMap<String, (FederationPreview, Arc<FakeClient>)>>,
     /// While set, every call reports `Offline`.
     unreachable: Mutex<bool>,
+    /// While set, every call hangs, as an unanswered connection does.
+    held: watch::Sender<bool>,
     /// Calls that would have opened a connection.
     connects: AtomicU32,
+    joins: AtomicU32,
 }
 
 impl FakePort {
     /// Adds a federation on `network` with Lightning; returns its client.
-    pub(crate) fn add_federation(
-        &self,
-        invite: &str,
-        id: &str,
-        network: Network,
-    ) -> Arc<FakeClient> {
+    pub fn add_federation(&self, invite: &str, id: &str, network: Network) -> Arc<FakeClient> {
         let name = format!("Federation {id}");
         let client = FakeClient::new(id, &name);
         let preview = FederationPreview {
@@ -417,16 +426,28 @@ impl FakePort {
         client
     }
 
-    pub(crate) fn set_unreachable(&self, unreachable: bool) {
+    pub fn set_unreachable(&self, unreachable: bool) {
         *self.unreachable.lock().unwrap() = unreachable;
     }
 
-    pub(crate) fn connects(&self) -> u32 {
+    /// Calls hang until this is set back to `false`.
+    pub fn set_held(&self, held: bool) {
+        self.held.send_replace(held);
+    }
+
+    pub fn connects(&self) -> u32 {
         self.connects.load(Ordering::SeqCst)
     }
 
-    fn connect(&self) -> Result<()> {
+    /// Calls of `join` that got through.
+    pub fn joins(&self) -> u32 {
+        self.joins.load(Ordering::SeqCst)
+    }
+
+    async fn connect(&self) -> Result<()> {
         self.connects.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         if *self.unreachable.lock().unwrap() {
             return Err(FedimixError::Offline);
         }
@@ -452,17 +473,19 @@ fn reopened(client: Arc<FakeClient>) -> Arc<dyn FederationClient> {
 #[async_trait]
 impl FederationPort for FakePort {
     async fn preview(&self, invite: &str) -> Result<FederationPreview> {
-        self.connect()?;
+        self.connect().await?;
         Ok(self.by_invite(invite)?.0)
     }
 
     async fn join(&self, invite: &str, _root: &Seed) -> Result<Arc<dyn FederationClient>> {
-        self.connect()?;
-        Ok(reopened(self.by_invite(invite)?.1))
+        self.connect().await?;
+        let client = self.by_invite(invite)?.1;
+        self.joins.fetch_add(1, Ordering::SeqCst);
+        Ok(reopened(client))
     }
 
     async fn open(&self, id: &str, _root: &Seed) -> Result<Arc<dyn FederationClient>> {
-        self.connect()?;
+        self.connect().await?;
         let invites = self.invites.lock().unwrap();
         let (_, client) = invites
             .values()

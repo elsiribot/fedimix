@@ -17,7 +17,7 @@ use fedimix_core::testing::{
     DataDirLock, DepositEvent, FederationClient, FederationPort, FedimintPort, Seed, Watch,
     WatchKind, WatchUpdate,
 };
-use fedimix_core::{Amount, FedimixError, Network, SendAmount};
+use fedimix_core::{Amount, Backend, CoreConfig, FedimixError, Network, RealBackend, SendAmount};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use tempfile::TempDir;
@@ -639,4 +639,56 @@ async fn withdraw_quote_reports_the_real_problem() {
         "{reply:?}"
     );
     client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn restart_keeps_federation_and_balance() {
+    // Receive is not in `RealBackend` yet, so fund the folder through the port.
+    // Joining then finds the client database and opens it.
+    let wallet = Wallet::new();
+    let client = funded(&wallet, 10_000).await;
+    let balance = client.balance().await.unwrap();
+    assert!(balance > Amount::ZERO);
+    let id = client.id();
+    client.shutdown().await.unwrap();
+    let Wallet { dir, _lock, .. } = wallet;
+    drop(_lock);
+    let config = CoreConfig {
+        data_dir: dir.path().to_str().unwrap().to_string(),
+        network: Network::Regtest,
+    };
+
+    let backend = RealBackend::open(config.clone()).await.unwrap();
+    let joined = backend.join_federation(invite()).await.unwrap();
+    assert_eq!(joined.id, id);
+    connected_with(&backend, balance).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = RealBackend::open(config).await.unwrap();
+    // Before anything has connected: this is what the store remembers.
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.balance, balance);
+    assert_eq!(state.federation.unwrap().id, id);
+    connected_with(&backend, balance).await;
+    backend.shutdown().await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+async fn connected_with(backend: &RealBackend, balance: Amount) {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            let state = backend.spending_state().await.unwrap();
+            if state.balance == balance
+                && !state.notes.is_empty()
+                && state.federation.is_some_and(|f| f.online)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the federation connects with its balance");
 }

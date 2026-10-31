@@ -262,11 +262,14 @@ impl Store {
     }
 
     /// Adding a known id updates its row and keeps its place and active flag.
+    /// The first federation becomes the active one, in the same write.
     pub(crate) fn add_federation(&self, row: &FederationRow) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO federations (id, name, invite, online_at, balance_msat, position)
-                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT COALESCE(MAX(position), 0) + 1 FROM federations))
+                "INSERT INTO federations (id, name, invite, online_at, balance_msat, position, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5,
+                    (SELECT COALESCE(MAX(position), 0) + 1 FROM federations),
+                    NOT EXISTS (SELECT 1 FROM federations WHERE active = 1))
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, invite = excluded.invite,
                     online_at = excluded.online_at, balance_msat = excluded.balance_msat",
@@ -277,6 +280,28 @@ impl Store {
                     row.online_at.map(to_db),
                     to_db(row.balance_msat)
                 ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Returns whether the stored balance changed.
+    pub(crate) fn set_federation_balance(&self, id: &str, balance_msat: u64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE federations SET balance_msat = ?2 WHERE id = ?1 AND balance_msat != ?2",
+                params![id, to_db(balance_msat)],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn set_online_at(&self, id: &str, at: Timestamp) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE federations SET online_at = ?2 WHERE id = ?1",
+                params![id, to_db(at)],
             )
             .map_err(db_err)?;
         Ok(())
@@ -637,6 +662,41 @@ mod tests {
         assert_eq!(store.watches().unwrap(), vec![w]);
         store.finish_watch("w").unwrap();
         assert!(store.watches().unwrap().is_empty());
+    }
+
+    fn federation(id: &str) -> FederationRow {
+        FederationRow {
+            id: id.into(),
+            name: id.into(),
+            invite: "fed1".into(),
+            online_at: None,
+            balance_msat: 0,
+        }
+    }
+
+    #[test]
+    fn first_added_federation_is_active_and_stays_so() {
+        let (_d, store) = open();
+        assert_eq!(store.active_federation().unwrap(), None);
+        store.add_federation(&federation("a")).unwrap();
+        store.add_federation(&federation("b")).unwrap();
+        store.add_federation(&federation("a")).unwrap();
+        assert_eq!(store.active_federation().unwrap().as_deref(), Some("a"));
+        store.set_active("b").unwrap();
+        store.add_federation(&federation("a")).unwrap();
+        assert_eq!(store.active_federation().unwrap().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn balance_updates_report_a_change() {
+        let (_d, store) = open();
+        store.add_federation(&federation("a")).unwrap();
+        assert!(store.set_federation_balance("a", 5).unwrap());
+        assert!(!store.set_federation_balance("a", 5).unwrap());
+        assert!(!store.set_federation_balance("nope", 5).unwrap());
+        store.set_online_at("a", 9).unwrap();
+        let rows = store.federations().unwrap();
+        assert_eq!((rows[0].balance_msat, rows[0].online_at), (5, Some(9)));
     }
 
     #[test]

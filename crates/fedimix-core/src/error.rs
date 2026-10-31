@@ -19,6 +19,11 @@ pub enum FedimixError {
     DeviceNotConnected(String),
     #[error("offline")]
     Offline,
+    /// A proxy is set, and federation connections cannot use one yet.
+    #[error(
+        "Fedimix cannot reach federations through a proxy yet. Clear the proxy in Settings to connect."
+    )]
+    ProxyUnsupported,
     #[error("not set up: {0}")]
     NotSetUp(String),
     #[error("preview expired")]
