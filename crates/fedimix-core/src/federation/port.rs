@@ -1,0 +1,152 @@
+//! The boundary around Fedimint: owned types only, amounts in msat.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+
+use crate::api::{Amount, Network, NoteBucket, SendAmount};
+use crate::error::Result;
+use crate::seed::Seed;
+use crate::store::Watch;
+
+/// What an invite says about a federation, before joining it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FederationPreview {
+    pub id: String,
+    pub name: String,
+    /// `None` when the federation runs on a network Fedimix does not know, or
+    /// has no module that names one.
+    pub network: Option<Network>,
+    pub has_lightning: bool,
+}
+
+/// What paying an invoice would cost, at the terms read now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightningQuote {
+    /// The amount the invoice asks for.
+    pub amount: Amount,
+    /// Gateway fee plus federation fee.
+    pub fee: Amount,
+}
+
+/// A withdrawal that can be submitted as quoted. Taking the quote back to
+/// [`FederationClient::withdraw`] submits it with the fee that was shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithdrawQuote {
+    pub address: String,
+    pub amount: Amount,
+    /// Miner fee plus federation fee.
+    pub fee: Amount,
+    pub terms: WithdrawTerms,
+}
+
+/// The fee terms the federation must see again at submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawTerms {
+    V1 {
+        sats_per_kvb: u64,
+        total_weight: u64,
+    },
+    V2 {
+        miner_fee_sat: u64,
+    },
+}
+
+/// Progress of a watched operation. Every variant but `Confirming` is final,
+/// and the stream ends after it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchUpdate {
+    /// `confirmations` stays 0 until the federation has seen enough of them:
+    /// the client reports no count in between.
+    Confirming {
+        confirmations: u32,
+        required: u32,
+        amount: Amount,
+    },
+    /// `amount` is what the operation moved: for a receive what reached the
+    /// wallet before the ecash fee, for a send what the recipient got. `fee` is
+    /// the part on top of that (or taken from it) that the operation names.
+    Settled {
+        amount: Amount,
+        fee: Amount,
+        txid: Option<String>,
+    },
+    Refunded,
+    Expired,
+    Failed {
+        reason: String,
+    },
+}
+
+impl WatchUpdate {
+    pub fn is_final(&self) -> bool {
+        !matches!(self, Self::Confirming { .. })
+    }
+}
+
+/// One on-chain deposit seen in the client's event log, where a generation
+/// without a deposit operation reports them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepositEvent {
+    /// Pass this to [`FederationClient::deposits`] to resume just after this
+    /// event.
+    pub cursor: u64,
+    /// The same for every event of one deposit, also across a retried claim.
+    pub id: String,
+    /// The deposit net of `fee`, before the ecash fee.
+    pub amount: Amount,
+    pub fee: Amount,
+    pub txid: Option<String>,
+    /// The federation accepted the claim and the ecash has been issued.
+    pub confirmed: bool,
+}
+
+#[async_trait]
+pub trait FederationPort: Send + Sync {
+    async fn preview(&self, invite: &str) -> Result<FederationPreview>;
+    async fn join(&self, invite: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;
+    async fn open(&self, id: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;
+}
+
+/// One federation's client. Calls that only read report `Offline` if the
+/// federation does not answer in time. `pay_invoice` and `withdraw` are not cut
+/// off: an interrupted payment must not look like one that never started.
+#[async_trait]
+pub trait FederationClient: Send + Sync {
+    fn id(&self) -> String;
+    fn name(&self) -> String;
+    async fn balance(&self) -> Result<Amount>;
+    /// The current balance, then each change.
+    fn balance_changes(&self) -> BoxStream<'static, Amount>;
+    /// Whether a threshold of guardians is connected: the current value, then
+    /// each change.
+    fn online_changes(&self) -> BoxStream<'static, bool>;
+    async fn notes(&self) -> Result<Vec<NoteBucket>>;
+    /// A deposit must exceed this to be credited.
+    async fn min_deposit(&self) -> Result<Amount>;
+    /// Returns the invoice and its watch id.
+    async fn lightning_invoice(
+        &self,
+        amount: Amount,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<(String, String)>;
+    /// Returns the address, and a watch id if the generation has one. Without
+    /// one, the deposit arrives through [`Self::deposits`].
+    async fn deposit_address(&self) -> Result<(String, Option<String>)>;
+    async fn lightning_quote(&self, invoice: &str) -> Result<LightningQuote>;
+    /// Returns the watch id.
+    async fn pay_invoice(&self, invoice: &str) -> Result<String>;
+    async fn withdraw_quote(&self, address: &str, amount: SendAmount) -> Result<WithdrawQuote>;
+    /// Returns the watch id.
+    async fn withdraw(&self, quote: &WithdrawQuote) -> Result<String>;
+    /// Follows an operation to its final update and ends. A watch started
+    /// after the operation ended yields that final update.
+    fn watch(&self, watch: Watch) -> BoxStream<'static, WatchUpdate>;
+    /// The deposits logged after `cursor` (0 is the start), then new ones as
+    /// they arrive. Empty on a generation with deposit watches.
+    fn deposits(&self, cursor: u64) -> BoxStream<'static, DepositEvent>;
+    /// Ends every stream and closes the client's database.
+    async fn shutdown(self: Arc<Self>) -> Result<()>;
+}

@@ -6,6 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use fedimint_bip39::{Bip39RootSecretStrategy, Language, Mnemonic};
+use fedimint_client::RootSecret;
 use fedimint_client::secret::RootSecretStrategy;
 
 use crate::error::{FedimixError, Result};
@@ -49,7 +50,7 @@ pub(crate) fn open_data_dir(dir: &Path) -> Result<()> {
 }
 
 /// The wallet's recovery phrase, kept in `<data_dir>/seed` with mode 0600.
-pub(crate) struct Seed {
+pub struct Seed {
     mnemonic: Mnemonic,
 }
 
@@ -64,7 +65,7 @@ impl Seed {
     /// Loads the phrase, or creates it on first run. A file readable by
     /// group or others is refused, not repaired.
     /// Needs the lock, so two processes cannot create a seed at once.
-    pub(crate) fn load_or_create(dir: &Path, _lock: &DataDirLock) -> Result<Seed> {
+    pub fn load_or_create(dir: &Path, _lock: &DataDirLock) -> Result<Seed> {
         open_data_dir(dir)?;
         let path = dir.join(SEED_FILE);
         match File::open(&path) {
@@ -77,6 +78,14 @@ impl Seed {
     /// The recovery phrase, space separated.
     pub(crate) fn words(&self) -> String {
         self.mnemonic.to_string()
+    }
+
+    /// What every federation's client is built from. Each join mixes in its
+    /// federation id, so this must not be derived any further.
+    pub(crate) fn root_secret(&self) -> RootSecret {
+        RootSecret::StandardDoubleDerive(Bip39RootSecretStrategy::<WORD_COUNT>::to_root_secret(
+            &self.mnemonic,
+        ))
     }
 
     fn load(mut file: File, path: &Path) -> Result<Seed> {
@@ -152,12 +161,12 @@ impl Seed {
 
 /// An exclusive `flock` on `<data_dir>/lock`, released on drop.
 #[derive(Debug)]
-pub(crate) struct DataDirLock {
+pub struct DataDirLock {
     _file: File,
 }
 
 impl DataDirLock {
-    pub(crate) fn acquire(dir: &Path) -> Result<DataDirLock> {
+    pub fn acquire(dir: &Path) -> Result<DataDirLock> {
         open_data_dir(dir)?;
         let path = dir.join(LOCK_FILE);
         let file = OpenOptions::new()

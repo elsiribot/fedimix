@@ -89,7 +89,7 @@ pub(crate) struct FederationRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WatchKind {
+pub enum WatchKind {
     LnReceive,
     LnSend,
     Deposit,
@@ -119,7 +119,7 @@ impl WatchKind {
 
 /// An operation to follow until it settles, kept across restarts.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Watch {
+pub struct Watch {
     pub id: String,
     pub federation_id: String,
     pub kind: WatchKind,
