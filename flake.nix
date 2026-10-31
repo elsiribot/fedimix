@@ -178,7 +178,12 @@
                 fmPkgs.which
               ];
               FM_ESPLORA_BASE_EXECUTABLE = "${fmPkgs.esplora-electrs}/bin/esplora";
-              inherit (default) LD_LIBRARY_PATH LIBCLANG_PATH shellHook;
+              # (inputsFrom merges the default shellHook, but not env vars.)
+              inherit (default) LIBCLANG_PATH;
+              # librocksdb needs libstdc++ at test time. The script sets it for
+              # the `cargo test` step only, so devimint's daemons, built from
+              # another nixpkgs, never load it.
+              FEDIMIX_TEST_LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
             };
         };
       }

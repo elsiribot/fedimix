@@ -4,14 +4,30 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+out="$(mktemp)"
+trap 'rm -f "$out"' EXIT
+
+# usage: run <label> <v1|v2> [VAR=value ...]
 run() {
-    echo "=== devimint: $1 ==="
-    shift
-    env FM_FED_SIZE=1 "$@" devimint dev-fed --exec \
-        cargo test -p fedimix-core --test devimint -- --ignored --test-threads=1
+    local label="$1" gen="$2"
+    shift 2
+    echo "=== devimint: $label ==="
+    # Only the test process gets the C++ runtime; devimint's daemons must not.
+    env -u FM_ENABLE_MODULE_MINT -u FM_ENABLE_MODULE_WALLET \
+        -u FM_ENABLE_MODULE_MINTV2 -u FM_ENABLE_MODULE_WALLETV2 \
+        FM_FED_SIZE=1 "$@" \
+        devimint dev-fed --exec \
+        env "LD_LIBRARY_PATH=${FEDIMIX_TEST_LD_LIBRARY_PATH:-}" FEDIMIX_EXPECT_MODULES="$gen" \
+        cargo test -p fedimix-core --test devimint -- --ignored --test-threads=1 \
+        2>&1 | tee "$out"
+    # A run that matched no tests exits 0 too, so require a real pass.
+    if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed' "$out"; then
+        echo "no devimint test passed in the '$label' run" >&2
+        exit 1
+    fi
 }
 
-run "default modules (mintv2, walletv2)"
-run "v1 modules (mint, wallet)" \
+run "default modules (mintv2, walletv2)" v2
+run "v1 modules (mint, wallet)" v1 \
     FM_ENABLE_MODULE_MINT=1 FM_ENABLE_MODULE_WALLET=1 \
     FM_ENABLE_MODULE_MINTV2=0 FM_ENABLE_MODULE_WALLETV2=0

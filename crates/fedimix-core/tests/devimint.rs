@@ -9,6 +9,24 @@ use fedimint_client::{Client, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::invite_code::InviteCode;
 
+/// Which module generation the federation under test must run, chosen by
+/// `scripts/test-integration.sh` through `FEDIMIX_EXPECT_MODULES=v1|v2`.
+/// Panics if the variable is unset, so a test cannot run without choosing one.
+fn assert_expected_generation(kinds: &[String]) {
+    let has = |k: &str| kinds.iter().any(|x| x == k);
+    let (present, absent) = match std::env::var("FEDIMIX_EXPECT_MODULES").as_deref() {
+        Ok("v1") => (["mint", "wallet"], ["mintv2", "walletv2"]),
+        Ok("v2") => (["mintv2", "walletv2"], ["mint", "wallet"]),
+        other => panic!("FEDIMIX_EXPECT_MODULES must be v1 or v2, got {other:?}"),
+    };
+    for k in present {
+        assert!(has(k), "expected module {k} in {kinds:?}");
+    }
+    for k in absent {
+        assert!(!has(k), "unexpected module {k} in {kinds:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs devimint"]
 async fn smoke_join_and_read_modules() {
@@ -36,6 +54,7 @@ async fn smoke_join_and_read_modules() {
         .collect();
     eprintln!("module kinds: {kinds:?}");
     assert!(kinds.iter().any(|k| k == "lnv2"));
+    assert_expected_generation(&kinds);
 
     let db = fedimint_rocksdb::RocksDb::build(dir.path().join("client.rocksdb"))
         .open()
