@@ -231,14 +231,35 @@ pub struct SavingState {
     pub in_flight: Amount,
     pub coins: Vec<Coin>,
     pub history: Vec<HistoryItem>,
-    /// Whether Saving can be set up in this build.
-    pub can_set_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NoteBucket {
     pub denomination: Amount,
     pub count: u32,
+}
+
+/// What this backend can do. A front end hides what it cannot, so nothing
+/// implies a feature that does not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Features {
+    /// Exits from Spending to Saving, and the settings that steer them.
+    pub scheduler: bool,
+    pub cover: bool,
+    pub saving: bool,
+}
+
+impl Features {
+    pub const ALL: Self = Self {
+        scheduler: true,
+        cover: true,
+        saving: true,
+    };
+    pub const NONE: Self = Self {
+        scheduler: false,
+        cover: false,
+        saving: false,
+    };
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,6 +272,7 @@ pub struct SpendingState {
     pub saving_ready: bool,
     pub notes: Vec<NoteBucket>,
     pub history: Vec<HistoryItem>,
+    pub features: Features,
 }
 
 #[derive(Debug, Clone, PartialEq)]

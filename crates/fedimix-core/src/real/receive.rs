@@ -32,6 +32,8 @@ fn deposits_cursor(federation: &str) -> String {
     format!("deposits:{federation}")
 }
 
+const RESTORING: &str = "Fedimix is still restoring your wallet. Try again when it has finished.";
+
 /// Not zero from the start of a federation's recovery until a client is usable.
 fn recovery_mark(federation: &str) -> String {
     format!("recovering:{federation}")
@@ -57,7 +59,11 @@ fn incoming(
 impl Core {
     /// The client of a federation that is connected now.
     pub(super) fn connected(&self, id: &str) -> Result<Arc<dyn FederationClient>> {
+        let open = *self.gate.borrow() == super::Gate::Open;
         let state = self.state();
+        if open && state.live.get(id).is_some_and(|live| live.recovering) {
+            return Err(FedimixError::Internal(RESTORING.into()));
+        }
         let live = state.live.get(id).filter(|live| live.online);
         live.and_then(|live| live.client.clone())
             .ok_or(FedimixError::Offline)

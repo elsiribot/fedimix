@@ -19,7 +19,7 @@ where
 {
     tokio::time::timeout(cap, fut).await.unwrap_or_else(|_| {
         Err(FedimixError::Internal(
-            "shutdown took too long.".to_string(),
+            "Shutdown took too long.".to_string(),
         ))
     })
 }

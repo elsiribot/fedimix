@@ -49,13 +49,14 @@ start_sway() {
     export WAYLAND_DISPLAY="$wl" SWAYSOCK="$sock"
 }
 
-# usage: flow <name> <wanted exit code> <wanted final line>
+# usage: flow <name> <wanted exit code> <wanted final line> [<wanted stderr text>]
 # Runs scripts/real-flows/<name>.drive on the wallet's folder, answering its
 # `shot` steps, and calls `on_shot_<name> <shot>` for each if that is defined.
-# `exited` is the final line of an app that never printed a DRIVE line. Returns 1
-# unless both match. The network is $flow_network, regtest by default.
+# `exited` is the final line of an app that never printed a DRIVE line, so no
+# flow may want it. Returns 1 unless all match. The network is $flow_network,
+# regtest by default.
 flow() {
-    local name="$1" wanted_exit="$2" wanted_line="$3"
+    local name="$1" wanted_exit="$2" wanted_line="$3" wanted_err="${4:-}"
     local out="$work/$name.out" err="$work/$name.err" stdin="$work/$name.stdin"
     local fd pid seen=0 total line status="" deadline=$((SECONDS + 400)) code=0
     : > "$out"
@@ -101,6 +102,9 @@ flow() {
     local bad=""
     [[ "$code" == "$wanted_exit" ]] || bad="exit code $code, wanted $wanted_exit"
     [[ "$status" == "$wanted_line" ]] || bad="${bad:+$bad; }ended with '$status', wanted '$wanted_line'"
+    if [[ -n "$wanted_err" ]] && ! grep -qF "fedimix: $wanted_err" "$err"; then
+        bad="${bad:+$bad; }stderr lacks '$wanted_err'"
+    fi
     if grep -Eq 'CRITICAL|panicked' "$err"; then
         bad="${bad:+$bad; }CRITICAL or panic in stderr"
     fi
@@ -129,11 +133,7 @@ on_shot_join-and-receive() {
 # While a first app holds the folder: a second one says so and exits 1.
 on_shot_reopen() {
     [[ "$1" == reopened ]] || return 0
-    flow second-launch 1 "exited"
-    grep -q 'Fedimix is already running with this data folder.' "$work/second-launch.err" || {
-        echo "the second launch did not report the lock" >&2
-        return 1
-    }
+    flow second-launch 1 "DRIVE OK" "Fedimix is already running with this data folder."
 }
 
 on_second_wallet_paid() {
@@ -172,7 +172,8 @@ inner() {
     [[ -n "$paid" ]] || { echo "LND paid no invoice" >&2; return 1; }
     flow reopen 0 "DRIVE OK"
     pay_second_wallet
-    flow_network=signet flow wrong-network 1 "exited"
+    flow_network=signet flow wrong-network 1 "DRIVE OK" \
+        "This data folder is for regtest, but Fedimix was started for signet."
     echo "$passed"
 }
 

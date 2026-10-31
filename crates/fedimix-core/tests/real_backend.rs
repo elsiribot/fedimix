@@ -10,15 +10,16 @@ use fedimix_core::testing::{
     real_backend,
 };
 use fedimix_core::{
-    Amount, Backend, ChangeDestination, CoreConfig, Event, EventStream, FedimixError, HistoryItem,
-    HistoryKind, HistoryStatus, Network, NoteBucket, Notice, OperationKind, OperationState,
-    ReceiveMethod, ReceiveRequest, Result, RunningOperation, SendAmount, SendPreview, SendRequest,
-    Settings, WalletKind,
+    Amount, Backend, ChangeDestination, CoreConfig, Event, EventStream, Features, FedimixError,
+    HistoryItem, HistoryKind, HistoryStatus, Network, NoteBucket, Notice, OperationKind,
+    OperationState, ReceiveMethod, ReceiveRequest, Result, RunningOperation, SendAmount,
+    SendPreview, SendRequest, Settings, WalletKind,
 };
 use tempfile::TempDir;
 
 const INVITE: &str = "fed1one";
 const SECOND_INVITE: &str = "fed1two";
+const RESTORING: &str = "Fedimix is still restoring your wallet. Try again when it has finished.";
 const PROXY_SENTENCE: &str =
     "Fedimix cannot reach federations through a proxy yet. Clear the proxy in Settings to connect.";
 /// Longer than anything here takes unless it is broken.
@@ -1319,7 +1320,7 @@ async fn a_lost_client_database_recovers_in_the_background() {
         assert!(!state.unwrap().unwrap().federation.unwrap().online);
         assert_eq!(
             backend.receive(invoice_request(1)).await,
-            Err(FedimixError::Offline)
+            Err(FedimixError::Internal(RESTORING.into()))
         );
 
         harness.port.set_recover_held(false);
@@ -1348,6 +1349,38 @@ async fn a_recovery_is_reported_until_the_client_is_usable() {
     harness.port.set_recover_held(false);
     wait_online(&*backend, true).await;
     assert!(!recovering(&backend).await);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sending_and_receiving_during_a_recovery_say_so() {
+    let harness = Harness::new();
+    harness.port.set_recover_held(true);
+    let backend = lost_client_database(&harness).await;
+    wait_until("the mark", || async { recovering(&backend).await }).await;
+    let restoring = FedimixError::Internal(RESTORING.into());
+    assert_eq!(
+        backend.receive(invoice_request(1)).await.err().as_ref(),
+        Some(&restoring)
+    );
+    let send = SendRequest {
+        wallet: WalletKind::Spending,
+        destination: "lnbc1000n1invoice".into(),
+        amount: SendAmount::FromInvoice,
+        fee_rate_sat_vb: None,
+    };
+    assert_eq!(
+        backend.prepare_send(send).await.err().as_ref(),
+        Some(&restoring)
+    );
+
+    // Behind a proxy nothing runs, so the proxy is what the user must hear.
+    backend.set_settings(with_proxy()).await.unwrap();
+    assert_ne!(
+        backend.receive(invoice_request(1)).await.err().as_ref(),
+        Some(&restoring)
+    );
+    harness.port.set_recover_held(false);
     backend.shutdown().await.unwrap();
 }
 
@@ -1413,10 +1446,11 @@ async fn a_proxy_shows_offline_rather_than_a_recovery_that_cannot_run() {
 }
 
 #[tokio::test]
-async fn saving_cannot_be_set_up_on_the_real_backend() {
+async fn the_real_backend_offers_no_later_features() {
     let harness = Harness::new();
     let backend = harness.open().await.unwrap();
-    assert!(!backend.saving_state().await.unwrap().can_set_up);
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.features, Features::NONE);
     backend.shutdown().await.unwrap();
 }
 

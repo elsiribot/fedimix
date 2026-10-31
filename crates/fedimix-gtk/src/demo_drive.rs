@@ -17,7 +17,9 @@
 //! - `save-text <text> <path>` (text quoted as for `type`): write the whole text
 //!   of the mapped label containing `<text>` to `<path>`, relative to the
 //!   working directory. Polls up to 3 s.
-//! - `expect-slow <text>`: as `expect`, for a real federation: up to 180 s.
+//! - `expect-slow <text>`: as `expect`, for a real federation: up to 60 s.
+//! - `expect-numbered <n>`: the mapped labels hold exactly the words `1. x` to
+//!   `<n>. x`, each one word.
 //! - `expect-clipboard <text>`: the clipboard holds `<text>`.
 //! - `expect-clipboard-empty`: the clipboard holds no text.
 //! - `wait <ms>`, `shot <name>` (prints `SHOT <name>`, then waits for a line
@@ -37,11 +39,13 @@
 //! - `action <name>`: activate an application action such as `app.settings`
 //!   (menu popovers are not in the widget tree until opened).
 //!
-//! A failing step prints `DRIVE FAILED: <step>` and exits 1; a finished
-//! script prints `DRIVE OK` and quits the application.
+//! A failing step prints `DRIVE FAILED: <step>`, and a finished script prints
+//! `DRIVE OK`. Both quit through the `quit` action, so a real wallet shuts down
+//! cleanly; after a failure the process exits 1 (see [`failed`]).
 
 use std::fmt;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -49,8 +53,8 @@ use gtk::glib;
 
 const POLL: Duration = Duration::from_millis(100);
 const POLL_LIMIT: u32 = 30;
-/// `expect-slow`: at this interval, 180 s in all.
-const SLOW_POLL_LIMIT: u32 = 1800;
+/// `expect-slow`: at this interval, 60 s in all.
+const SLOW_POLL_LIMIT: u32 = 600;
 const SHOT_PAUSE: Duration = Duration::from_millis(500);
 const SHOT_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -64,6 +68,7 @@ pub enum Step {
     ExpectSlow(String),
     ExpectClipboard(String),
     ExpectClipboardEmpty,
+    ExpectNumbered(u32),
     ExpectNot(String),
     ExpectAbsent(String),
     ExpectLocked,
@@ -108,6 +113,10 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "expect-slow" => Step::ExpectSlow(need("text")?),
         "expect-clipboard" => Step::ExpectClipboard(need("text")?),
         "expect-clipboard-empty" => Step::ExpectClipboardEmpty,
+        "expect-numbered" => Step::ExpectNumbered(
+            rest.parse()
+                .map_err(|_| format!("'expect-numbered' needs a count, got '{rest}'"))?,
+        ),
         "expect-not" => Step::ExpectNot(need("text")?),
         "expect-absent" => Step::ExpectAbsent(need("text")?),
         "expect-disabled" => Step::ExpectRowControls {
@@ -179,6 +188,7 @@ impl fmt::Display for Step {
             Step::ExpectSlow(t) => write!(f, "expect-slow {t}"),
             Step::ExpectClipboard(t) => write!(f, "expect-clipboard {t}"),
             Step::ExpectClipboardEmpty => write!(f, "expect-clipboard-empty"),
+            Step::ExpectNumbered(n) => write!(f, "expect-numbered {n}"),
             Step::ExpectNot(t) => write!(f, "expect-not {t}"),
             Step::ExpectAbsent(t) => write!(f, "expect-absent {t}"),
             Step::ExpectLocked => write!(f, "expect-locked"),
@@ -199,6 +209,13 @@ impl fmt::Display for Step {
     }
 }
 
+static FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a step failed, which makes the process exit 1.
+pub fn failed() -> bool {
+    FAILED.load(Ordering::SeqCst)
+}
+
 /// Everything the driver needs from the running application.
 pub struct Env {
     pub app: adw::Application,
@@ -213,12 +230,14 @@ pub fn start(env: Env, steps: Vec<Step>) {
             if let Err(why) = run_step(&env, step).await {
                 println!("DRIVE FAILED: {step} ({why})");
                 let _ = std::io::stdout().flush();
-                std::process::exit(1);
+                FAILED.store(true, Ordering::SeqCst);
+                // The road a user's Quit takes, so a real wallet closes cleanly.
+                env.app.activate_action("quit", None);
+                return;
             }
         }
         println!("DRIVE OK");
         let _ = std::io::stdout().flush();
-        // The road a user's Quit takes, so shutdown runs too.
         env.app.activate_action("quit", None);
     });
 }
@@ -257,6 +276,11 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             })
             .await
             .ok_or_else(|| format!("no visible label containing '{text}'"))?;
+        }
+        Step::ExpectNumbered(n) => {
+            poll(|| numbered_words_are(&mapped_labels(env), *n).then_some(()))
+                .await
+                .ok_or_else(|| format!("not exactly {n} numbered words"))?;
         }
         Step::ExpectClipboard(text) => {
             let held = clipboard_text(env).await;
@@ -546,6 +570,24 @@ fn label_containing(env: &Env, text: &str) -> Option<String> {
     })
 }
 
+/// Whether the labels hold exactly the words `1. x` to `<n>. x`.
+fn numbered_words_are(labels: &[String], n: u32) -> bool {
+    let mut found: Vec<u32> = labels
+        .iter()
+        .filter_map(|label| {
+            let (number, word) = label.split_once(". ")?;
+            let is_word = !word.is_empty() && word.chars().all(char::is_alphabetic);
+            is_word.then(|| number.parse().ok()).flatten()
+        })
+        .collect();
+    found.sort_unstable();
+    found.into_iter().eq(1..=n)
+}
+
+fn mapped_labels(env: &Env) -> Vec<String> {
+    roots(env).iter().flat_map(label_texts).collect()
+}
+
 /// What a paste would give, as this process sees it; `None` for no text.
 async fn clipboard_text(env: &Env) -> Option<String> {
     let text = env.window.clipboard().read_text_future().await;
@@ -753,6 +795,22 @@ action app.settings
     }
 
     #[test]
+    fn numbered_words_are_counted_exactly() {
+        let chips = |n: u32| -> Vec<String> { (1..=n).map(|k| format!("{k}. word")).collect() };
+        assert!(numbered_words_are(&chips(12), 12));
+        assert!(!numbered_words_are(&chips(11), 12));
+        assert!(!numbered_words_are(&chips(13), 12));
+        // Text that merely has the number in it is not a word.
+        let mut other = chips(11);
+        other.push("0.0012. BTC".to_string());
+        assert!(!numbered_words_are(&other, 12));
+        // Other labels on the page do not count.
+        let mut page = chips(12);
+        page.push("Write these words down.".to_string());
+        assert!(numbered_words_are(&page, 12));
+    }
+
+    #[test]
     fn rejects_bad_steps_with_line_number() {
         for bad in [
             "bogus x",
@@ -763,6 +821,7 @@ action app.settings
             "save-text onlytext",
             "expect-slow",
             "expect-clipboard",
+            "expect-numbered twelve",
             "shot",
             "type \"open",
         ] {

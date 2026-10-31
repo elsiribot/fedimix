@@ -1,6 +1,6 @@
 # Status
 
-Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 2 Tasks 1-9 are done: fedimint 0.13, store, seed and lock, `RealBackend` with receive and send, and, since Task 9, `fedimix` runs on the real backend without `--demo`. Saving stays a later phase: its empty state says so, and Setup is off.
+Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 2 Tasks 1-9 are done: fedimint 0.13, store, seed and lock, `RealBackend` with receive and send, and, since Task 9, `fedimix` runs on the real backend without `--demo`. Saving, exits and cover traffic are later phases: `SpendingState.features` is all false in real mode, which hides their controls.
 
 ## What works (commands run in `nix develop`)
 - `just clippy`, `just test` (includes `tests/real_backend.rs`: `RealBackend` over the fake port).
@@ -22,8 +22,9 @@ Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 
 - Real pointer/keyboard input (the driver emits clicks and sets text), Escape as a key, the Apply button's own click (the driver emits `apply`), the header menu popover (opened through actions), Enter in entries.
 - Dark theme, accessibility, a real desktop (sway only), hardware. A second process launch is tested only with no session bus; `NON_UNIQUE` is what should make it the same on a desktop.
 - Mainnet and signet: every real run was regtest.
+- `NON_UNIQUE`: a launcher double-click shows "cannot start" rather than raising the window, and D-Bus activation is gone; revisit when a .desktop file ships (per-network application ids are the alternative).
 - The clipboard: flows read it from inside the app, where GTK answers locally. No other Wayland client was tried, and a clipboard manager can keep its own copy, which Fedimix cannot clear: that is what the toast is for. If Fedimix quits inside the 60 s, what happens to the clipboard was not observed.
-- A real recovery on screen: the state is tested over the fake port (`tests/real_backend.rs`), the banner through the demo's `recovering`, and `devimint.rs` covers recovery itself. During a recovery Send and Receive answer "You are offline".
+- A real recovery on screen: the state is tested over the fake port (`tests/real_backend.rs`), the banner through the demo's `recovering`, and `devimint.rs` covers recovery itself. During a recovery Send and Receive say the wallet is still restoring.
 - The window hiding at shutdown: every flow quits through that path and exits 0, but nothing looks at the window while it happens. A shutdown that takes the whole 30 s was not run in the UI.
 - A real on-chain receive or send through the UI: `tests/devimint.rs` covers them below the UI; the UI flow is Lightning only.
 - `parse_destination` is lexical (base58 by shape); `validate_address` checks checksum and network, and `RealBackend::prepare_send` calls it.

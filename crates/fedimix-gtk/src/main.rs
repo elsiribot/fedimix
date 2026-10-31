@@ -48,12 +48,19 @@ fn show_start_failure(sentence: &str, drive: Option<Vec<demo_drive::Step>>) -> g
             .default_height(240)
             .build();
         window.present();
+        let quit = gtk::gio::ActionEntry::builder("quit")
+            .activate(|app: &adw::Application, _, _| app.quit())
+            .build();
+        app.add_action_entries([quit]);
         let dialog = adw::AlertDialog::new(Some("Fedimix cannot start"), Some(&sentence));
         dialog.add_response("close", "Close");
-        dialog.connect_closed({
-            let app = app.clone();
-            move |_| app.quit()
-        });
+        // A drive ends through `quit`, so its last line cannot race the close.
+        if drive.is_none() {
+            dialog.connect_closed({
+                let app = app.clone();
+                move |_| app.quit()
+            });
+        }
         dialog.present(Some(&window));
         if let Some(steps) = drive.clone() {
             demo_drive::start(
@@ -142,5 +149,9 @@ fn main() -> gtk::glib::ExitCode {
         let _ = window.set(new);
     });
 
-    app.run_with_args::<&str>(&[])
+    let code = app.run_with_args::<&str>(&[]);
+    if demo_drive::failed() {
+        return gtk::glib::ExitCode::from(1);
+    }
+    code
 }

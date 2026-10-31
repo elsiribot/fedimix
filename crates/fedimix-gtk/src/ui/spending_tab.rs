@@ -1,6 +1,6 @@
 //! The Spending tab: ecash balance, refill/queue links and history.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
@@ -15,7 +15,6 @@ struct Inner {
     connection: adw::Banner,
     backup: adw::Banner,
     nudge: adw::Banner,
-    can_set_up: Cell<bool>,
     federation: gtk::Label,
     balance: widgets::AmountButton,
     bar: gtk::LevelBar,
@@ -165,7 +164,6 @@ impl SpendingTab {
             connection,
             backup,
             nudge,
-            can_set_up: Cell::new(false),
             federation,
             balance,
             bar,
@@ -214,8 +212,7 @@ impl Inner {
             s.spending.balance,
             s.recovery_words_shown,
         ));
-        let setup_changed = self.can_set_up.replace(s.saving.can_set_up) != s.saving.can_set_up;
-        if !setup_changed && self.last.borrow().as_ref() == Some(&s.spending) {
+        if self.last.borrow().as_ref() == Some(&s.spending) {
             return;
         }
         *self.last.borrow_mut() = Some(s.spending.clone());
@@ -226,10 +223,11 @@ impl Inner {
         let last = self.last.borrow();
         let Some(s) = last.as_ref() else { return };
         // Without a federation the window shows the Join page instead.
+        self.show_cover.set_visible(s.features.cover);
         let connection = present::connection_banner(s.federation.as_ref());
         self.connection.set_title(connection.unwrap_or(""));
         self.connection.set_revealed(connection.is_some());
-        match present::saving_banner(s, self.can_set_up.get()) {
+        match present::saving_banner(s, s.features.saving) {
             Some(text) => {
                 self.nudge.set_title(&text);
                 self.nudge.set_revealed(true);

@@ -157,7 +157,7 @@ impl Inner {
         let saving = &s.saving;
         match &saving.device {
             None => {
-                let empty = present::saving_empty_state(saving.can_set_up);
+                let empty = present::saving_empty_state(s.spending.features.saving);
                 self.empty.set_title(empty.title);
                 self.setup.set_label(empty.button);
                 self.setup.set_sensitive(empty.button_enabled);

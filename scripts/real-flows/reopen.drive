@@ -6,3 +6,20 @@ expect +0.0019
 expect-not Join a federation
 expect-not Write down your recovery words
 shot reopened
+# Settings offers only what the real backend has.
+action app.settings
+expect Recovery words
+expect-not Anonymity target
+expect-not Budget (sat per month)
+expect-not Hardware wallet
+shot settings
+scroll-end
+shot settings-end
+# Over the target the rest waits, and nothing promises it is on its way.
+type "Target (BTC)" 0.001
+wait 800
+click Back
+expect-slow waiting for Saving
+expect-not moving to Saving
+expect-not Set up Saving
+shot waiting-for-saving

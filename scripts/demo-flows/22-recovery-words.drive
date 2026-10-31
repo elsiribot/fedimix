@@ -5,7 +5,7 @@
 action app.settings
 click Recovery words
 expect Write these words down
-expect 12. demo
+expect-numbered 12
 shot words
 click Copy
 expect Copied. Clear your clipboard when done.

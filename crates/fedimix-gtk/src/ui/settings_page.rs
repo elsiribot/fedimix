@@ -25,6 +25,9 @@ struct Inner {
     fed_rows: RefCell<Vec<adw::ActionRow>>,
     /// Federations and active id as last rendered.
     fed_shown: RefCell<Option<(Vec<FederationInfo>, Option<String>)>>,
+    exit: adw::PreferencesGroup,
+    cover: adw::PreferencesGroup,
+    hardware: adw::PreferencesGroup,
     hw_name: adw::ActionRow,
     hw_status: adw::ActionRow,
     target: adw::EntryRow,
@@ -171,6 +174,19 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
             .build(),
         fed_rows: RefCell::default(),
         fed_shown: RefCell::default(),
+        // Hidden until a snapshot says the backend has them.
+        exit: adw::PreferencesGroup::builder()
+            .title("Exit")
+            .visible(false)
+            .build(),
+        cover: adw::PreferencesGroup::builder()
+            .title("Cover traffic")
+            .visible(false)
+            .build(),
+        hardware: adw::PreferencesGroup::builder()
+            .title("Hardware wallet")
+            .visible(false)
+            .build(),
         hw_name: adw::ActionRow::builder().title("Device").build(),
         hw_status: adw::ActionRow::builder().title("Status").build(),
         target: entry("Target (BTC)", &target_text(&settings)),
@@ -227,29 +243,22 @@ fn show(ctx: &Rc<AppContext>, settings: Settings, federations: Vec<FederationInf
     spending.add(&inner.target);
     page.add(&spending);
 
-    let exit = adw::PreferencesGroup::builder().title("Exit").build();
     for row in [
         &inner.anonymity,
         &inner.min_hours,
         &inner.grace,
         &inner.fee_guard,
     ] {
-        exit.add(row);
+        inner.exit.add(row);
     }
-    page.add(&exit);
+    page.add(&inner.exit);
 
-    let cover = adw::PreferencesGroup::builder()
-        .title("Cover traffic")
-        .build();
-    cover.add(&inner.budget);
-    page.add(&cover);
+    inner.cover.add(&inner.budget);
+    page.add(&inner.cover);
 
-    let hardware = adw::PreferencesGroup::builder()
-        .title("Hardware wallet")
-        .build();
-    hardware.add(&inner.hw_name);
-    hardware.add(&inner.hw_status);
-    page.add(&hardware);
+    inner.hardware.add(&inner.hw_name);
+    inner.hardware.add(&inner.hw_status);
+    page.add(&inner.hardware);
 
     let backup = adw::PreferencesGroup::builder().title("Backup").build();
     let words = adw::ActionRow::builder()
@@ -507,6 +516,10 @@ impl Inner {
     }
 
     fn update(self: &Rc<Self>, s: &Snapshots) {
+        let features = s.spending.features;
+        self.exit.set_visible(features.scheduler);
+        self.cover.set_visible(features.cover);
+        self.hardware.set_visible(features.saving);
         match &s.saving.device {
             Some(device) => {
                 self.hw_name.set_subtitle(&device.name);

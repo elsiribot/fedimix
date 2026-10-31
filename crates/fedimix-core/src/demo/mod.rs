@@ -824,7 +824,6 @@ impl Backend for DemoBackend {
             in_flight: st.in_flight,
             coins: st.coins.clone(),
             history: newest(&st.saving_history),
-            can_set_up: true,
         })
     }
 
@@ -839,6 +838,7 @@ impl Backend for DemoBackend {
             saving_ready: st.saving_ready,
             notes: st.notes(),
             history: newest(&st.spending_history),
+            features: Features::ALL,
         })
     }
 
@@ -1971,6 +1971,14 @@ mod tests {
                 assert_eq!(history_id, None);
                 break;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_demo_shows_every_feature() {
+        for sc in ALL {
+            let state = DemoBackend::new(sc).spending_state().await.unwrap();
+            assert_eq!(state.features, Features::ALL);
         }
     }
 

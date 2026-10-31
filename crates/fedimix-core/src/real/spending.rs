@@ -26,6 +26,7 @@ pub(super) fn spending_state(
         saving_ready: false,
         notes,
         history,
+        features: Features::NONE,
     }
 }
 
@@ -47,6 +48,5 @@ pub(super) fn saving_state(history: Vec<HistoryItem>) -> SavingState {
         in_flight: Amount::ZERO,
         coins: Vec::new(),
         history,
-        can_set_up: false,
     }
 }

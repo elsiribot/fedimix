@@ -115,6 +115,10 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     if demo && (data_dir.is_some() || network.is_some()) {
         return Err("--data-dir and --network do not apply to --demo".to_string());
     }
+    // A script can click the money UI, so it never runs on real bitcoin.
+    if !demo && drive.is_some() && network.is_none_or(|n| n == Network::Bitcoin) {
+        return Err("--demo-drive is refused on --network bitcoin".to_string());
+    }
     Ok(Args {
         demo,
         scenario: scenario.unwrap_or(DemoScenario::Funded),
@@ -172,10 +176,18 @@ mod tests {
     fn parses_drive_file_with_or_without_demo() {
         let a = p(&["--demo", "--demo-drive", "flow.drive"]).unwrap();
         assert_eq!(a.drive, Some("flow.drive".into()));
-        let a = p(&["--demo-drive", "flow.drive"]).unwrap();
+        let a = p(&["--network", "regtest", "--demo-drive", "flow.drive"]).unwrap();
         assert!(!a.demo);
         assert_eq!(a.drive, Some("flow.drive".into()));
         assert!(p(&["--demo", "--demo-drive"]).is_err());
+    }
+
+    /// A script can click the money UI, so it never runs on real bitcoin.
+    #[test]
+    fn a_drive_is_refused_on_bitcoin() {
+        assert!(p(&["--demo-drive", "flow.drive"]).is_err());
+        assert!(p(&["--network", "bitcoin", "--demo-drive", "flow.drive"]).is_err());
+        assert!(p(&["--network", "signet", "--demo-drive", "flow.drive"]).is_ok());
     }
 
     #[test]

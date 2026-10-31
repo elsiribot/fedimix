@@ -80,8 +80,8 @@ scenario and page at 480x640 and 360x640 (`-narrow`) into
 `target/screenshots/<scenario>-<page>[-narrow].png`. It fails if a window never
 maps or the app logs `CRITICAL` or `panicked`.
 
-`--demo-drive <file>` replays a script inside the running app, demo or real,
-because OS-level input injection does not reach GTK under headless sway.
+`--demo-drive <file>` replays a script inside the running app, demo or real but
+never on `--network bitcoin`, because OS-level input injection does not reach GTK under headless sway.
 The steps are documented at the top of `crates/fedimix-gtk/src/demo_drive.rs`.
 It prints `DRIVE OK`, or
 `DRIVE FAILED: <step>` and exits 1. `scripts/interact-demo.sh` (`just

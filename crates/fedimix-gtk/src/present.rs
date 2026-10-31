@@ -715,6 +715,7 @@ mod tests {
             for_spending: btc(for_spending),
             moving: btc(moving),
             saving_ready: ready,
+            features: Features::ALL,
             notes: vec![],
             history: vec![],
         }
@@ -834,7 +835,6 @@ mod tests {
             in_flight: btc(0.42),
             coins: vec![],
             history: vec![],
-            can_set_up: true,
         };
         assert_eq!(
             in_flight_line(&s),

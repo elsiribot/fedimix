@@ -3,3 +3,4 @@ expect Fedimix cannot start
 expect Fedimix is already running with this data folder.
 shot lock-alert
 click Close
+expect-not Fedimix cannot start
