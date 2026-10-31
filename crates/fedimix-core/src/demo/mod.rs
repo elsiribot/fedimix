@@ -22,6 +22,7 @@ const LIGHTNING_FEE_SAT: u64 = 12;
 const SMALL_CHANGE_SAT: u64 = 10_000;
 /// Smallest on-chain deposit the demo federation credits.
 const SPENDING_MIN_DEPOSIT_SAT: u64 = 10_000;
+const DEMO_RECEIVE_FEE_SAT: u64 = 50;
 /// What `recovery_words` returns: twelve words that fail the BIP39 checksum,
 /// so they can never be mistaken for a real seed.
 const DEMO_RECOVERY_WORDS: &str = "demo demo demo demo demo demo demo demo demo demo demo demo";
@@ -962,6 +963,8 @@ impl Backend for DemoBackend {
                     payload,
                     expires_at: Some(now_secs() + u64::from(expiry_secs)),
                     min_deposit: None,
+                    fee: Some(Amount::from_sat(DEMO_RECEIVE_FEE_SAT)),
+                    address_repeats: false,
                 }
             }
             ReceiveMethod::OnChain => {
@@ -972,6 +975,8 @@ impl Backend for DemoBackend {
                     expires_at: None,
                     min_deposit: (request.wallet == WalletKind::Spending)
                         .then_some(Amount::from_sat(SPENDING_MIN_DEPOSIT_SAT)),
+                    fee: None,
+                    address_repeats: false,
                 }
             }
         })

@@ -21,6 +21,16 @@ pub struct FederationPreview {
     pub has_lightning: bool,
 }
 
+/// An invoice made to be paid to this wallet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightningInvoice {
+    pub invoice: String,
+    pub watch_id: String,
+    /// What the gateway and the federation keep of the amount. `None` when it
+    /// could not be read; the invoice is good either way.
+    pub fee: Option<Amount>,
+}
+
 /// What paying an invoice would cost. Taking the quote back to
 /// [`FederationClient::pay_invoice`] pays through the gateway and at the terms
 /// that were shown, or not at all.
@@ -154,13 +164,12 @@ pub trait FederationClient: Send + Sync {
     /// but not sufficient: the fee moves with the feerate on v2, and the claim
     /// also pays the ecash fee.
     async fn min_deposit(&self) -> Result<Amount>;
-    /// Returns the invoice and its watch id.
     async fn lightning_invoice(
         &self,
         amount: Amount,
         description: &str,
         expiry_secs: u32,
-    ) -> Result<(String, String)>;
+    ) -> Result<LightningInvoice>;
     /// Returns the address, and a watch id if the generation has one. Without
     /// one, the deposit arrives through [`Self::deposits`].
     async fn deposit_address(&self) -> Result<(String, Option<String>)>;

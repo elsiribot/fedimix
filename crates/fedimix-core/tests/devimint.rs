@@ -134,14 +134,15 @@ fn lnd_invoice(sat: u64) -> String {
 async fn pay_with_lnd(client: &dyn FederationClient, amount: Amount) -> String {
     const TRIES: u32 = 8;
     for attempt in 1..=TRIES {
-        let (invoice, watch_id) = client
+        let made = client
             .lightning_invoice(amount, "test", 3600)
             .await
             .unwrap();
         match sh(&format!(
-            "timeout 30 $FM_LNCLI payinvoice --force {invoice}"
+            "timeout 30 $FM_LNCLI payinvoice --force {}",
+            made.invoice
         )) {
-            Ok(_) => return watch_id,
+            Ok(_) => return made.watch_id,
             Err(e) => eprintln!("payinvoice attempt {attempt} failed: {e}"),
         }
     }
@@ -426,11 +427,11 @@ async fn pay_invoice_settles() {
         let invoice = if attempt <= LND_TRIES {
             lnd_invoice(paid.as_sat())
         } else {
-            let (invoice, _) = other_client
+            other_client
                 .lightning_invoice(paid, "test", 3600)
                 .await
-                .unwrap();
-            invoice
+                .unwrap()
+                .invoice
         };
         let before = client.balance().await.unwrap();
         let op = pay(&*client, &invoice, paid).await;
@@ -854,6 +855,8 @@ async fn receive_onchain_end_to_end() {
     let info = address(&backend).await;
     assert_eq!(info.uri, format!("bitcoin:{}", info.payload));
     assert!(info.min_deposit.unwrap() > Amount::ZERO);
+    let v2 = std::env::var("FEDIMIX_EXPECT_MODULES").as_deref() == Ok("v2");
+    assert_eq!(info.address_repeats, v2);
     assert!(
         rows(&backend).await.is_empty(),
         "an address alone adds no row"

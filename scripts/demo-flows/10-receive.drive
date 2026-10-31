@@ -9,10 +9,11 @@ type "Description (optional)" Coffee
 click Create invoice
 expect lnbc1000000n1pdemo
 expect Expires in
+expect Fees take about 50 sat of this amount.
 shot invoice
 type "Amount (BTC)" 0.002
 expect-not lnbc1000000n1pdemo
 click On-chain
 expect bc1qdemo
-expect Deposits under 10000 sat are not credited.
+expect Deposits of 10000 sat or less are not credited.
 shot address

@@ -12,8 +12,8 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 
 use super::port::{
-    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote,
-    LightningTerms, WatchUpdate, WithdrawQuote, WithdrawTerms,
+    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningInvoice,
+    LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote, WithdrawTerms,
 };
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
@@ -76,6 +76,7 @@ pub struct FakeClient {
     deposit_watches: Mutex<bool>,
     lightning_fee: Mutex<Amount>,
     withdraw_fee: Mutex<Amount>,
+    receive_fee: Mutex<Option<Amount>>,
     /// Next results of these calls; empty means the call works.
     invoice_errors: Mutex<VecDeque<FedimixError>>,
     quote_errors: Mutex<VecDeque<FedimixError>>,
@@ -120,6 +121,7 @@ impl FakeClient {
             deposit_watches: Mutex::new(true),
             lightning_fee: Mutex::new(Amount::from_sat(10)),
             withdraw_fee: Mutex::new(Amount::from_sat(300)),
+            receive_fee: Mutex::new(None),
             invoice_errors: Mutex::default(),
             quote_errors: Mutex::default(),
             pay_errors: Mutex::default(),
@@ -171,6 +173,10 @@ impl FakeClient {
 
     pub fn set_withdraw_fee(&self, fee: Amount) {
         *self.withdraw_fee.lock().unwrap() = fee;
+    }
+
+    pub fn set_receive_fee(&self, fee: Option<Amount>) {
+        *self.receive_fee.lock().unwrap() = fee;
     }
 
     /// Makes `invoice` payable for `amount`.
@@ -345,13 +351,17 @@ impl FederationClient for FakeClient {
         _amount: Amount,
         _description: &str,
         _expiry_secs: u32,
-    ) -> Result<(String, String)> {
+    ) -> Result<LightningInvoice> {
         self.invoice_calls.fetch_add(1, Ordering::SeqCst);
         let mut held = self.invoice_held.subscribe();
         let _ = held.wait_for(|held| !*held).await;
         Self::take_error(&self.invoice_errors)?;
-        let id = self.next_id("ln-receive");
-        Ok((format!("lnbcrt-{id}"), id))
+        let watch_id = self.next_id("ln-receive");
+        Ok(LightningInvoice {
+            invoice: format!("lnbcrt-{watch_id}"),
+            watch_id,
+            fee: *self.receive_fee.lock().unwrap(),
+        })
     }
 
     async fn deposit_address(&self) -> Result<(String, Option<String>)> {

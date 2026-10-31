@@ -1165,6 +1165,41 @@ async fn v2_deposits_reach_history_and_notify_once() {
 }
 
 #[tokio::test]
+async fn only_an_address_without_a_watch_repeats() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let request = || ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::OnChain,
+    };
+    assert!(!backend.receive(request()).await.unwrap().address_repeats);
+    harness.first.set_deposit_watches(false);
+    assert!(backend.receive(request()).await.unwrap().address_repeats);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_invoice_states_its_fee_when_the_client_knows_it() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let request = || ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::Lightning {
+            amount: Amount::from_sat(1_000),
+            description: String::new(),
+            expiry_secs: 600,
+        },
+    };
+    harness.first.set_receive_fee(Some(Amount::from_sat(7)));
+    let info = backend.receive(request()).await.unwrap();
+    assert_eq!(info.fee, Some(Amount::from_sat(7)));
+    assert!(!info.address_repeats);
+    harness.first.set_receive_fee(None);
+    assert_eq!(backend.receive(request()).await.unwrap().fee, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_cursor_is_not_replayed_after_restart() {
     let harness = Harness::new();
     harness.first.set_deposit_watches(false);

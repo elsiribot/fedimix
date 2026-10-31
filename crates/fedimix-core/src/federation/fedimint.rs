@@ -35,8 +35,8 @@ use tokio::task::JoinSet;
 
 use super::onchain::{Mint, OnChain, config_network, follow_deposits, no_on_chain, send_meta};
 use super::port::{
-    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote,
-    LightningTerms, WatchUpdate, WithdrawQuote,
+    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningInvoice,
+    LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
 };
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
@@ -538,6 +538,19 @@ async fn received(client: &Client, op: OperationId) -> Option<(Amount, Amount)> 
     }
 }
 
+/// What the gateway and the federation keep of an invoice for `amount`. The
+/// operation names the gateway that was chosen, so this is that one's fee.
+async fn receive_fee(
+    client: &Client,
+    ln: &LightningClientModule,
+    amount: fedimint_core::Amount,
+    op: OperationId,
+) -> Option<Amount> {
+    let (_, gateway) = received(client, op).await?;
+    let federation = read(ln.receive_fee_quote(amount)).await.ok()?.ok()?;
+    gateway.checked_add(amount_of(federation.total().get_bitcoin()))
+}
+
 /// Waits for the funding transaction's change. Fedimint reports both success and
 /// a refund while it is still being issued, and a final update must leave the
 /// balance whole. An issuance error is ignored: the outcome stands either way.
@@ -679,7 +692,7 @@ impl FederationClient for FedimintClient {
         amount: Amount,
         description: &str,
         expiry_secs: u32,
-    ) -> Result<(String, String)> {
+    ) -> Result<LightningInvoice> {
         let client = self.client()?;
         let ln = client
             .get_first_module::<LightningClientModule>()
@@ -693,7 +706,11 @@ impl FederationClient for FedimintClient {
             serde_json::json!({}),
         );
         let (invoice, op) = read(call).await?.map_err(|e| invoice_receive_error(&e))?;
-        Ok((invoice.to_string(), op.fmt_full().to_string()))
+        Ok(LightningInvoice {
+            invoice: invoice.to_string(),
+            watch_id: op.fmt_full().to_string(),
+            fee: receive_fee(&client, &ln, fedimint_amount(amount), op).await,
+        })
     }
 
     async fn deposit_address(&self) -> Result<(String, Option<String>)> {

@@ -180,7 +180,7 @@ impl PayloadView {
             .map(|at| present::expiry_line(at, widgets::now()));
         self.expiry.set_visible(expiry.is_some());
         self.expiry.set_label(expiry.as_deref().unwrap_or(""));
-        let minimum = present::receive_minimum(info);
+        let minimum = present::receive_note(info);
         self.minimum.set_visible(minimum.is_some());
         self.minimum.set_label(minimum.as_deref().unwrap_or(""));
         self.copy.set_sensitive(true);

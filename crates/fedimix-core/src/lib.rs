@@ -40,7 +40,7 @@ pub mod testing {
     pub use crate::federation::fake::{FakeClient, FakePort};
     pub use crate::federation::{
         DepositEvent, FederationClient, FederationPort, FederationPreview, FedimintPort,
-        LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
+        LightningInvoice, LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
     #[cfg(feature = "testing")]
     pub use crate::real::{Clock, SendHalt, halt_sends};

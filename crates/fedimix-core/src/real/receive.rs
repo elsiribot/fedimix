@@ -100,21 +100,25 @@ impl Core {
             } => {
                 // Before the call: the invoice's clock starts at the gateway.
                 let asked_at = (self.clock)();
-                let (invoice, id) = client
+                let made = client
                     .lightning_invoice(amount, &description, expiry_secs)
                     .await?;
-                self.add_invoice(&federation, &id, amount)?;
+                self.add_invoice(&federation, &made.watch_id, amount)?;
                 Ok(ReceiveInfo {
-                    uri: format!("lightning:{invoice}"),
-                    payload: invoice,
+                    uri: format!("lightning:{}", made.invoice),
+                    payload: made.invoice,
                     expires_at: Some(asked_at + u64::from(expiry_secs)),
                     min_deposit: None,
+                    fee: made.fee,
+                    address_repeats: false,
                 })
             }
             ReceiveMethod::OnChain => {
                 // First: a failure here must not use up an address.
                 let min_deposit = client.min_deposit().await?;
                 let (address, id) = client.deposit_address().await?;
+                // A generation with no watch hands out one address at a time.
+                let address_repeats = id.is_none();
                 if let Some(id) = id {
                     self.add_deposit_watch(&federation, id)?;
                 }
@@ -123,6 +127,8 @@ impl Core {
                     payload: address,
                     expires_at: None,
                     min_deposit: Some(min_deposit),
+                    fee: None,
+                    address_repeats,
                 })
             }
         }

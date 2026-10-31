@@ -416,6 +416,12 @@ pub struct ReceiveInfo {
     /// On-chain deposits below this are not credited. It is a floor, not a
     /// promise: a deposit just above it can still fall short of the fees.
     pub min_deposit: Option<Amount>,
+    /// What the gateway and the federation keep of an invoice's amount, when
+    /// that could be read.
+    pub fee: Option<Amount>,
+    /// This address is shown again until a payment to it is seen, so two
+    /// payers given it would be linked on chain.
+    pub address_repeats: bool,
 }
 
 /// The Bitcoin network a data folder belongs to.

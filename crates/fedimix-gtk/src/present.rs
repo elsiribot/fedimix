@@ -542,13 +542,29 @@ pub fn history_to_show(
     visible_history(&all, show_cover)
 }
 
-/// Under the on-chain address: what the federation does not credit.
-pub fn receive_minimum(info: &ReceiveInfo) -> Option<String> {
-    let min = info.min_deposit.filter(|m| *m != Amount::ZERO)?;
-    Some(format!(
-        "Deposits under {} are not credited.",
-        format::sats(min)
-    ))
+/// Under the invoice or the address: what the user should know before anyone
+/// pays it. Only a repeating address has a minimum that moves with the feerate.
+pub fn receive_note(info: &ReceiveInfo) -> Option<String> {
+    if let Some(fee) = info.fee {
+        return Some(format!(
+            "Fees take about {} of this amount.",
+            format::sats(fee)
+        ));
+    }
+    let min = info.min_deposit.filter(|m| *m != Amount::ZERO);
+    let repeats = "This address stays the same until it receives a payment.";
+    match (min, info.address_repeats) {
+        (Some(min), true) => Some(format!(
+            "Send well above {}; this minimum follows Bitcoin fees. {repeats}",
+            format::sats(min)
+        )),
+        (None, true) => Some(repeats.to_string()),
+        (Some(min), false) => Some(format!(
+            "Deposits of {} or less are not credited.",
+            format::sats(min)
+        )),
+        (None, false) => None,
+    }
 }
 
 /// What to tell about an operation found running at startup, once it ends.
@@ -1324,17 +1340,54 @@ mod tests {
             uri: "bitcoin:bc1qdemo".into(),
             expires_at: None,
             min_deposit,
+            fee: None,
+            address_repeats: false,
         }
     }
 
     #[test]
-    fn receive_shows_minimum() {
+    fn a_fixed_minimum_says_a_deposit_at_it_is_not_credited() {
         assert_eq!(
-            receive_minimum(&receive_info(Some(sat(10_000)))),
-            Some("Deposits under 10000 sat are not credited.".to_string())
+            receive_note(&receive_info(Some(sat(10_000)))).as_deref(),
+            Some("Deposits of 10000 sat or less are not credited.")
         );
-        assert_eq!(receive_minimum(&receive_info(None)), None);
-        assert_eq!(receive_minimum(&receive_info(Some(Amount::ZERO))), None);
+        assert_eq!(receive_note(&receive_info(None)), None);
+        assert_eq!(receive_note(&receive_info(Some(Amount::ZERO))), None);
+    }
+
+    #[test]
+    fn a_repeating_address_says_so_and_that_its_minimum_moves() {
+        let info = fedimix_core::ReceiveInfo {
+            address_repeats: true,
+            ..receive_info(Some(sat(2_000)))
+        };
+        assert_eq!(
+            receive_note(&info).as_deref(),
+            Some(
+                "Send well above 2000 sat; this minimum follows Bitcoin fees. \
+                 This address stays the same until it receives a payment."
+            )
+        );
+        let no_minimum = fedimix_core::ReceiveInfo {
+            min_deposit: None,
+            ..info
+        };
+        assert_eq!(
+            receive_note(&no_minimum).as_deref(),
+            Some("This address stays the same until it receives a payment.")
+        );
+    }
+
+    #[test]
+    fn an_invoice_says_what_fees_take() {
+        let info = fedimix_core::ReceiveInfo {
+            fee: Some(sat(50)),
+            ..receive_info(None)
+        };
+        assert_eq!(
+            receive_note(&info).as_deref(),
+            Some("Fees take about 50 sat of this amount.")
+        );
     }
 
     fn rows(ids: &[&str]) -> Vec<HistoryItem> {
