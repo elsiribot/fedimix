@@ -402,8 +402,18 @@ impl Core {
 
 /// Whether `federations/` holds a client database. The port creates
 /// `federations/<id>` only after a seed exists, so none can be here by chance.
-fn has_federation_data(dir: &Path) -> bool {
-    std::fs::read_dir(dir.join("federations")).is_ok_and(|mut entries| entries.next().is_some())
+/// A folder that cannot be read is an error: guessing "no data" would skip the
+/// guard on the very folder it protects.
+fn has_federation_data(dir: &Path) -> Result<bool> {
+    let path = dir.join("federations");
+    match std::fs::read_dir(&path) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(FedimixError::Internal(format!(
+            "Fedimix cannot read {} ({e}), so it cannot tell whether this folder holds a wallet. Fix the folder's permissions, or choose another data folder.",
+            path.display()
+        ))),
+    }
 }
 
 pub struct RealBackend {
@@ -430,7 +440,8 @@ impl RealBackend {
         let db = dir.join(DB_FILE);
         // Before `load_or_create`: a new seed cannot open what the old one made.
         if seed_is_new
-            && (has_federation_data(&dir) || (db.exists() && Store::open(&db)?.holds_a_wallet()?))
+            && (has_federation_data(&dir)?
+                || (db.exists() && Store::open(&db)?.holds_a_wallet()?))
         {
             return Err(Seed::missing(&dir));
         }

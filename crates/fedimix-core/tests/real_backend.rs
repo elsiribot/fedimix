@@ -1852,6 +1852,29 @@ async fn missing_seed_with_a_surviving_federations_folder_is_refused() {
 }
 
 #[tokio::test]
+async fn an_unreadable_federations_folder_is_an_error_not_no_data() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    let federations = harness.dir.path().join("federations");
+    std::fs::create_dir_all(federations.join("one")).unwrap();
+    lose_store(&harness);
+    std::fs::remove_file(harness.dir.path().join("seed")).unwrap();
+    std::fs::set_permissions(&federations, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let reply = harness.open().await;
+    std::fs::set_permissions(&federations, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Err(FedimixError::Internal(sentence)) = &reply else {
+        panic!(
+            "started beside a folder it could not read: {:?}",
+            reply.map(|_| ())
+        );
+    };
+    assert!(sentence.contains("federations"), "{sentence}");
+    assert!(!harness.dir.path().join("seed").exists());
+}
+
+#[tokio::test]
 async fn a_lost_seed_and_store_start_a_new_wallet() {
     let harness = Harness::new();
     let backend = harness.open().await.unwrap();

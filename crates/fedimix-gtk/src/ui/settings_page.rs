@@ -399,6 +399,7 @@ impl Inner {
             electrum,
             url,
             proxy,
+            servers_shown: self.url.is_visible(),
         })
     }
 
@@ -419,7 +420,7 @@ impl Inner {
         set_error(&self.target, parse_btc(&self.target.text()).is_err());
         set_error(
             &self.url,
-            present::validate_server_url(electrum, &url).is_err(),
+            self.url.is_visible() && present::validate_server_url(electrum, &url).is_err(),
         );
         set_error(
             &self.proxy,
@@ -625,7 +626,9 @@ impl Inner {
                     let ctx = self.ctx.clone();
                     move |button| {
                         button.clipboard().set_text(&offer.copy);
-                        ctx.toast("Invite code copied.");
+                        ctx.toast(
+                            "Copied. Invite codes identify your federation; keep them private.",
+                        );
                     }
                 });
                 invite.add_suffix(&copy);
@@ -699,6 +702,7 @@ mod tests {
             electrum: fields.electrum,
             url: fields.url,
             proxy: fields.proxy,
+            servers_shown: true,
         })
         .unwrap()
     }

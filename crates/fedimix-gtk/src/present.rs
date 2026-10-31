@@ -699,6 +699,9 @@ pub struct SettingsForm<'a> {
     pub electrum: bool,
     pub url: &'a str,
     pub proxy: &'a str,
+    /// The page shows the server rows. When it does not, `electrum` and `url`
+    /// are the values in force and are kept as they are, empty or not.
+    pub servers_shown: bool,
 }
 
 fn in_range(name: &str, v: f64, min: f64, max: f64) -> Result<u64, String> {
@@ -783,10 +786,12 @@ pub fn validate_proxy(proxy: &str) -> Result<(), String> {
 /// Validate the Settings form and build the new [`Settings`] from it.
 pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
     let url = form.url.trim();
-    if url.is_empty() {
-        return Err("Enter a server URL".to_string());
+    if form.servers_shown {
+        if url.is_empty() {
+            return Err("Enter a server URL".to_string());
+        }
+        validate_server_url(form.electrum, url)?;
     }
-    validate_server_url(form.electrum, url)?;
     let proxy = form.proxy.trim();
     validate_proxy(proxy)?;
     Ok(Settings {
@@ -1860,7 +1865,37 @@ mod settings_form_tests {
             electrum: true,
             url: " ssl://electrum.example:50002 ",
             proxy: "",
+            servers_shown: true,
         }
+    }
+
+    #[test]
+    fn hidden_server_rows_are_not_validated_and_keep_the_value_in_force() {
+        let hidden = SettingsForm {
+            electrum: false,
+            url: "",
+            servers_shown: false,
+            ..form()
+        };
+        let s = settings_from_form(&hidden).unwrap();
+        assert_eq!(
+            s.chain_backend,
+            ChainBackend::Esplora { url: String::new() }
+        );
+        assert_eq!(s.anonymity_target, 100);
+    }
+
+    #[test]
+    fn shown_server_rows_still_refuse_an_empty_url() {
+        let shown = SettingsForm {
+            electrum: false,
+            url: " ",
+            ..form()
+        };
+        assert_eq!(
+            settings_from_form(&shown).unwrap_err(),
+            "Enter a server URL"
+        );
     }
 
     #[test]
