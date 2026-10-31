@@ -1167,6 +1167,18 @@ fn came_back() -> OperationState {
 }
 
 /// The row of send `id`, once it is final.
+/// The row is written before the operation ends, so a crash replays harmlessly:
+/// a reader can see a final row with the operation still listed.
+async fn wait_no_operations(backend: &RealBackend) {
+    tokio::time::timeout(PATIENCE, async {
+        while !backend.operations().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the operation ends after its row");
+}
+
 async fn final_row(backend: &RealBackend, id: &str) -> HistoryItem {
     tokio::time::timeout(PATIENCE, async {
         loop {
@@ -1404,7 +1416,7 @@ async fn killed_after_submit_resumes() {
 
         payer = reopened_after_drop(&config).await;
         let row = final_row(&payer, &id).await;
-        assert!(payer.operations().await.unwrap().is_empty());
+        wait_no_operations(&payer).await;
         wait_online(&payer).await;
         match row.status {
             HistoryStatus::Complete => {
