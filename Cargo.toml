@@ -15,3 +15,59 @@ async-trait = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt"] }
 qrcode = { version = "0.14", default-features = false }
+bitcoin = "0.32.6"
+lightning-invoice = "0.34"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.8"
+tempfile = "3"
+fedimint-client = "=0.13.0"
+fedimint-core = "=0.13.0"
+fedimint-api-client = "=0.13.0"
+fedimint-connectors = "=0.13.0"
+fedimint-bip39 = "=0.13.0"
+fedimint-eventlog = "=0.13.0"
+fedimint-mint-client = "=0.13.0"
+fedimint-mint-common = "=0.13.0"
+fedimint-mintv2-client = "=0.13.0"
+fedimint-wallet-client = "=0.13.0"
+fedimint-wallet-common = "=0.13.0"
+fedimint-walletv2-client = "=0.13.0"
+fedimint-walletv2-common = "=0.13.0"
+fedimint-lnv2-client = "=0.13.0"
+fedimint-lnv2-common = "=0.13.0"
+fedimint-rocksdb = "=0.13.0"
+
+# copied from fedimint workspace: optimise crypto crates in dev builds
+# in dev mode optimize crates that are perf-critical (usually just crypto crates)
+[profile.dev.package]
+ahash = { opt-level = 3 }
+aleph-bft-crypto = { opt-level = 3 }
+aleph-bft-rmc = { opt-level = 3 }
+aleph-bft-types = { opt-level = 3 }
+bitcoin_hashes = { opt-level = 3 }
+bls12_381 = { opt-level = 3 }
+byteorder = { opt-level = 3 }
+fedimint-threshold-crypto = { opt-level = 3 }
+ff = { opt-level = 3 }
+group = { opt-level = 3 }
+hashbrown = { opt-level = 3 }
+libc = { opt-level = 3 }
+librocksdb-sys = { opt-level = 3 }
+memchr = { opt-level = 3 }
+pairing = { opt-level = 3 }
+parity-scale-codec = { opt-level = 3 }
+ppv-lite86 = { opt-level = 3 }
+rand = { opt-level = 3 }
+rand_chacha = { opt-level = 3 }
+rand_core = { opt-level = 3 }
+regex = { opt-level = 3 }
+ring = { opt-level = 3 }
+rustls = { opt-level = 3 }
+secp256k1 = { opt-level = 3 }
+secp256k1-sys = { opt-level = 3 }
+subtle = { opt-level = 3 }
+tikv-jemalloc-sys = { opt-level = 3 }
+zeroize = { opt-level = 3 }
+
+[profile.dev]
+debug = "line-tables-only"

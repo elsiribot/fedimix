@@ -21,6 +21,14 @@ just clippy   # lint with warnings denied
 just fmt      # format the code
 ```
 
+`just test-integration` runs the smoke tests in `crates/fedimix-core/tests/devimint.rs`
+against a local devimint federation, once with the default `mintv2`/`walletv2`
+modules and once with `mint`/`wallet`. It uses the separate `integration`
+shell (`nix develop .#integration`), which adds devimint, the fedimint daemons,
+bitcoind, lnd and esplora. Plain `nix develop` never fetches fedimint. The
+`--accept-flake-config` flag in the recipe makes nix use the fedimint cachix
+cache; without it nix builds fedimint from source (hundreds of crates).
+
 `nix build` produces a wrapped release binary at `result/bin/fedimix`;
 `just build-nix` does that and runs the flake checks (clippy, fmt, tests).
 

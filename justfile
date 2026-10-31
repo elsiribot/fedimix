@@ -13,6 +13,10 @@ demo:
 test:
     cargo test --workspace
 
+# Smoke tests against devimint federations, once per module generation (slow)
+test-integration:
+    nix develop .#integration --accept-flake-config -c scripts/test-integration.sh
+
 check:
     cargo check --workspace --all-targets
 

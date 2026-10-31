@@ -1,6 +1,13 @@
 {
   description = "fedimix - a Fedimint-based bitcoin mixer (GTK4 desktop app)";
 
+  nixConfig = {
+    extra-substituters = [ "https://fedimint.cachix.org" ];
+    extra-trusted-public-keys = [
+      "fedimint.cachix.org-1:FpJJjy1iPVlvyv4OMiN5y9+/arFLPcnZhZVVCHCDYTs="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
@@ -9,6 +16,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    # No `follows`: its binaries must come from its own nixpkgs to match the cachix cache.
+    fedimint.url = "github:fedimint/fedimint/v0.13.0";
   };
 
   outputs =
@@ -18,6 +27,7 @@
       flake-utils,
       fenix,
       crane,
+      fedimint,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -35,9 +45,15 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
 
+        libclangPath = "${pkgs.llvmPackages.libclang.lib}/lib";
+
         nativeBuildInputs = with pkgs; [
           pkg-config
           wrapGAppsHook4
+          # fedimint-rocksdb builds librocksdb from source
+          clang
+          cmake
+          protobuf
         ];
 
         buildInputs = with pkgs; [
@@ -61,6 +77,7 @@
           pname = "fedimix";
           strictDeps = true;
           inherit nativeBuildInputs buildInputs;
+          LIBCLANG_PATH = libclangPath;
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -71,12 +88,12 @@
             inherit cargoArtifacts;
             # Test binaries are not wrapped; they load GTK from here.
             preCheck = ''
-              export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath buildInputs}
+              export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (buildInputs ++ [ pkgs.stdenv.cc.cc.lib ])}
             '';
             # Rust links without a runpath, so the binary would only start
             # inside the dev shell.
             postInstall = ''
-              patchelf --add-rpath ${pkgs.lib.makeLibraryPath buildInputs} $out/bin/fedimix
+              patchelf --add-rpath ${pkgs.lib.makeLibraryPath (buildInputs ++ [ pkgs.stdenv.cc.cc.lib ])} $out/bin/fedimix
             '';
             # Exits 2 before touching a display; 127 means libraries are missing.
             doInstallCheck = true;
@@ -106,22 +123,63 @@
           fmt = craneLib.cargoFmt { inherit src; inherit (commonArgs) pname; };
         };
 
-        devShells.default = pkgs.mkShell {
-          inherit nativeBuildInputs buildInputs;
-          packages = [
-            toolchain
-            pkgs.just
-            pkgs.sway
-            pkgs.grim
-            pkgs.jq
-            pkgs.dbus
-          ];
-          # The built binary needs the GTK/libadwaita libraries at runtime.
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
-          # Lets GTK find schemas/icons when running via `cargo run`.
-          shellHook = ''
-            export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.adwaita-icon-theme}/share:$XDG_DATA_DIRS"
-          '';
+        devShells = rec {
+          default = pkgs.mkShell {
+            inherit nativeBuildInputs buildInputs;
+            packages = [
+              toolchain
+              pkgs.just
+              pkgs.sway
+              pkgs.grim
+              pkgs.jq
+              pkgs.dbus
+            ];
+            LIBCLANG_PATH = libclangPath;
+            # The built binary needs the GTK/libadwaita libraries (and
+            # librocksdb's libstdc++) at runtime.
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ [ pkgs.stdenv.cc.cc.lib ]);
+            # Lets GTK find schemas/icons when running via `cargo run`.
+            shellHook = ''
+              export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.adwaita-icon-theme}/share:$XDG_DATA_DIRS"
+            '';
+          };
+
+          # Adds devimint and the daemons it spawns. Separate so that plain
+          # `nix develop` never fetches or builds fedimint.
+          integration =
+            let
+              # fedimint's own nixpkgs and overlay, so that bitcoind, lnd and
+              # esplora match what its cachix cache holds
+              fmPkgs = import fedimint.inputs.nixpkgs {
+                inherit system;
+                overlays = [ fedimint.overlays.all ];
+              };
+              fm = fedimint.packages.${system};
+            in
+            pkgs.mkShell {
+              inputsFrom = [ default ];
+              packages = [
+                fm.devimint
+                fm.fedimintd
+                fm.fedimint-cli
+                fm.gatewayd
+                fm.gateway-cli
+                fm.fedimint-dbtool
+                # devimint's dev-fed dies with "Could not spawn: recurringd" without these
+                fm.fedimint-recurringd
+                fm.fedimint-recurringdv2
+                fmPkgs.bitcoind
+                fmPkgs.lnd
+                fmPkgs.esplora-electrs
+                fmPkgs.jq
+                fmPkgs.perl
+                fmPkgs.procps
+                fmPkgs.netcat
+                fmPkgs.which
+              ];
+              FM_ESPLORA_BASE_EXECUTABLE = "${fmPkgs.esplora-electrs}/bin/esplora";
+              inherit (default) LD_LIBRARY_PATH LIBCLANG_PATH shellHook;
+            };
         };
       }
     );
