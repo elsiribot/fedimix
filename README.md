@@ -46,13 +46,32 @@ wallet, and a folder refusing another network. Screenshots land in
 fedimix [--data-dir PATH] [--network bitcoin|signet|regtest]
 ```
 
-The network defaults to `bitcoin`. Data lives in `$XDG_DATA_HOME/fedimix`, else
-`~/.local/share/fedimix`; `signet` and `regtest` use `fedimix-signet` and
-`fedimix-regtest`, so test networks never collide. A folder remembers its
-network and refuses another one, also through `--data-dir`. If the wallet cannot
-start, for example because another Fedimix holds the folder, it says why and
-exits 1. The first launch creates the recovery words; Spending asks you to write
-them down once you hold funds, and Settings shows them at any time.
+The network defaults to `bitcoin`: this spends real money. Try it with small
+amounts first.
+
+Each network has its own data folder, so test networks never collide:
+`$XDG_DATA_HOME/fedimix` (else `~/.local/share/fedimix`) for bitcoin,
+`fedimix-signet` and `fedimix-regtest` next to it. A folder remembers its
+network and refuses another one, also through `--data-dir`. If the wallet
+cannot start, for example because another Fedimix holds the folder, it says why
+and exits 1.
+
+The first launch creates a seed in the folder (`seed`, mode 0600, a plain file,
+not encrypted). Whoever can read it can spend your funds. The folder is created
+0700 and Fedimix refuses a seed or folder open to others. Spending asks you to
+write down the recovery words once you hold funds, and Settings shows them at
+any time. Back them up: they are what restores your funds, and nothing else
+does. Restoring from the words on a new device is not available yet; today the
+words are a record, and the data folder with its seed is the wallet.
+
+## Not yet
+
+- Saving (the cold-storage side) and hardware wallets: the controls are hidden
+  in the real wallet.
+- Exits and cover traffic.
+- A proxy for federation traffic: fedimint has no SOCKS5 support, so setting a
+  proxy keeps federations offline instead of connecting directly.
+- Restoring from the recovery words on a new device.
 
 ## Demo mode
 

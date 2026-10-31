@@ -29,7 +29,7 @@ run() {
         # Only the test process gets the C++ runtime; devimint's daemons must not.
         env -u FM_ENABLE_MODULE_MINT -u FM_ENABLE_MODULE_WALLET \
             -u FM_ENABLE_MODULE_MINTV2 -u FM_ENABLE_MODULE_WALLETV2 \
-            FM_FED_SIZE=1 "$@" \
+            FM_FED_SIZE="${FM_FED_SIZE:-1}" "$@" \
             devimint dev-fed --exec \
             scripts/fund-gateways.sh \
             env "LD_LIBRARY_PATH=${FEDIMIX_TEST_LD_LIBRARY_PATH:-}" FEDIMIX_EXPECT_MODULES="$gen" \
