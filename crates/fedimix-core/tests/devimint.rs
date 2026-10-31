@@ -942,8 +942,13 @@ async fn lost_client_db_recovers_balance() {
     let backend = RealBackend::open(config).await.unwrap();
     connected_with(&backend, balance).await;
 
+    // Both v1 modules join the client only on the reopen after recovery: an
+    // address takes the wallet, and a credited receive takes the mint.
+    address(&backend).await;
     // The next notes must not reuse a nonce the lost database had used.
+    let events = backend.subscribe();
     pay_backend_with_lnd(&backend, 5_000).await;
+    wait_received(&backend, &events).await;
     wait_balance(&backend, |now| now > balance).await;
     backend.shutdown().await.unwrap();
 }

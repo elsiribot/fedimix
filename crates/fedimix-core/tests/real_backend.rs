@@ -2,6 +2,7 @@
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fedimix_core::testing::{
@@ -26,6 +27,7 @@ struct Harness {
     port: Arc<FakePort>,
     first: Arc<FakeClient>,
     second: Arc<FakeClient>,
+    time: Arc<AtomicU64>,
 }
 
 impl Harness {
@@ -42,6 +44,7 @@ impl Harness {
             port,
             first,
             second,
+            time: Arc::new(AtomicU64::new(1_000)),
         }
     }
 
@@ -54,7 +57,9 @@ impl Harness {
             data_dir: self.dir.path().to_str().unwrap().to_string(),
             network,
         };
-        real_backend(config, self.port.clone(), Arc::new(|| 1_000)).await
+        let time = Arc::clone(&self.time);
+        let clock = Arc::new(move || time.load(Ordering::SeqCst));
+        real_backend(config, self.port.clone(), clock).await
     }
 
     /// A backend that has joined the first federation.
@@ -1401,5 +1406,154 @@ async fn recovery_reads_the_new_deposit_log_from_the_start() {
     wait_until("the recovery", || async { harness.port.recovers() > 0 }).await;
     harness.port.set_open_error(None);
     wait_status(&*backend, "new", HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_capped_watch_that_sees_a_deposit_is_kept() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let oldest = backend.receive(address_request()).await.unwrap();
+    let oldest = watch_id(&oldest.payload).to_string();
+    for _ in 0..100 {
+        backend.receive(address_request()).await.unwrap();
+    }
+    assert_eq!(watches_left(&harness), 100, "the oldest went past the cap");
+
+    // Its task runs on until the connection ends, and the address is paid.
+    harness.first.push_update(&oldest, confirming(1, 40_000));
+    wait_until("the deposit's row", || async {
+        rows(&*backend).await.len() == 1
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.first.push_update(&oldest, settled(39_900));
+    let backend = harness.open().await.unwrap();
+    wait_status(&*backend, &oldest, HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_known_outpoint_in_the_new_log_stays_silent() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    harness
+        .first
+        .push_deposit(deposit_event(1, "outpoint", true));
+    wait_status(&*backend, "outpoint", HistoryStatus::Complete).await;
+    assert_eq!(notices(&drain(&events).await), 1);
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.first.lose_deposit_log();
+    harness
+        .first
+        .push_deposit(deposit_event(1, "outpoint", false));
+    harness
+        .first
+        .push_deposit(deposit_event(2, "outpoint", true));
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+    let backend = harness.open().await.unwrap();
+    let events = backend.subscribe();
+    wait_until("the recovery", || async { harness.port.recovers() > 0 }).await;
+    harness.port.set_open_error(None);
+    wait_until("the log to be read", || async {
+        let cursor: i64 = raw_store(&harness)
+            .query_row(
+                "SELECT value FROM cursors WHERE name = 'deposits:one'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        cursor == 2
+    })
+    .await;
+    let seen = drain(&events).await;
+    assert_eq!(notices(&seen), 0, "{seen:?}");
+    let rows = rows(&*backend).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, HistoryStatus::Complete);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_invoice_expires_counted_from_the_request() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    harness.first.set_invoice_held(true);
+    let asking = Arc::clone(&backend);
+    let asked = tokio::spawn(async move { asking.receive(invoice_request(1)).await });
+    wait_until("the gateway call", || async {
+        harness.first.invoice_calls() == 1
+    })
+    .await;
+    harness.time.store(1_020, Ordering::SeqCst);
+    harness.first.set_invoice_held(false);
+    let info = within("the invoice", asked).await.unwrap().unwrap();
+    assert_eq!(info.expires_at, Some(1_600));
+    backend.shutdown().await.unwrap();
+}
+
+/// Removes the store and leaves the seed, as losing one file would.
+fn lose_store(harness: &Harness) {
+    for name in ["fedimix.db", "fedimix.db-wal", "fedimix.db-shm"] {
+        let _ = std::fs::remove_file(harness.dir.path().join(name));
+    }
+}
+
+#[tokio::test]
+async fn a_lost_store_with_a_living_seed_recovers_on_join() {
+    let harness = Harness::new();
+    harness.first.set_balance(Amount::from_sat(4_000));
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    lose_store(&harness);
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+
+    let backend = harness.open().await.unwrap();
+    let joins = harness.port.joins();
+    harness.port.set_recover_held(true);
+    let joined = within("the join", backend.join_federation(INVITE.into()))
+        .await
+        .unwrap();
+    assert_eq!(joined.id, "one");
+    assert!(!joined.online, "offline until the recovery ends");
+    wait_until("the recovery", || async { harness.port.recovers() == 1 }).await;
+    harness.port.set_open_error(None);
+    harness.port.set_recover_held(false);
+    wait_online(&*backend, true).await;
+    wait_balance(&*backend, Amount::from_sat(4_000)).await;
+    assert_eq!(harness.port.joins(), joins, "never a fresh start");
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // Remembered: the seed is still older than this store after a restart.
+    let backend = harness.open().await.unwrap();
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    assert_eq!(harness.port.joins(), joins);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_seed_born_with_its_store_joins_fresh_also_after_a_restart() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    assert_eq!(harness.port.joins(), 1);
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = harness.open().await.unwrap();
+    backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    assert_eq!(harness.port.joins(), 2);
+    assert_eq!(harness.port.recovers(), 0);
     backend.shutdown().await.unwrap();
 }

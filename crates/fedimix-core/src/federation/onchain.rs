@@ -3,6 +3,7 @@
 //! alive.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use bitcoin::Address;
 use bitcoin::address::NetworkUnchecked;
@@ -46,6 +47,10 @@ const NOT_CLAIMED: &str = "The federation did not credit this deposit.";
 const NO_FEERATE: &str =
     "The federation has not agreed on a Bitcoin fee rate yet. Try again in a few minutes.";
 const LOG_PAGE: u64 = 100;
+/// How long the search for a first v2 address may take in one call.
+const ADDRESS_TIMEOUT: Duration = Duration::from_secs(120);
+const ADDRESS_NOT_READY: &str =
+    "Fedimix is still preparing a deposit address. Try again in a moment.";
 
 pub(super) fn no_on_chain() -> FedimixError {
     FedimixError::NotSetUp("This federation has no on-chain support.".into())
@@ -147,8 +152,13 @@ impl<'c> OnChain<'c> {
                     Some(operation_id.fmt_full().to_string()),
                 ))
             }
-            // The scanner grinds an address from the federation's output list.
-            Self::V2(w) => Ok((read(w.receive()).await?.to_string(), None)),
+            // A background task searches for an index that about 1 in 65536
+            // pass. That is CPU, not network, so it is no sign of being offline,
+            // and what it finds is kept for the next try.
+            Self::V2(w) => tokio::time::timeout(ADDRESS_TIMEOUT, w.receive())
+                .await
+                .map(|address| (address.to_string(), None))
+                .map_err(|_| FedimixError::Internal(ADDRESS_NOT_READY.into())),
         }
     }
 

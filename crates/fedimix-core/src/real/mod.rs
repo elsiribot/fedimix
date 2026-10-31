@@ -80,6 +80,9 @@ struct State {
 enum Reached {
     Known(String),
     Joined(FederationPreview, Arc<dyn FederationClient>),
+    /// New to the store, but the seed is older than the store, so it may have
+    /// been used there. The supervisor opens or recovers it.
+    Unjoined(FederationPreview),
 }
 
 /// A panic can happen with a lock held. The data stays valid, as nothing
@@ -130,6 +133,9 @@ struct Core {
     config: CoreConfig,
     port: Arc<dyn FederationPort>,
     seed: Seed,
+    /// `false` when the seed is older than the store: the store was lost, so
+    /// this seed may have been used at a federation the store does not list.
+    seed_born_with_store: bool,
     clock: Clock,
     store: Mutex<Store>,
     state: Mutex<State>,
@@ -224,8 +230,21 @@ impl Core {
                 ));
             }
         }
+        if !self.seed_born_with_store {
+            return Ok(Reached::Unjoined(preview));
+        }
         let client = self.port.join(invite, &self.seed).await?;
         Ok(Reached::Joined(preview, client))
+    }
+
+    fn new_row(&self, id: &str, name: String, invite: &str, balance: Amount) -> FederationRow {
+        FederationRow {
+            id: id.to_string(),
+            name,
+            invite: invite.to_string(),
+            online_at: Some((self.clock)()),
+            balance_msat: balance.msat,
+        }
     }
 
     async fn join(self: &Arc<Self>, invite: &str) -> Result<FederationInfo> {
@@ -245,18 +264,19 @@ impl Core {
                 self.retry_open(&id);
                 return self.federation(&id);
             }
+            Reached::Unjoined(preview) => {
+                let row = self.new_row(&preview.id, preview.name, invite, Amount::ZERO);
+                self.store().add_federation(&row)?;
+                supervisors.push(tokio::spawn(supervise(Arc::clone(self), row.id.clone())));
+                self.events.emit(&Event::FederationChanged);
+                return Ok(self.info(&row));
+            }
             Reached::Joined(preview, client) => (preview, client),
         };
         // A client database from an earlier join can already hold money.
         let balance = client.balance().await.unwrap_or(Amount::ZERO);
         let id = client.id();
-        let row = FederationRow {
-            id: id.clone(),
-            name: preview.name,
-            invite: invite.to_string(),
-            online_at: Some((self.clock)()),
-            balance_msat: balance.msat,
-        };
+        let row = self.new_row(&id, preview.name, invite, balance);
         let added = self.store().add_federation(&row);
         if let Err(e) = added {
             let _ = client.shutdown().await;
@@ -337,15 +357,18 @@ impl RealBackend {
         let dir = PathBuf::from(&config.data_dir);
         // The lock comes first: it decides who may touch the seed and the store.
         let lock = DataDirLock::acquire(&dir)?;
+        let seed_is_new = !Seed::exists(&dir, &lock);
         let seed = Seed::load_or_create(&dir, &lock)?;
         let store = Store::open(&dir.join(DB_FILE))?;
         store.bind_network(config.network)?;
+        let seed_born_with_store = store.seed_born_with_store(seed_is_new)?;
         let gate = Gate::of(&store.settings()?);
         let rows = store.federations()?;
         let core = Arc::new(Core {
             config,
             port,
             seed,
+            seed_born_with_store,
             clock,
             store: Mutex::new(store),
             state: Mutex::default(),

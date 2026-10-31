@@ -98,6 +98,9 @@ pub struct FakeClient {
     balance_reads: AtomicU32,
     /// While set, `shutdown` hangs, as it does for a payment in flight.
     close_held: watch::Sender<bool>,
+    /// While set, `lightning_invoice` hangs, as a slow gateway does.
+    invoice_held: watch::Sender<bool>,
+    invoice_calls: AtomicU32,
 }
 
 impl FakeClient {
@@ -129,6 +132,8 @@ impl FakeClient {
             balance_held: watch::Sender::new(false),
             balance_reads: AtomicU32::new(0),
             close_held: watch::Sender::new(false),
+            invoice_held: watch::Sender::new(false),
+            invoice_calls: AtomicU32::new(0),
         })
     }
 
@@ -212,6 +217,15 @@ impl FakeClient {
     /// Calls of `balance`, also those still hanging.
     pub fn balance_reads(&self) -> u32 {
         self.balance_reads.load(Ordering::SeqCst)
+    }
+
+    pub fn set_invoice_held(&self, held: bool) {
+        self.invoice_held.send_replace(held);
+    }
+
+    /// Calls of `lightning_invoice`, also those still hanging.
+    pub fn invoice_calls(&self) -> u32 {
+        self.invoice_calls.load(Ordering::SeqCst)
     }
 
     pub fn set_close_held(&self, held: bool) {
@@ -312,6 +326,9 @@ impl FederationClient for FakeClient {
         _description: &str,
         _expiry_secs: u32,
     ) -> Result<(String, String)> {
+        self.invoice_calls.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.invoice_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         Self::take_error(&self.invoice_errors)?;
         let id = self.next_id("ln-receive");
         Ok((format!("lnbcrt-{id}"), id))

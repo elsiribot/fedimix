@@ -87,6 +87,8 @@ impl Core {
                 description,
                 expiry_secs,
             } => {
+                // Before the call: the invoice's clock starts at the gateway.
+                let asked_at = (self.clock)();
                 let (invoice, id) = client
                     .lightning_invoice(amount, &description, expiry_secs)
                     .await?;
@@ -94,7 +96,7 @@ impl Core {
                 Ok(ReceiveInfo {
                     uri: format!("lightning:{invoice}"),
                     payload: invoice,
-                    expires_at: Some((self.clock)() + u64::from(expiry_secs)),
+                    expires_at: Some(asked_at + u64::from(expiry_secs)),
                     min_deposit: None,
                 })
             }
@@ -234,13 +236,17 @@ impl Core {
                 })
             }
         };
+        if !update.is_final() {
+            if let Some(item) = item {
+                let write = self.store().upsert_progress(federation, &item)?;
+                self.announce(federation, &item, &write);
+            }
+            return Ok(());
+        }
         if let Some(item) = item {
             self.record(federation, &item)?;
         }
-        if update.is_final() {
-            self.store().finish_watch(&watch.id)?;
-        }
-        Ok(())
+        self.store().finish_watch(&watch.id)
     }
 
     /// Opens the client of `id`, or recovers it if this device holds no data for
@@ -335,8 +341,8 @@ impl Watches {
     pub(super) async fn tend(&mut self) {
         tokio::select! {
             Some(watch) = self.added.recv() => self.start(watch),
-            Some(Err(e)) = self.tasks.join_next() => {
-                if e.is_panic() {
+            Some(ended) = self.tasks.join_next() => {
+                if ended.is_err_and(|e| e.is_panic()) {
                     eprintln!("fedimix: a watch panicked; the next connection resumes it");
                 }
             }

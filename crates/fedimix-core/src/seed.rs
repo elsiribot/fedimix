@@ -75,6 +75,12 @@ impl Seed {
         }
     }
 
+    /// Whether `dir` already holds a phrase. Needs the lock, or the answer could
+    /// change.
+    pub(crate) fn exists(dir: &Path, _lock: &DataDirLock) -> bool {
+        dir.join(SEED_FILE).exists()
+    }
+
     /// The recovery phrase, space separated.
     pub(crate) fn words(&self) -> String {
         self.mnemonic.to_string()

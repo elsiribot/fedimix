@@ -136,7 +136,8 @@ pub(crate) enum HistoryWrite {
         was: HistoryStatus,
     },
     /// The row already says this, or holds a final status that a replayed
-    /// earlier update must not take back.
+    /// earlier update must not take back. Nothing at all replaces `Complete`:
+    /// that money arrived.
     Unchanged,
 }
 
@@ -169,7 +170,11 @@ fn upsert_in(
         // A row that no longer parses gives way to this one.
         outcome = match serde_json::from_str::<HistoryItem>(&json) {
             Ok(old) if old == item => return Ok(HistoryWrite::Unchanged),
-            Ok(old) if is_final(&old.status) && !is_final(&item.status) => {
+            Ok(old)
+                if (is_final(&old.status) && !is_final(&item.status))
+                    || (old.status == HistoryStatus::Complete
+                        && item.status != HistoryStatus::Complete) =>
+            {
                 return Ok(HistoryWrite::Unchanged);
             }
             Ok(old) => HistoryWrite::Changed { was: old.status },
@@ -533,6 +538,44 @@ impl Store {
         Ok(out)
     }
 
+    /// A Spending row for a deposit still on its way, keyed on its watch, which
+    /// it takes back if the cap had dropped it: that watch's task runs until the
+    /// connection ends, and a row needs its watch to ever reach a final status.
+    pub(crate) fn upsert_progress(
+        &self,
+        federation_id: &str,
+        item: &HistoryItem,
+    ) -> Result<HistoryWrite> {
+        let tx = begin(&self.conn)?;
+        let outcome = upsert_in(&tx, WalletKind::Spending, federation_id, item)?;
+        if outcome != HistoryWrite::Unchanged {
+            tx.execute("UPDATE watches SET finished = 0 WHERE id = ?1", [&item.id])
+                .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(outcome)
+    }
+
+    /// Whether the seed was created together with this store. The first answer
+    /// stands: `seed_is_new` means nothing on later opens.
+    pub(crate) fn seed_born_with_store(&self, seed_is_new: bool) -> Result<bool> {
+        let tx = begin(&self.conn)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('seed_born_with_store', ?1)",
+            [if seed_is_new { "true" } else { "false" }],
+        )
+        .map_err(db_err)?;
+        let value: String = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'seed_born_with_store'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(value == "true")
+    }
+
     pub(crate) fn add_watch(&self, watch: &Watch) -> Result<()> {
         insert_watch(&self.conn, watch)
     }
@@ -819,6 +862,89 @@ mod tests {
             .history_page(WalletKind::Spending, Some("f"), None, 10)
             .unwrap();
         assert_eq!(page[0].status, HistoryStatus::Complete);
+    }
+
+    #[test]
+    fn complete_is_not_replaced_even_by_a_final_status() {
+        let (_d, store) = open();
+        let mut row = item("a", 1);
+        row.status = HistoryStatus::Complete;
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &row)
+            .unwrap();
+        for status in [
+            HistoryStatus::Failed,
+            HistoryStatus::Expired,
+            HistoryStatus::Refunded,
+        ] {
+            row.status = status;
+            assert_eq!(
+                store.upsert_history(WalletKind::Spending, Some("f"), &row),
+                Ok(HistoryWrite::Unchanged)
+            );
+        }
+        assert_eq!(
+            store
+                .history_item(WalletKind::Spending, Some("f"), "a")
+                .unwrap()
+                .unwrap()
+                .status,
+            HistoryStatus::Complete
+        );
+    }
+
+    #[test]
+    fn a_seen_deposit_takes_its_watch_back() {
+        let (_d, store) = open();
+        let watch = Watch {
+            id: "a".into(),
+            federation_id: "f".into(),
+            kind: WatchKind::Deposit,
+            created_at: 1,
+        };
+        store.add_watch(&watch).unwrap();
+        store.finish_watch("a").unwrap();
+        let mut row = item("a", 1);
+        row.status = HistoryStatus::Confirming {
+            confirmations: 1,
+            required: 6,
+        };
+        store.upsert_progress("f", &row).unwrap();
+        assert_eq!(store.watches().unwrap(), vec![watch]);
+    }
+
+    #[test]
+    fn progress_replayed_on_a_final_row_leaves_the_watch_finished() {
+        let (_d, store) = open();
+        let watch = Watch {
+            id: "a".into(),
+            federation_id: "f".into(),
+            kind: WatchKind::Deposit,
+            created_at: 1,
+        };
+        store.add_watch(&watch).unwrap();
+        store.finish_watch("a").unwrap();
+        let mut row = item("a", 1);
+        row.status = HistoryStatus::Complete;
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &row)
+            .unwrap();
+        row.status = HistoryStatus::Pending;
+        assert_eq!(
+            store.upsert_progress("f", &row),
+            Ok(HistoryWrite::Unchanged)
+        );
+        assert!(store.watches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn whether_the_seed_is_older_than_the_store_is_kept_from_the_first_answer() {
+        let (_d, store) = open();
+        assert!(store.seed_born_with_store(true).unwrap());
+        assert!(store.seed_born_with_store(false).unwrap());
+        let (_d, store) = open();
+        assert!(!store.seed_born_with_store(false).unwrap());
+        assert!(!store.seed_born_with_store(true).unwrap());
     }
 
     #[test]
