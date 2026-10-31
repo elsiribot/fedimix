@@ -11,6 +11,7 @@ pub mod event;
 mod federation;
 pub mod handle;
 mod real;
+mod saving;
 mod seed;
 mod store;
 
@@ -40,6 +41,9 @@ pub mod testing {
     };
     #[cfg(feature = "testing")]
     pub use crate::real::{Clock, SendHalt, halt_sends};
+    #[cfg(feature = "testing")]
+    pub use crate::saving::FakeChain;
+    pub use crate::saving::{ChainClient, connect_chain};
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 

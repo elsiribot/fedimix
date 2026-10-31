@@ -1,0 +1,152 @@
+//! A scripted [`ChainClient`], for tests of the wallet above it.
+
+use std::collections::{HashSet, VecDeque};
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use bdk_wallet::KeychainKind;
+use bdk_wallet::bitcoin::{Transaction, Txid};
+use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
+
+use super::ChainClient;
+use crate::error::{FedimixError, Result};
+
+#[derive(Default)]
+struct State {
+    offline: bool,
+    fee_rate: Option<f64>,
+    full_scans: VecDeque<FullScanResponse<KeychainKind>>,
+    syncs: VecDeque<SyncResponse>,
+    known: HashSet<Txid>,
+    broadcasts: Vec<Transaction>,
+    scans_made: usize,
+}
+
+/// Answers from a queue: an empty response when the queue is empty. `offline`
+/// makes every call fail as an unreachable server does.
+#[derive(Default)]
+pub struct FakeChain {
+    state: Mutex<State>,
+}
+
+impl FakeChain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn check_online(&self) -> Result<()> {
+        if self.state().offline {
+            Err(FedimixError::Offline)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn set_offline(&self, offline: bool) {
+        self.state().offline = offline;
+    }
+
+    pub fn set_fee_rate(&self, rate: Option<f64>) {
+        self.state().fee_rate = rate;
+    }
+
+    /// The next `full_scan` returns `response`.
+    pub fn push_full_scan(&self, response: FullScanResponse<KeychainKind>) {
+        self.state().full_scans.push_back(response);
+    }
+
+    /// The next `sync` returns `response`.
+    pub fn push_sync(&self, response: SyncResponse) {
+        self.state().syncs.push_back(response);
+    }
+
+    /// The server knows `txid`, as if it had been mined by someone else.
+    pub fn know(&self, txid: Txid) {
+        self.state().known.insert(txid);
+    }
+
+    /// Every transaction handed to `broadcast`, in order, repeats included.
+    pub fn broadcasts(&self) -> Vec<Transaction> {
+        self.state().broadcasts.clone()
+    }
+
+    /// How many scans and syncs were asked for.
+    pub fn scans_made(&self) -> usize {
+        self.state().scans_made
+    }
+}
+
+#[async_trait]
+impl ChainClient for FakeChain {
+    async fn full_scan(
+        &self,
+        _request: FullScanRequest<KeychainKind>,
+        _stop_gap: usize,
+    ) -> Result<FullScanResponse<KeychainKind>> {
+        self.check_online()?;
+        let mut state = self.state();
+        state.scans_made += 1;
+        Ok(state.full_scans.pop_front().unwrap_or_default())
+    }
+
+    async fn sync(&self, _request: SyncRequest<(KeychainKind, u32)>) -> Result<SyncResponse> {
+        self.check_online()?;
+        let mut state = self.state();
+        state.scans_made += 1;
+        Ok(state.syncs.pop_front().unwrap_or_default())
+    }
+
+    async fn broadcast(&self, tx: &Transaction) -> Result<()> {
+        self.check_online()?;
+        let mut state = self.state();
+        state.broadcasts.push(tx.clone());
+        state.known.insert(tx.compute_txid());
+        Ok(())
+    }
+
+    async fn fee_rate_sat_vb(&self, _target_blocks: u16) -> Result<Option<f64>> {
+        self.check_online()?;
+        Ok(self.state().fee_rate)
+    }
+
+    async fn tx_seen(&self, txid: Txid) -> Result<bool> {
+        self.check_online()?;
+        Ok(self.state().known.contains(&txid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::{absolute::LockTime, transaction::Version};
+
+    use super::*;
+
+    fn tx() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fake_remembers_broadcasts_and_goes_offline() {
+        let chain = FakeChain::new();
+        let tx = tx();
+        assert!(!chain.tx_seen(tx.compute_txid()).await.unwrap());
+        chain.broadcast(&tx).await.unwrap();
+        chain.broadcast(&tx).await.unwrap();
+        assert!(chain.tx_seen(tx.compute_txid()).await.unwrap());
+        assert_eq!(chain.broadcasts().len(), 2);
+        chain.set_fee_rate(Some(3.0));
+        assert_eq!(chain.fee_rate_sat_vb(6).await.unwrap(), Some(3.0));
+        chain.set_offline(true);
+        assert_eq!(chain.fee_rate_sat_vb(6).await, Err(FedimixError::Offline));
+        assert_eq!(chain.broadcast(&tx).await, Err(FedimixError::Offline));
+    }
+}

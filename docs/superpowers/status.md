@@ -5,7 +5,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## What works (commands run in `nix develop`)
 - `just run [--data-dir PATH] [--network bitcoin|signet|regtest]`: the real wallet. `just demo`: the complete UI over the demo backend.
 - `just clippy`, `just fmt`, `just test` (includes `tests/real_backend.rs` over a fake port).
-- `just test-integration`: devimint, both module sets, 26 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
+- `just test-integration`: devimint, both module sets, 29 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
 - `just test-real-ui`: the real binary through Join, Lightning receive and send, restart, lock, wrong network, under headless sway.
 - `just interact-demo`, `just screenshot-all`: scripted demo flows and screenshots at 480 and 360 px.
 - `nix build` / `just build-nix`: wrapped release binary plus flake checks. Release build from clean: 7 min 16 s, 88 MiB, 64 MiB stripped.
@@ -20,7 +20,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Task 1 done: the Saving dependencies (bdk_wallet, bdk_esplora, bdk_electrum, async-hwi, rusqlite 0.31; udev and hidapi in the nix build), the per-network chain server default (M14), N1-N3, and Settings shows each federation's invite with Copy. Next: Task 2 of the Phase 3 plan. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause (a shot outlasting a 300 ms state) is from reading.
+Phase 3 (Saving, hardware wallet), Tasks 1-2 done: the dependencies and Phase 2 residuals, and chain access (`saving::ChainClient` over Esplora or Electrum, through a SOCKS5 proxy that fails closed; `FakeChain` under `testing`; devimint tests for equal balances, double broadcast and the closed proxy). Next: Task 3 of the Phase 3 plan, the watch-only wallet. Open from the Phase 2 re-review: O1-O4 and N8 (accepted). Flow 03 now runs each operation state for 3 s (`# step-ms:` header, `--demo-step-ms`); the flake was never reproduced here, so the cause (a shot outlasting a 300 ms state) is from reading.
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.

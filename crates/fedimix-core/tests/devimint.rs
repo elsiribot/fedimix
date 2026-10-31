@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bitcoin::hashes::Hash as _;
 use fedimint_bip39::Bip39RootSecretStrategy;
 use fedimint_client::secret::RootSecretStrategy;
 use fedimint_client::{Client, RootSecret};
@@ -15,12 +16,12 @@ use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
 use fedimix_core::testing::{
     DataDirLock, DepositEvent, FederationClient, FederationPort, FedimintPort, Seed, SendHalt,
-    Watch, WatchKind, WatchUpdate, halt_sends,
+    Watch, WatchKind, WatchUpdate, connect_chain, halt_sends,
 };
 use fedimix_core::{
-    Amount, Backend, CoreConfig, Event, EventStream, FedimixError, HistoryItem, HistoryStatus,
-    Network, Notice, OperationState, RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest,
-    SendAmount, SendPreview, SendRequest, WalletKind,
+    Amount, Backend, ChainBackend, CoreConfig, Event, EventStream, FedimixError, HistoryItem,
+    HistoryStatus, Network, Notice, OperationState, RealBackend, ReceiveInfo, ReceiveMethod,
+    ReceiveRequest, SendAmount, SendPreview, SendRequest, WalletKind,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -1426,4 +1427,174 @@ async fn killed_after_submit_resumes() {
     assert_eq!(credited.count(), 1, "the payee was paid once: {received:?}");
     payee.shutdown().await.unwrap();
     payer.shutdown().await.unwrap();
+}
+
+// Chain access (Saving). The wallets here are watch-only descriptors made in
+// the test; nothing touches the federation.
+
+fn esplora() -> ChainBackend {
+    let port = std::env::var("FM_PORT_ESPLORA").expect("devimint exports FM_PORT_ESPLORA");
+    ChainBackend::Esplora {
+        url: format!("http://127.0.0.1:{port}"),
+    }
+}
+
+fn electrum() -> ChainBackend {
+    let port = std::env::var("FM_PORT_ESPLORA_ELECTRUM")
+        .expect("devimint exports FM_PORT_ESPLORA_ELECTRUM");
+    ChainBackend::Electrum {
+        url: format!("tcp://127.0.0.1:{port}"),
+    }
+}
+
+/// Descriptors for a key of its own, so each test sees only what it funded.
+fn new_descriptors() -> (String, String) {
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    let key = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Regtest, &seed).unwrap();
+    (
+        format!("wpkh({key}/84h/1h/0h/0/*)"),
+        format!("wpkh({key}/84h/1h/0h/1/*)"),
+    )
+}
+
+fn wallet_of((external, internal): &(String, String)) -> bdk_wallet::Wallet {
+    bdk_wallet::Wallet::create(external.clone(), internal.clone())
+        .network(bitcoin::Network::Regtest)
+        .create_wallet_no_persist()
+        .unwrap()
+}
+
+/// A transaction paying `sat` to a new address of bitcoind's wallet, signed
+/// and not broadcast.
+fn unbroadcast_tx(sat: u64) -> bitcoin::Transaction {
+    let address = btc("getnewaddress");
+    let raw = btc(&format!(
+        "createrawtransaction '[]' '[{{\"{address}\":{}.{:08}}}]'",
+        sat / 100_000_000,
+        sat % 100_000_000
+    ));
+    let funded: serde_json::Value =
+        serde_json::from_str(&btc(&format!("fundrawtransaction {raw}"))).unwrap();
+    let signed: serde_json::Value = serde_json::from_str(&btc(&format!(
+        "signrawtransactionwithwallet {}",
+        funded["hex"].as_str().unwrap()
+    )))
+    .unwrap();
+    let bytes: Vec<u8> = bitcoin::hex::FromHex::from_hex(signed["hex"].as_str().unwrap()).unwrap();
+    bitcoin::consensus::deserialize(&bytes).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn esplora_and_electrum_see_the_same_balance() {
+    let descriptors = new_descriptors();
+    let funded = wallet_of(&descriptors);
+    // One address near the start and one far past the usual gap of a small
+    // scan, so a server that scans short shows as a lower balance.
+    for (index, sat) in [(3u32, 40_000u64), (30, 25_000)] {
+        let address = funded
+            .peek_address(bdk_wallet::KeychainKind::External, index)
+            .address;
+        fund(&address.to_string(), sat);
+    }
+    mine(1);
+    let mut totals = Vec::new();
+    for chain in [esplora(), electrum()] {
+        let client = connect_chain(&chain, None).unwrap();
+        let mut wallet = wallet_of(&descriptors);
+        // The indexer needs a moment to see the block.
+        let found = tokio::time::timeout(PATIENCE, async {
+            loop {
+                let response = client
+                    .full_scan(wallet.start_full_scan().build(), 50)
+                    .await
+                    .unwrap();
+                if response.tx_update.txs.len() == 2 {
+                    return response;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("the chain server sees both funding transactions");
+        wallet.apply_update(found).unwrap();
+        totals.push(wallet.balance().total().to_sat());
+    }
+    assert_eq!(totals, [65_000, 65_000]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn broadcasting_twice_is_ok() {
+    for chain in [esplora(), electrum()] {
+        let client = connect_chain(&chain, None).unwrap();
+        let tx = unbroadcast_tx(30_000);
+        let txid = tx.compute_txid();
+        assert!(!client.tx_seen(txid).await.unwrap(), "{chain:?}: not yet");
+        client.broadcast(&tx).await.unwrap();
+        // Again in the mempool, then again in a block.
+        client.broadcast(&tx).await.unwrap();
+        mine(1);
+        client.broadcast(&tx).await.unwrap();
+        tokio::time::timeout(PATIENCE, async {
+            while !client.tx_seen(txid).await.unwrap() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{chain:?}: the broadcast transaction is seen"));
+        // A rate is a positive number or unknown; regtest has none.
+        if let Some(rate) = client.fee_rate_sat_vb(6).await.unwrap() {
+            assert!(rate > 0.0);
+        }
+    }
+}
+
+/// With the proxy closed, a request fails and nothing reaches the server
+/// directly. A listener stands in for the chain server and counts connections.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn proxy_down_fails_closed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server_port = server.local_addr().unwrap().port();
+    server.set_nonblocking(true).unwrap();
+    let closed_port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    for (chain, proxy) in [
+        (
+            ChainBackend::Esplora {
+                url: format!("http://127.0.0.1:{server_port}"),
+            },
+            format!("socks5h://127.0.0.1:{closed_port}"),
+        ),
+        (
+            ChainBackend::Electrum {
+                url: format!("tcp://127.0.0.1:{server_port}"),
+            },
+            format!("127.0.0.1:{closed_port}"),
+        ),
+    ] {
+        let client = connect_chain(&chain, Some(&proxy)).unwrap();
+        let wallet = wallet_of(&new_descriptors());
+        let scan = client.full_scan(wallet.start_full_scan().build(), 5).await;
+        assert!(scan.is_err(), "{chain:?}: a scan with no proxy must fail");
+        let sync = client
+            .sync(wallet.start_sync_with_revealed_spks().build())
+            .await;
+        assert!(sync.is_err(), "{chain:?}: a sync with no proxy must fail");
+        assert!(client.tx_seen(bitcoin::Txid::all_zeros()).await.is_err());
+        assert!(client.fee_rate_sat_vb(6).await.is_err());
+        let tx = unbroadcast_tx(30_000);
+        assert!(client.broadcast(&tx).await.is_err());
+        assert!(matches!(scan.err(), Some(FedimixError::Offline)));
+    }
+    let connections = AtomicUsize::new(0);
+    while server.accept().is_ok() {
+        connections.fetch_add(1, Ordering::SeqCst);
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 0, "a direct connection");
 }
