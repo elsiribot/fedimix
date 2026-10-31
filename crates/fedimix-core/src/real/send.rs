@@ -261,6 +261,7 @@ impl Core {
             timestamp: now,
             txid: None,
             fee: Some(quote.fee()),
+            session: None,
         };
         let watch = Watch {
             id: intent.clone(),

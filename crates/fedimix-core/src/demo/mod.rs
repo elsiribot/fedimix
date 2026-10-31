@@ -415,6 +415,7 @@ impl State {
             timestamp: BASE_TS,
             txid: None,
             fee: None,
+            session: None,
         }
     }
 
@@ -1141,14 +1142,16 @@ impl Backend for DemoBackend {
         let st = &mut *guard;
         let (_, preview) = take_preview(&mut st.exits, &st.cancelled, &preview_id)?;
         st.check_online()?;
-        let txid = fixtures::outpoint_for(st.next_coin_index());
         let item = st
             .queue
             .iter_mut()
             .find(|i| i.id == preview.item_id)
             .filter(|i| !matches!(i.status, QueueItemStatus::Withdrawing { .. }))
             .ok_or_else(|| FedimixError::UnknownItem(preview.item_id.clone()))?;
-        let restore = std::mem::replace(&mut item.status, QueueItemStatus::Withdrawing { txid });
+        let restore = std::mem::replace(
+            &mut item.status,
+            QueueItemStatus::Withdrawing { txid: None },
+        );
         let id = self.start(
             st,
             preview_id,

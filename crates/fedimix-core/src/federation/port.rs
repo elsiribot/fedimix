@@ -160,6 +160,8 @@ pub trait FederationClient: Send + Sync {
     /// each change.
     fn online_changes(&self) -> BoxStream<'static, bool>;
     async fn notes(&self) -> Result<Vec<NoteBucket>>;
+    /// How many consensus sessions the federation has finished.
+    async fn session_count(&self) -> Result<u64>;
     /// A deposit at or below this is never credited. Exceeding it is necessary
     /// but not sufficient: the fee moves with the feerate on v2, and the claim
     /// also pays the ecash fee.

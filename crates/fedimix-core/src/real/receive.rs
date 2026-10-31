@@ -60,6 +60,7 @@ fn incoming(
         timestamp: at,
         txid: None,
         fee: None,
+        session: None,
     }
 }
 
@@ -218,9 +219,34 @@ impl Core {
         Ok(())
     }
 
+    /// The session count to keep on a settled deposit. A replay keeps the first
+    /// answer. A failed read leaves it unset, as a deposit must settle anyway.
+    async fn deposit_session(
+        &self,
+        client: &dyn FederationClient,
+        federation: &str,
+        id: &str,
+    ) -> Option<u64> {
+        let row = self
+            .store()
+            .history_item(WalletKind::Spending, Some(federation), id);
+        if let Ok(Some(HistoryItem {
+            session: Some(session),
+            ..
+        })) = row
+        {
+            return Some(session);
+        }
+        client
+            .session_count()
+            .await
+            .inspect_err(|e| eprintln!("fedimix: reading the session count of {federation}: {e}"))
+            .ok()
+    }
+
     /// Writes what `update` says about `watch`, and ends the watch if it is
     /// final. The row comes first, so a crash between the two replays.
-    fn apply(&self, watch: &Watch, update: &WatchUpdate) -> Result<()> {
+    fn apply(&self, watch: &Watch, update: &WatchUpdate, session: Option<u64>) -> Result<()> {
         if is_send(watch.kind) {
             return self.apply_send(watch, update);
         }
@@ -245,6 +271,7 @@ impl Core {
             WatchUpdate::Settled { amount, fee, txid } => Some(HistoryItem {
                 fee: paid_fee(*fee),
                 txid: txid.clone(),
+                session,
                 ..incoming(&watch.id, kind, *amount, HistoryStatus::Complete, now)
             }),
             // These name no amount, so they can only update a row. A deposit
@@ -361,9 +388,10 @@ impl Core {
             Ok(cursor) => {
                 let events = client.deposits(cursor.unwrap_or(0));
                 let federation = federation.to_string();
-                watches
-                    .tasks
-                    .spawn(async move { follow_deposits(&core, &federation, events).await });
+                let client = Arc::clone(client);
+                watches.tasks.spawn(async move {
+                    follow_deposits(&core, &*client, &federation, events).await;
+                });
             }
             Err(e) => eprintln!("fedimix: reading the deposits of federation {federation}: {e}"),
         }
@@ -393,8 +421,9 @@ impl Watches {
         self.started.insert(watch.id.clone());
         let updates = self.client.watch(followed);
         let core = Arc::clone(&self.core);
+        let client = Arc::clone(&self.client);
         self.tasks
-            .spawn(async move { follow(&core, &watch, updates).await });
+            .spawn(async move { follow(&core, &*client, &watch, updates).await });
     }
 
     /// Settles what a crash left of sends with no operation. Runs each time the
@@ -426,9 +455,21 @@ impl Watches {
 }
 
 /// A failed write leaves the watch unfinished, for the next connection.
-async fn follow(core: &Core, watch: &Watch, mut updates: BoxStream<'static, WatchUpdate>) {
+async fn follow(
+    core: &Core,
+    client: &dyn FederationClient,
+    watch: &Watch,
+    mut updates: BoxStream<'static, WatchUpdate>,
+) {
     while let Some(update) = updates.next().await {
-        if let Err(e) = core.apply(watch, &update) {
+        let settled = matches!(update, WatchUpdate::Settled { .. });
+        let session = if settled && watch.kind == WatchKind::Deposit {
+            core.deposit_session(client, &watch.federation_id, &watch.id)
+                .await
+        } else {
+            None
+        };
+        if let Err(e) = core.apply(watch, &update, session) {
             eprintln!("fedimix: saving the progress of {}: {e}", watch.id);
             return;
         }
@@ -439,6 +480,7 @@ async fn follow(core: &Core, watch: &Watch, mut updates: BoxStream<'static, Watc
 /// comes before the cursor, so a crash between the two reads the event again.
 async fn follow_deposits(
     core: &Core,
+    client: &dyn FederationClient,
     federation: &str,
     mut events: BoxStream<'static, DepositEvent>,
 ) {
@@ -448,9 +490,15 @@ async fn follow_deposits(
         } else {
             HistoryStatus::Pending
         };
+        let session = if event.confirmed {
+            core.deposit_session(client, federation, &event.id).await
+        } else {
+            None
+        };
         let item = HistoryItem {
             fee: paid_fee(event.fee),
             txid: event.txid,
+            session,
             ..incoming(
                 &event.id,
                 HistoryKind::Deposit,

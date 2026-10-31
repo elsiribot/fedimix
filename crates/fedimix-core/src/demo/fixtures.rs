@@ -104,6 +104,7 @@ fn hist(
         timestamp: BASE_TS - age_secs,
         txid: on_chain.then(|| format!("{age_secs:064x}")),
         fee: on_chain.then_some(Amount::from_sat(300)),
+        session: None,
     }
 }
 
@@ -268,9 +269,7 @@ fn exit_deferred() -> Fixture {
             queue_item(
                 5,
                 0.002,
-                QueueItemStatus::Withdrawing {
-                    txid: outpoint_for(50),
-                },
+                QueueItemStatus::Withdrawing { txid: None },
                 71,
                 71,
             ),
@@ -368,6 +367,7 @@ fn long_history_rows(prefix: &str, spending: bool) -> Vec<HistoryItem> {
                 timestamp: BASE_TS - (n as u64 + 1) * 5 * HOUR,
                 txid: None,
                 fee: None,
+                session: None,
             }
         })
         .collect()

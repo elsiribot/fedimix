@@ -270,6 +270,7 @@ impl Core {
             invite: invite.to_string(),
             online_at: Some((self.clock)()),
             balance_msat: balance.msat,
+            joined_session: None,
         }
     }
 
@@ -302,7 +303,15 @@ impl Core {
         // A client database from an earlier join can already hold money.
         let balance = client.balance().await.unwrap_or(Amount::ZERO);
         let id = client.id();
-        let row = self.new_row(&id, preview.name, invite, balance);
+        let joined_session = client
+            .session_count()
+            .await
+            .inspect_err(|e| eprintln!("fedimix: reading the session count of {id}: {e}"))
+            .ok();
+        let row = FederationRow {
+            joined_session,
+            ..self.new_row(&id, preview.name, invite, balance)
+        };
         let added = self.store().add_federation(&row);
         if let Err(e) = added {
             let _ = client.shutdown().await;

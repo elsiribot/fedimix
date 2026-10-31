@@ -77,6 +77,7 @@ pub struct FakeClient {
     lightning_fee: Mutex<Amount>,
     withdraw_fee: Mutex<Amount>,
     receive_fee: Mutex<Option<Amount>>,
+    session_count: Mutex<Result<u64>>,
     /// Next results of these calls; empty means the call works.
     invoice_errors: Mutex<VecDeque<FedimixError>>,
     quote_errors: Mutex<VecDeque<FedimixError>>,
@@ -122,6 +123,7 @@ impl FakeClient {
             lightning_fee: Mutex::new(Amount::from_sat(10)),
             withdraw_fee: Mutex::new(Amount::from_sat(300)),
             receive_fee: Mutex::new(None),
+            session_count: Mutex::new(Ok(0)),
             invoice_errors: Mutex::default(),
             quote_errors: Mutex::default(),
             pay_errors: Mutex::default(),
@@ -173,6 +175,10 @@ impl FakeClient {
 
     pub fn set_withdraw_fee(&self, fee: Amount) {
         *self.withdraw_fee.lock().unwrap() = fee;
+    }
+
+    pub fn set_session_count(&self, count: Result<u64>) {
+        *self.session_count.lock().unwrap() = count;
     }
 
     pub fn set_receive_fee(&self, fee: Option<Amount>) {
@@ -340,6 +346,10 @@ impl FederationClient for FakeClient {
 
     async fn notes(&self) -> Result<Vec<NoteBucket>> {
         Ok(self.notes.lock().unwrap().clone())
+    }
+
+    async fn session_count(&self) -> Result<u64> {
+        self.session_count.lock().unwrap().clone()
     }
 
     async fn min_deposit(&self) -> Result<Amount> {

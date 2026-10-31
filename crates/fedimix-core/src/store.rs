@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::api::{HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind};
 use crate::error::{FedimixError, Result};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -20,7 +20,8 @@ CREATE TABLE federations (
     online_at INTEGER,
     balance_msat INTEGER NOT NULL,
     active INTEGER NOT NULL DEFAULT 0,
-    position INTEGER NOT NULL
+    position INTEGER NOT NULL,
+    joined_session INTEGER
 );
 CREATE TABLE history (
     wallet TEXT NOT NULL,
@@ -78,6 +79,9 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
         1 => tx
             .execute_batch("ALTER TABLE watches ADD COLUMN operation TEXT;")
             .map_err(db_err),
+        2 => tx
+            .execute_batch("ALTER TABLE federations ADD COLUMN joined_session INTEGER;")
+            .map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -92,6 +96,8 @@ pub(crate) struct FederationRow {
     pub online_at: Option<Timestamp>,
     /// Last known balance, shown while offline.
     pub balance_msat: u64,
+    /// The federation's session count at the join, if it could be read.
+    pub joined_session: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,7 +340,8 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, invite, online_at, balance_msat FROM federations ORDER BY position",
+                "SELECT id, name, invite, online_at, balance_msat, joined_session
+                 FROM federations ORDER BY position",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -345,6 +352,7 @@ impl Store {
                     invite: r.get(2)?,
                     online_at: r.get::<_, Option<i64>>(3)?.map(from_db),
                     balance_msat: from_db(r.get(4)?),
+                    joined_session: r.get::<_, Option<i64>>(5)?.map(from_db),
                 })
             })
             .map_err(db_err)?;
@@ -356,19 +364,22 @@ impl Store {
     pub(crate) fn add_federation(&self, row: &FederationRow) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO federations (id, name, invite, online_at, balance_msat, position, active)
-                 VALUES (?1, ?2, ?3, ?4, ?5,
+                "INSERT INTO federations
+                    (id, name, invite, online_at, balance_msat, joined_session, position, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                     (SELECT COALESCE(MAX(position), 0) + 1 FROM federations),
                     NOT EXISTS (SELECT 1 FROM federations WHERE active = 1))
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, invite = excluded.invite,
-                    online_at = excluded.online_at, balance_msat = excluded.balance_msat",
+                    online_at = excluded.online_at, balance_msat = excluded.balance_msat,
+                    joined_session = COALESCE(joined_session, excluded.joined_session)",
                 params![
                     row.id,
                     row.name,
                     row.invite,
                     row.online_at.map(to_db),
-                    to_db(row.balance_msat)
+                    to_db(row.balance_msat),
+                    row.joined_session.map(to_db)
                 ],
             )
             .map_err(db_err)?;
@@ -757,6 +768,7 @@ mod tests {
             timestamp,
             txid: None,
             fee: None,
+            session: None,
         }
     }
 
@@ -793,6 +805,7 @@ mod tests {
                     invite: "fed1abc".into(),
                     online_at: Some(5),
                     balance_msat: 2_100_000_000_000_000_000,
+                    joined_session: None,
                 })
                 .unwrap();
             store.set_active("f1").unwrap();
@@ -1125,6 +1138,7 @@ mod tests {
                 .conn
                 .execute_batch(
                     "ALTER TABLE watches DROP COLUMN operation;
+                     ALTER TABLE federations DROP COLUMN joined_session;
                      UPDATE schema_version SET version = 1;",
                 )
                 .unwrap();
@@ -1133,6 +1147,25 @@ mod tests {
         assert_eq!(store.watches().unwrap(), vec![watch]);
         store.set_operation("w", "op").unwrap();
         assert_eq!(store.operation_of("w"), Ok(Some("op".into())));
+    }
+
+    #[test]
+    fn a_version_2_database_gains_the_joined_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.add_federation(&federation("f")).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE federations DROP COLUMN joined_session;
+                     UPDATE schema_version SET version = 2;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.federations().unwrap()[0].joined_session, None);
     }
 
     #[test]
@@ -1183,6 +1216,7 @@ mod tests {
             invite: "fed1".into(),
             online_at: None,
             balance_msat: 0,
+            joined_session: None,
         }
     }
 

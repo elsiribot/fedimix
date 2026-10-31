@@ -2396,6 +2396,95 @@ async fn a_deposit_row_keeps_its_fee_and_txid() {
     backend.shutdown().await.unwrap();
 }
 
+fn joined_session(harness: &Harness) -> Option<i64> {
+    raw_store(harness)
+        .query_row("SELECT joined_session FROM federations", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_join_records_the_session_count() {
+    let harness = Harness::new();
+    harness.first.set_session_count(Ok(41));
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    assert_eq!(joined_session(&harness), Some(41));
+}
+
+#[tokio::test]
+async fn a_join_survives_an_unreadable_session_count() {
+    let harness = Harness::new();
+    harness.first.set_session_count(Err(FedimixError::Offline));
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    assert_eq!(joined_session(&harness), None);
+}
+
+#[tokio::test]
+async fn a_settled_deposit_records_the_session_count_once() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    harness.first.set_session_count(Ok(50));
+    let backend = harness.joined().await;
+    harness.first.push_deposit(deposit_event(1, "first", false));
+    wait_status(&*backend, "first", HistoryStatus::Pending).await;
+    assert_eq!(row_of(&rows(&*backend).await, "first").session, None);
+
+    harness.first.push_deposit(deposit_event(2, "first", true));
+    wait_status(&*backend, "first", HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, "first").session, Some(50));
+
+    // A replay of the same deposit keeps the first answer.
+    harness.first.set_session_count(Ok(60));
+    harness.first.push_deposit(deposit_event(3, "first", true));
+    harness.first.push_deposit(deposit_event(4, "second", true));
+    wait_status(&*backend, "second", HistoryStatus::Complete).await;
+    let rows = rows(&*backend).await;
+    assert_eq!(row_of(&rows, "first").session, Some(50));
+    assert_eq!(row_of(&rows, "second").session, Some(60));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deposit_watch_records_the_session_count() {
+    let harness = Harness::new();
+    harness.first.set_session_count(Ok(70));
+    let backend = harness.joined().await;
+    let info = backend
+        .receive(ReceiveRequest {
+            wallet: WalletKind::Spending,
+            method: ReceiveMethod::OnChain,
+        })
+        .await
+        .unwrap();
+    let id = watch_id(&info.payload).to_string();
+    harness.first.push_update(
+        &id,
+        WatchUpdate::Settled {
+            amount: sat(40_000),
+            fee: sat(100),
+            txid: Some("txid".into()),
+        },
+    );
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, &id).session, Some(70));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deposit_settles_with_an_unreadable_session_count() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    harness.first.set_session_count(Err(FedimixError::Offline));
+    let backend = harness.joined().await;
+    harness.first.push_deposit(deposit_event(1, "first", true));
+    wait_status(&*backend, "first", HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, "first").session, None);
+    backend.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_higher_fee_at_confirm_expires_the_preview() {
     let harness = Harness::new();

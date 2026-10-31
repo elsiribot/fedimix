@@ -774,6 +774,7 @@ mod tests {
             timestamp: 1_793_356_920,
             txid: None,
             fee: None,
+            session: None,
         }
     }
 
@@ -963,7 +964,7 @@ mod tests {
             assert!(exit_allowed(&allowed), "{allowed:?}");
         }
         for refused in [
-            QueueItemStatus::Withdrawing { txid: "t".into() },
+            QueueItemStatus::Withdrawing { txid: None },
             QueueItemStatus::Landed,
             deferred(Offline),
             deferred(FeeUnaffordable),

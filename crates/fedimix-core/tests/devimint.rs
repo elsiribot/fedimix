@@ -865,6 +865,8 @@ async fn receive_onchain_end_to_end() {
     fund(&info.payload, DEPOSIT_SAT);
     let row = mine_until_received(&backend, &events).await;
     assert!(row.amount < Amount::from_sat(DEPOSIT_SAT), "{row:?}");
+    assert!(row.session.is_some(), "{row:?}");
+    assert!(row.txid.is_some(), "{row:?}");
     let balance = wait_balance(&backend, |balance| balance > Amount::ZERO).await;
     assert!(balance <= row.amount, "{balance:?} {row:?}");
     backend.shutdown().await.unwrap();

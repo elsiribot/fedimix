@@ -204,6 +204,10 @@ pub struct HistoryItem {
     /// What this cost on top of `amount`, or took from it when incoming.
     #[serde(default)]
     pub fee: Option<Amount>,
+    /// The federation's session count when a deposit settled, for the
+    /// anonymity count of later phases. `None` if it could not be read.
+    #[serde(default)]
+    pub session: Option<u64>,
 }
 
 /// One page of history, newest first.
@@ -295,8 +299,9 @@ pub enum QueueItemStatus {
     Deferred {
         reason: DeferReason,
     },
+    /// Fedimint reports the txid only once the withdrawal has succeeded.
     Withdrawing {
-        txid: String,
+        txid: Option<String>,
     },
     Landed,
 }
@@ -587,13 +592,17 @@ mod tests {
             timestamp: 1,
             txid: Some("t".into()),
             fee: Some(Amount::from_sat(1)),
+            session: Some(1),
         };
         let mut old = serde_json::to_value(&item).unwrap();
-        for field in ["txid", "fee"] {
+        for field in ["txid", "fee", "session"] {
             old.as_object_mut().unwrap().remove(field);
         }
         let loaded: HistoryItem = serde_json::from_value(old).unwrap();
-        assert_eq!((loaded.txid, loaded.fee), (None, None));
+        assert_eq!(
+            (loaded.txid, loaded.fee, loaded.session),
+            (None, None, None)
+        );
     }
 
     #[test]

@@ -682,6 +682,13 @@ impl FederationClient for FedimintClient {
         Mint::of(&client)?.notes(&client).await
     }
 
+    async fn session_count(&self) -> Result<u64> {
+        let client = self.client()?;
+        read(client.api().session_count())
+            .await?
+            .map_err(|_| FedimixError::Offline)
+    }
+
     async fn min_deposit(&self) -> Result<Amount> {
         let client = self.client()?;
         OnChain::of(&client)?.min_deposit().await
