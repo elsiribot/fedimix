@@ -43,7 +43,7 @@ pub mod testing {
         LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
     #[cfg(feature = "testing")]
-    pub use crate::real::Clock;
+    pub use crate::real::{Clock, SendHalt, halt_sends};
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 

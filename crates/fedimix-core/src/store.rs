@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::api::{HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind};
 use crate::error::{FedimixError, Result};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -36,7 +36,8 @@ CREATE TABLE watches (
     federation_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    finished INTEGER NOT NULL DEFAULT 0
+    finished INTEGER NOT NULL DEFAULT 0,
+    operation TEXT
 );
 CREATE TABLE cursors (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -71,12 +72,16 @@ fn wallet_name(w: WalletKind) -> &'static str {
     }
 }
 
-/// Upgrades the database from `from` to `from + 1`. Version 1 is the first,
-/// so there is none yet.
-fn migrate_step(_tx: &Transaction<'_>, from: i64) -> Result<()> {
-    Err(FedimixError::Internal(format!(
-        "Fedimix cannot upgrade its database from version {from}."
-    )))
+/// Upgrades the database from `from` to `from + 1`.
+fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
+    match from {
+        1 => tx
+            .execute_batch("ALTER TABLE watches ADD COLUMN operation TEXT;")
+            .map_err(db_err),
+        _ => Err(FedimixError::Internal(format!(
+            "Fedimix cannot upgrade its database from version {from}."
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,7 +123,9 @@ impl WatchKind {
     }
 }
 
-/// An operation to follow until it settles, kept across restarts.
+/// An operation to follow until it settles, kept across restarts. A send's id
+/// is its intent, which exists before the payment does: the store keeps the
+/// operation it became beside it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Watch {
     pub id: String,
@@ -582,7 +589,7 @@ impl Store {
 
     /// A Spending row and the watch that will finish it, in one write: a crash
     /// must not leave a row nothing will ever update.
-    pub(crate) fn add_receive(&self, item: &HistoryItem, watch: &Watch) -> Result<()> {
+    pub(crate) fn add_tracked(&self, item: &HistoryItem, watch: &Watch) -> Result<()> {
         let tx = begin(&self.conn)?;
         upsert_in(&tx, WalletKind::Spending, &watch.federation_id, item)?;
         insert_watch(&tx, watch)?;
@@ -622,6 +629,51 @@ impl Store {
             .execute("UPDATE watches SET finished = 1 WHERE id = ?1", [id])
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Sends not yet finished, oldest first, each with its operation once known.
+    pub(crate) fn sends(&self) -> Result<Vec<(Watch, Option<String>)>> {
+        let mut out = Vec::new();
+        for watch in self.watches()? {
+            if matches!(watch.kind, WatchKind::LnSend | WatchKind::Withdraw) {
+                let operation = self.operation_of(&watch.id)?;
+                out.push((watch, operation));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What intent `id` became, if that is known yet.
+    pub(crate) fn operation_of(&self, id: &str) -> Result<Option<String>> {
+        let operation = self
+            .conn
+            .query_row("SELECT operation FROM watches WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_err)?;
+        Ok(operation.flatten())
+    }
+
+    pub(crate) fn set_operation(&self, id: &str, operation: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE watches SET operation = ?2 WHERE id = ?1",
+                [id, operation],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Whether `id` is a send, running or finished.
+    pub(crate) fn is_send(&self, id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM watches WHERE id = ?1 AND kind IN (?2, ?3))",
+                [id, WatchKind::LnSend.as_str(), WatchKind::Withdraw.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
     }
 
     /// Ties the data folder to `network` on first use. Later uses must name
@@ -973,7 +1025,7 @@ mod tests {
             kind: WatchKind::LnReceive,
             created_at: 1,
         };
-        store.add_receive(&item("a", 1), &watch).unwrap();
+        store.add_tracked(&item("a", 1), &watch).unwrap();
         assert_eq!(store.watches().unwrap(), vec![watch.clone()]);
         assert!(
             store
@@ -992,12 +1044,70 @@ mod tests {
             id: "b".into(),
             ..watch
         };
-        assert!(store.add_receive(&item("b", 2), &second).is_err());
+        assert!(store.add_tracked(&item("b", 2), &second).is_err());
         assert_eq!(
             store.history_item(WalletKind::Spending, Some("f"), "b"),
             Ok(None),
             "no row without its watch"
         );
+    }
+
+    #[test]
+    fn a_send_keeps_its_operation_beside_its_intent() {
+        let (_d, store) = open();
+        let send = Watch {
+            id: "intent".into(),
+            federation_id: "f".into(),
+            kind: WatchKind::LnSend,
+            created_at: 1,
+        };
+        let receive = Watch {
+            id: "receive".into(),
+            kind: WatchKind::LnReceive,
+            ..send.clone()
+        };
+        store.add_tracked(&item("intent", 1), &send).unwrap();
+        store.add_tracked(&item("receive", 1), &receive).unwrap();
+        assert_eq!(store.sends().unwrap(), vec![(send.clone(), None)]);
+        store.set_operation("intent", "op").unwrap();
+        assert_eq!(
+            store.sends().unwrap(),
+            vec![(send.clone(), Some("op".to_string()))]
+        );
+        assert_eq!(store.operation_of("intent"), Ok(Some("op".into())));
+        assert_eq!(store.operation_of("nothing"), Ok(None));
+        store.finish_watch("intent").unwrap();
+        assert_eq!(store.sends().unwrap(), Vec::new());
+        assert_eq!(store.is_send("intent"), Ok(true), "also once finished");
+        assert_eq!(store.is_send("receive"), Ok(false));
+        assert_eq!(store.is_send("nothing"), Ok(false));
+    }
+
+    #[test]
+    fn a_version_1_database_gains_the_operation_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        let watch = Watch {
+            id: "w".into(),
+            federation_id: "f".into(),
+            kind: WatchKind::Deposit,
+            created_at: 1,
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            store.add_watch(&watch).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE watches DROP COLUMN operation;
+                     UPDATE schema_version SET version = 1;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.watches().unwrap(), vec![watch]);
+        store.set_operation("w", "op").unwrap();
+        assert_eq!(store.operation_of("w"), Ok(Some("op".into())));
     }
 
     #[test]

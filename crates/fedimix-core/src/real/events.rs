@@ -176,7 +176,12 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
                 None => return,
             },
             status = online.next() => match status {
-                Some(status) => forward_online(&core, &id, status),
+                Some(status) => {
+                    forward_online(&core, &id, status);
+                    if status {
+                        watches.resolve_unsent(&id);
+                    }
+                }
                 None => return,
             },
             () = watches.tend() => {}

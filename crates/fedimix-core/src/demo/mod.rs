@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::api::*;
 use crate::backend::Backend;
-use crate::destination::{DestinationKind, parse_destination};
+use crate::destination::{DestinationKind, parse_destination, requested_amount};
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream, Notice};
 
@@ -782,36 +782,6 @@ fn notify_later(senders: &Senders, notice: Notice) {
         tokio::time::sleep(NOTIFY_DELAY).await;
         broadcast(&senders, &Event::Notification(notice));
     });
-}
-
-/// The amount to send, given what the destination carries. `Max` stays
-/// unresolved here: it depends on the wallet's balance and fee.
-fn requested_amount(requested: SendAmount, carried: Option<Amount>) -> Result<SendAmount> {
-    let amount = match (requested, carried) {
-        (SendAmount::FromInvoice, Some(a)) => SendAmount::Exact(a),
-        (SendAmount::FromInvoice, None) => {
-            return Err(FedimixError::InvalidAmount(
-                "This destination has no amount: enter one".to_string(),
-            ));
-        }
-        (SendAmount::Exact(a), Some(b)) if a != b => {
-            return Err(FedimixError::InvalidAmount(
-                "This destination asks for a different amount".to_string(),
-            ));
-        }
-        (SendAmount::Max, Some(_)) => {
-            return Err(FedimixError::InvalidAmount(
-                "This destination has a fixed amount".to_string(),
-            ));
-        }
-        (other, _) => other,
-    };
-    if amount == SendAmount::Exact(Amount::ZERO) {
-        return Err(FedimixError::InvalidAmount(
-            "Amount must be above zero".to_string(),
-        ));
-    }
-    Ok(amount)
 }
 
 /// Resolve `Max` against `available`; `fee` comes off the top.

@@ -14,13 +14,13 @@ use fedimint_core::PeerId;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
 use fedimix_core::testing::{
-    DataDirLock, DepositEvent, FederationClient, FederationPort, FedimintPort, Seed, Watch,
-    WatchKind, WatchUpdate,
+    DataDirLock, DepositEvent, FederationClient, FederationPort, FedimintPort, Seed, SendHalt,
+    Watch, WatchKind, WatchUpdate, halt_sends,
 };
 use fedimix_core::{
     Amount, Backend, CoreConfig, Event, EventStream, FedimixError, HistoryItem, HistoryStatus,
-    Network, Notice, RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest, SendAmount,
-    WalletKind,
+    Network, Notice, OperationState, RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest,
+    SendAmount, SendPreview, SendRequest, WalletKind,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -968,4 +968,309 @@ async fn an_empty_client_database_counts_as_lost() {
     let client = wallet.port.recover(&invite(), &wallet.seed).await.unwrap();
     assert_eq!(client.balance().await.unwrap(), Amount::ZERO);
     client.shutdown().await.unwrap();
+}
+
+const CAME_BACK: &str = "The payment failed and the money came back.";
+/// A refund costs the ecash fees of the notes spent and issued.
+const REFUND_COST: Amount = Amount { msat: 100_000 };
+/// How many fresh invoices a payment to another wallet gets: a gateway can fail.
+const PAY_TRIES: u32 = 5;
+
+fn spending(destination: &str, amount: SendAmount) -> SendRequest {
+    SendRequest {
+        wallet: WalletKind::Spending,
+        destination: destination.to_string(),
+        amount,
+        fee_rate_sat_vb: None,
+    }
+}
+
+/// A connected backend holding about `sat`, received over Lightning.
+async fn funded_backend(config: &CoreConfig, sat: u64) -> Arc<RealBackend> {
+    let backend = joined_backend(config).await;
+    let events = backend.subscribe();
+    pay_backend_with_lnd(&backend, sat).await;
+    wait_received(&backend, &events).await;
+    wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    backend
+}
+
+async fn balance_of(backend: &RealBackend) -> Amount {
+    backend.spending_state().await.unwrap().balance
+}
+
+async fn pay_preview(backend: &RealBackend, invoice: &str) -> SendPreview {
+    let request = spending(invoice, SendAmount::FromInvoice);
+    backend.prepare_send(request).await.unwrap()
+}
+
+/// The final state of operation `id`, with the row it names.
+async fn final_state(events: &EventStream, id: &str) -> (OperationState, Option<String>) {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            match events.next().await {
+                Some(Event::Operation {
+                    id: seen,
+                    state,
+                    history_id,
+                    ..
+                }) if seen == id && state.is_final() => return (state, history_id),
+                Some(_) => {}
+                None => panic!("the events ended"),
+            }
+        }
+    })
+    .await
+    .expect("the operation reaches a final state")
+}
+
+fn came_back() -> OperationState {
+    OperationState::Failed {
+        error: FedimixError::Internal(CAME_BACK.into()),
+    }
+}
+
+/// The row of send `id`, once it is final.
+async fn final_row(backend: &RealBackend, id: &str) -> HistoryItem {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            let found = rows(backend).await.into_iter().find(|row| row.id == id);
+            let row = found.expect("a send keeps its row");
+            if !matches!(row.status, HistoryStatus::Pending) {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the row reaches a final status")
+}
+
+/// Waits until the balance has fallen from `before` by `spent`, within 1 sat.
+async fn wait_debited(backend: &RealBackend, before: Amount, spent: Amount) {
+    let wanted = before.saturating_sub(spent).as_sat();
+    let reached = tokio::time::timeout(PATIENCE, async {
+        while balance_of(backend).await.as_sat().abs_diff(wanted) > 1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let now = balance_of(backend).await;
+    assert!(
+        reached.is_ok(),
+        "from {before:?} by {spent:?}, and the balance is {now:?}"
+    );
+}
+
+async fn wait_restored(backend: &RealBackend, before: Amount) {
+    wait_balance(backend, |now| now >= before.saturating_sub(REFUND_COST)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn pay_lightning_end_to_end() {
+    let (_payer_dir, payer_config) = folder();
+    let payer = funded_backend(&payer_config, 20_000).await;
+    let (_payee_dir, payee_config) = folder();
+    let payee = joined_backend(&payee_config).await;
+    let payee_events = payee.subscribe();
+    let events = payer.subscribe();
+    let paid = Amount::from_sat(2_000);
+
+    let mut done = false;
+    for attempt in 1..=PAY_TRIES {
+        let bill = invoice(&payee, paid.as_sat()).await;
+        let before = balance_of(&payer).await;
+        let preview = pay_preview(&payer, &bill.payload).await;
+        assert_eq!(preview.amount, paid);
+        assert!(preview.fee > Amount::ZERO);
+        let id = payer.confirm_send(preview.id.clone()).await.unwrap();
+        assert_eq!(
+            payer.confirm_send(preview.id.clone()).await,
+            Err(FedimixError::UnknownItem(preview.id.clone()))
+        );
+        let (state, history_id) = final_state(&events, &id).await;
+        assert_eq!(history_id, Some(id.clone()));
+        let row = final_row(&payer, &id).await;
+        assert_eq!(row.amount, paid);
+        assert!(!row.incoming);
+        if state == came_back() {
+            eprintln!("REFUNDED on attempt {attempt}");
+            assert_eq!(row.status, HistoryStatus::Refunded);
+            wait_restored(&payer, before).await;
+            continue;
+        }
+        assert_eq!(state, OperationState::Done);
+        assert_eq!(row.status, HistoryStatus::Complete);
+        let shown = preview.amount.checked_add(preview.fee).unwrap();
+        wait_debited(&payer, before, shown).await;
+        done = true;
+        break;
+    }
+    assert!(done, "no attempt settled");
+    wait_received(&payee, &payee_events).await;
+    payee.shutdown().await.unwrap();
+    payer.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn lnd_invoice_ends_refunded_and_labelled() {
+    let (_dir, config) = folder();
+    let backend = funded_backend(&config, 20_000).await;
+    let events = backend.subscribe();
+    let before = balance_of(&backend).await;
+    let preview = pay_preview(&backend, &lnd_invoice(2_000)).await;
+    let id = backend.confirm_send(preview.id).await.unwrap();
+
+    let (state, history_id) = final_state(&events, &id).await;
+    assert_eq!(state, came_back());
+    assert_eq!(history_id, Some(id.clone()));
+    assert_eq!(
+        final_row(&backend, &id).await.status,
+        HistoryStatus::Refunded
+    );
+    wait_restored(&backend, before).await;
+    assert!(backend.operations().await.unwrap().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn paying_own_invoice_is_handled() {
+    let (_dir, config) = folder();
+    let backend = funded_backend(&config, 20_000).await;
+    let events = backend.subscribe();
+    let before = balance_of(&backend).await;
+    let bill = invoice(&backend, 2_000).await;
+    let preview = pay_preview(&backend, &bill.payload).await;
+    let id = backend.confirm_send(preview.id).await.unwrap();
+
+    let (state, history_id) = final_state(&events, &id).await;
+    assert_eq!(history_id, Some(id.clone()));
+    let row = final_row(&backend, &id).await;
+    eprintln!("own invoice ended {state:?}, row {:?}", row.status);
+    if state == OperationState::Done {
+        assert_eq!(row.status, HistoryStatus::Complete);
+    } else {
+        assert_eq!(state, came_back());
+        assert_eq!(row.status, HistoryStatus::Refunded);
+        wait_restored(&backend, before).await;
+    }
+    assert!(backend.operations().await.unwrap().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+/// What bitcoind's wallet received at `address`: sats and the transactions.
+fn received_at(address: &str) -> (u64, Vec<String>) {
+    let reply = btc(&format!(r#"listreceivedbyaddress 0 true true "{address}""#));
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let Some(entry) = reply.as_array().and_then(|entries| entries.first()) else {
+        return (0, Vec::new());
+    };
+    let sats = (entry["amount"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+    let txids = entry["txids"].as_array().unwrap();
+    (
+        sats,
+        txids
+            .iter()
+            .map(|txid| txid.as_str().unwrap().to_string())
+            .collect(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn withdraw_end_to_end() {
+    let (_dir, config) = folder();
+    let backend = funded_backend(&config, 100_000).await;
+    let events = backend.subscribe();
+    let sent = Amount::from_sat(50_000);
+    let recipient = btc("getnewaddress");
+    let before = balance_of(&backend).await;
+    let preview = backend
+        .prepare_send(spending(&recipient, SendAmount::Exact(sent)))
+        .await
+        .unwrap();
+    assert_eq!(preview.amount, sent);
+    assert!(preview.fee > Amount::ZERO);
+    let id = backend.confirm_send(preview.id.clone()).await.unwrap();
+
+    let (state, history_id) = final_state(&events, &id).await;
+    assert_eq!(state, OperationState::Done);
+    assert_eq!(history_id, Some(id.clone()));
+    let row = final_row(&backend, &id).await;
+    assert_eq!(row.status, HistoryStatus::Complete);
+    assert_eq!(row.amount, sent);
+    let shown = preview.amount.checked_add(preview.fee).unwrap();
+    wait_debited(&backend, before, shown).await;
+
+    tokio::time::timeout(PATIENCE, async {
+        while received_at(&recipient).1.is_empty() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("the transaction must reach bitcoind");
+    let (received, txids) = received_at(&recipient);
+    assert_eq!(
+        received,
+        sent.as_sat(),
+        "the recipient gets the exact amount"
+    );
+    assert_eq!(txids.len(), 1);
+    wait_for_transaction(&txids[0]).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn killed_after_submit_resumes() {
+    let (_payer_dir, config) = folder();
+    let mut payer = funded_backend(&config, 20_000).await;
+    let (_payee_dir, payee_config) = folder();
+    let payee = joined_backend(&payee_config).await;
+    let payee_events = payee.subscribe();
+
+    let mut done = false;
+    for attempt in 1..=PAY_TRIES {
+        let bill = invoice(&payee, 2_000).await;
+        let before = balance_of(&payer).await;
+        halt_sends(&payer, SendHalt::AfterSubmit);
+        let preview = pay_preview(&payer, &bill.payload).await;
+        let shown = preview.amount.checked_add(preview.fee).unwrap();
+        let id = payer.confirm_send(preview.id).await.unwrap();
+        // The debit shows that `pay_invoice` got through, and the hook stops it
+        // before the operation id is written or a watch starts.
+        wait_balance(&payer, |now| now < before).await;
+        assert_eq!(payer.operations().await.unwrap().len(), 1);
+        drop(payer);
+
+        payer = reopened_after_drop(&config).await;
+        let row = final_row(&payer, &id).await;
+        assert!(payer.operations().await.unwrap().is_empty());
+        wait_online(&payer).await;
+        match row.status {
+            HistoryStatus::Complete => {
+                wait_debited(&payer, before, shown).await;
+                done = true;
+                break;
+            }
+            HistoryStatus::Refunded => {
+                eprintln!("REFUNDED on attempt {attempt}");
+                wait_restored(&payer, before).await;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(done, "no attempt settled");
+    let row = wait_received(&payee, &payee_events).await;
+    assert!(row.amount <= Amount::from_sat(2_000));
+    let received = rows(&payee).await;
+    let credited = received
+        .iter()
+        .filter(|row| row.status == HistoryStatus::Complete);
+    assert_eq!(credited.count(), 1, "the payee was paid once: {received:?}");
+    payee.shutdown().await.unwrap();
+    payer.shutdown().await.unwrap();
 }

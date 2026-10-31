@@ -34,8 +34,9 @@ pub enum Event {
         id: OperationId,
         kind: OperationKind,
         state: OperationState,
-        /// The history row the operation made, once it exists (as a rule
-        /// with `Done`). Look it up with `history`.
+        /// The history row the operation made: set on every final state that
+        /// made one, `Failed` included, and `None` before that. Look it up
+        /// with `history`.
         history_id: Option<String>,
     },
 }

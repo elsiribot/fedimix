@@ -14,8 +14,8 @@ use futures::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use super::Core;
-use super::saving_not_set_up;
+use super::send::{is_send, resolve_intent};
+use super::{Core, saving_not_set_up};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, Notice};
@@ -51,7 +51,7 @@ fn incoming(
 
 impl Core {
     /// The client of a federation that is connected now.
-    fn connected(&self, id: &str) -> Result<Arc<dyn FederationClient>> {
+    pub(super) fn connected(&self, id: &str) -> Result<Arc<dyn FederationClient>> {
         let state = self.state();
         let live = state.live.get(id).filter(|live| live.online);
         live.and_then(|live| live.client.clone())
@@ -60,7 +60,7 @@ impl Core {
 
     /// Hands a new watch to the running connection. With none, the next one
     /// finds it in the store.
-    fn start_watching(&self, watch: Watch) {
+    pub(super) fn start_watching(&self, watch: Watch) {
         let state = self.state();
         if let Some(tx) = state
             .live
@@ -132,7 +132,7 @@ impl Core {
             kind: WatchKind::LnReceive,
             created_at: now,
         };
-        self.store().add_receive(&item, &watch)?;
+        self.store().add_tracked(&item, &watch)?;
         self.announce(federation, &item, &HistoryWrite::Added);
         self.start_watching(watch);
         Ok(())
@@ -153,7 +153,7 @@ impl Core {
 
     /// Tells subscribers what a write to Spending's history did. The `Notice`
     /// hangs on the store's own report of the transition, so a replay is silent.
-    fn announce(&self, federation: &str, item: &HistoryItem, write: &HistoryWrite) {
+    pub(super) fn announce(&self, federation: &str, item: &HistoryItem, write: &HistoryWrite) {
         let wallet = WalletKind::Spending;
         let item_event = match write {
             HistoryWrite::Unchanged => return,
@@ -177,14 +177,16 @@ impl Core {
                 was: HistoryStatus::Complete,
             };
         if item.status == HistoryStatus::Complete && !was_complete {
-            self.events
-                .emit(&Event::Notification(Notice::DepositConfirmed {
-                    amount: item.amount,
-                }));
+            let amount = item.amount;
+            self.events.emit(&Event::Notification(if item.incoming {
+                Notice::DepositConfirmed { amount }
+            } else {
+                Notice::SendConfirmed { amount }
+            }));
         }
     }
 
-    fn record(&self, federation: &str, item: &HistoryItem) -> Result<()> {
+    pub(super) fn record(&self, federation: &str, item: &HistoryItem) -> Result<()> {
         let write = self
             .store()
             .upsert_history(WalletKind::Spending, Some(federation), item)?;
@@ -195,6 +197,9 @@ impl Core {
     /// Writes what `update` says about `watch`, and ends the watch if it is
     /// final. The row comes first, so a crash between the two replays.
     fn apply(&self, watch: &Watch, update: &WatchUpdate) -> Result<()> {
+        if is_send(watch.kind) {
+            return self.apply_send(watch, update);
+        }
         let federation = &watch.federation_id;
         let kind = match watch.kind {
             WatchKind::Deposit => HistoryKind::Deposit,
@@ -290,7 +295,9 @@ impl Core {
             tasks: JoinSet::new(),
             started: HashSet::new(),
         };
-        match self.store().watches() {
+        // Bound first: starting a watch reads the store too.
+        let listed = self.store().watches();
+        match listed {
             Ok(listed) => listed
                 .into_iter()
                 .filter(|watch| watch.federation_id == federation)
@@ -324,16 +331,29 @@ pub(super) struct Watches {
 
 impl Watches {
     fn start(&mut self, watch: Watch) {
-        // Sends arrive with Task 8.
-        if !matches!(watch.kind, WatchKind::LnReceive | WatchKind::Deposit)
-            || !self.started.insert(watch.id.clone())
-        {
+        if self.started.contains(&watch.id) {
             return;
         }
-        let updates = self.client.watch(watch.clone());
+        // A send with no operation yet has nothing to follow.
+        let Some(followed) = self.core.followed(&watch) else {
+            return;
+        };
+        self.started.insert(watch.id.clone());
+        let updates = self.client.watch(followed);
         let core = Arc::clone(&self.core);
         self.tasks
             .spawn(async move { follow(&core, &watch, updates).await });
+    }
+
+    /// Settles what a crash left of sends with no operation. Runs each time the
+    /// federation comes online, so a lookup that failed is tried again.
+    pub(super) fn resolve_unsent(&mut self, federation: &str) {
+        for watch in self.core.unsent(federation) {
+            let core = Arc::clone(&self.core);
+            let client = Arc::clone(&self.client);
+            self.tasks
+                .spawn(async move { resolve_intent(&core, &*client, &watch).await });
+        }
     }
 
     /// Starts a watch that has arrived, or clears away one that ended. A panic

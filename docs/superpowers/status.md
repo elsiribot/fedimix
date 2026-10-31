@@ -1,11 +1,11 @@
 # Status
 
-Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 2 Tasks 1 (the review residuals N1-N7, N9, N10, O5), 2 (fedimint 0.13 in the build, devimint smoke test), 3 (store, seed, data dir lock), 4 (additive API: paged history, operations, recovery words, shutdown), 5 (`FederationPort`, `FedimintPort` over both module generations, scriptable fake), 6 (`RealBackend`: bootstrap, join, state) and 7 (receive: invoices and deposits watched to the end, resumed after restart; a lost client database recovered from the federation) are done. The whole UI still runs over `DemoBackend`: the app only starts with `--demo` until Task 9.
+Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 2 Tasks 1 (the review residuals N1-N7, N9, N10, O5), 2 (fedimint 0.13 in the build, devimint smoke test), 3 (store, seed, data dir lock), 4 (additive API: paged history, operations, recovery words, shutdown), 5 (`FederationPort`, `FedimintPort` over both module generations, scriptable fake), 6 (`RealBackend`: bootstrap, join, state), 7 (receive: invoices and deposits watched to the end, resumed after restart; a lost client database recovered from the federation) and 8 (send: Lightning and on-chain, crash-safe by intent id) are done. The whole UI still runs over `DemoBackend`: the app only starts with `--demo` until Task 9.
 
 ## What works (commands run in `nix develop`)
 - `just clippy`, `just test` (includes `tests/real_backend.rs`: `RealBackend` over the fake port).
 - `nix build` (fails if the binary cannot load its libraries; `result/bin/fedimix --demo` was started once under headless sway with a clean environment), or `just build-nix` for that plus `nix flake check` (clippy, fmt, tests on the same source).
-- `just test-integration` (slow; devimint with both module sets, 18 tests each: `RealBackend` restart, receive over Lightning and on-chain, a deposit across a killed backend, recovery of a lost client database, join and reopen, deposit, too-small deposit, Lightning receive and pay, changed gateway terms, withdraw, quote errors, finding an operation by intent, minimum deposit, bad invites, the smoke test; `scripts/fund-gateways.sh` gives every gateway ecash first). Uses `nix develop .#integration --accept-flake-config`; plain `nix develop` does not touch fedimint.
+- `just test-integration` (slow; devimint with both module sets, 23 tests each: `RealBackend` restart, receive over Lightning and on-chain, send over Lightning and on-chain, a refunded payment, paying your own invoice, a send killed right after submission, a deposit across a killed backend, recovery of a lost client database, join and reopen, deposit, too-small deposit, Lightning receive and pay, changed gateway terms, withdraw, quote errors, finding an operation by intent, minimum deposit, bad invites, the smoke test; `scripts/fund-gateways.sh` gives every gateway ecash first; a generation is retried at most twice if devimint fails at `open-channel` before any test). Uses `nix develop .#integration --accept-flake-config`; plain `nix develop` does not touch fedimint.
 - `just demo` / `just run`; `--demo-scenario funded|below-target|no-saving|first-run|offline|exit-deferred|long-names|device-disconnected|preview-expiry|device-rejects|send-stuck|long-history`, `--demo-page ...`.
 - Core API is the Phase 2 shape: operations with state events and cancel, expiring previews, exit quotes, `parse_destination`, device identity, queue deferrals.
 
@@ -19,12 +19,12 @@ Phase 1 is complete: Tasks 1-12 and the final review's fix list are done. Phase 
 - A panic in a core future: covered by a unit test of `CoreBridge::call`, not through the UI.
 - Real pointer/keyboard input (the driver emits clicks and sets text), Escape as a key, the Apply button's own click (the driver emits `apply`), the header menu popover (opened through actions), Enter in entries.
 - Dark theme, accessibility, a second process launch (flows activate in-process), a real desktop (sway only), hardware, any real backend.
-- `parse_destination` is lexical (base58 by shape); `validate_address` checks checksum and network but nothing calls it until the real backend.
+- `parse_destination` is lexical (base58 by shape); `validate_address` checks checksum and network, and `RealBackend::prepare_send` calls it.
 - Window close and Quit wait for `shutdown` (5 s cap): unit-tested cap, exercised by every flow ending through the quit action; a hung backend is not run in the UI.
 - Startup `operations()` watchers: the demo never has a running operation at start, so only the unit test of `resumed_outcome` covers them.
 
 ## Next
-Phase 2 Task 8 (send). `RealBackend` answers `prepare_send` with `Internal("Not available yet.")` until then; `Core::resume_watches` resumes only receive watches so far (`Watches::start` is the place). Still open from the re-review: O1-O4 (not in Task 1) and N8 (accepted).
+Phase 2 Task 9 (GTK on the real backend). Still open from the re-review: O1-O4 (not in Task 1) and N8 (accepted).
 
 ## Needs user
 - SOCKS5 for federation traffic: fedimint 0.13 connectors have no such option, so a set proxy keeps federations offline.

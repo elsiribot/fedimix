@@ -81,6 +81,7 @@ pub struct FakeClient {
     quote_errors: Mutex<VecDeque<FedimixError>>,
     pay_errors: Mutex<VecDeque<FedimixError>>,
     withdraw_errors: Mutex<VecDeque<FedimixError>>,
+    find_errors: Mutex<VecDeque<FedimixError>>,
     next_op: AtomicU32,
     /// Amounts behind invoices a test wants to pay, by invoice.
     invoice_amounts: Mutex<HashMap<String, Amount>>,
@@ -101,6 +102,9 @@ pub struct FakeClient {
     /// While set, `lightning_invoice` hangs, as a slow gateway does.
     invoice_held: watch::Sender<bool>,
     invoice_calls: AtomicU32,
+    /// While set, `pay_invoice` hangs before it submits anything.
+    pay_held: watch::Sender<bool>,
+    pay_calls: AtomicU32,
 }
 
 impl FakeClient {
@@ -120,6 +124,7 @@ impl FakeClient {
             quote_errors: Mutex::default(),
             pay_errors: Mutex::default(),
             withdraw_errors: Mutex::default(),
+            find_errors: Mutex::default(),
             next_op: AtomicU32::new(1),
             invoice_amounts: Mutex::default(),
             paid: Mutex::default(),
@@ -134,6 +139,8 @@ impl FakeClient {
             close_held: watch::Sender::new(false),
             invoice_held: watch::Sender::new(false),
             invoice_calls: AtomicU32::new(0),
+            pay_held: watch::Sender::new(false),
+            pay_calls: AtomicU32::new(0),
         })
     }
 
@@ -189,6 +196,19 @@ impl FakeClient {
 
     pub fn fail_next_withdraw(&self, error: FedimixError) {
         self.withdraw_errors.lock().unwrap().push_back(error);
+    }
+
+    pub fn fail_next_find(&self, error: FedimixError) {
+        self.find_errors.lock().unwrap().push_back(error);
+    }
+
+    pub fn set_pay_held(&self, held: bool) {
+        self.pay_held.send_replace(held);
+    }
+
+    /// Calls of `pay_invoice`, also those still hanging.
+    pub fn pay_calls(&self) -> u32 {
+        self.pay_calls.load(Ordering::SeqCst)
     }
 
     /// Appends to what `watch` yields for this id, also for a later watch.
@@ -360,6 +380,9 @@ impl FederationClient for FakeClient {
     }
 
     async fn pay_invoice(&self, quote: &LightningQuote, intent: &str) -> Result<String> {
+        self.pay_calls.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.pay_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         Self::take_error(&self.pay_errors)?;
         self.debit(quote.amount, quote.fee)?;
         self.paid.lock().unwrap().push(quote.invoice.clone());
@@ -394,6 +417,7 @@ impl FederationClient for FakeClient {
     }
 
     async fn find_operation(&self, intent: &str) -> Result<Option<String>> {
+        Self::take_error(&self.find_errors)?;
         Ok(self.intents.lock().unwrap().get(intent).cloned())
     }
 

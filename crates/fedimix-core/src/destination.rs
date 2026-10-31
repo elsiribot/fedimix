@@ -1,6 +1,6 @@
 //! Parsing of user-entered destinations and BTC amounts.
 
-use crate::api::{Amount, Network};
+use crate::api::{Amount, Network, SendAmount};
 use crate::error::{FedimixError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +209,39 @@ pub fn validate_address(address: &str, network: Network) -> Result<()> {
     })
 }
 
+/// The amount to send, given what the destination carries. `Max` stays
+/// unresolved here: it depends on the wallet's balance and fee.
+pub(crate) fn requested_amount(
+    requested: SendAmount,
+    carried: Option<Amount>,
+) -> Result<SendAmount> {
+    let amount = match (requested, carried) {
+        (SendAmount::FromInvoice, Some(a)) => SendAmount::Exact(a),
+        (SendAmount::FromInvoice, None) => {
+            return Err(FedimixError::InvalidAmount(
+                "This destination has no amount: enter one".to_string(),
+            ));
+        }
+        (SendAmount::Exact(a), Some(b)) if a != b => {
+            return Err(FedimixError::InvalidAmount(
+                "This destination asks for a different amount".to_string(),
+            ));
+        }
+        (SendAmount::Max, Some(_)) => {
+            return Err(FedimixError::InvalidAmount(
+                "This destination has a fixed amount".to_string(),
+            ));
+        }
+        (other, _) => other,
+    };
+    if amount == SendAmount::Exact(Amount::ZERO) {
+        return Err(FedimixError::InvalidAmount(
+            "Amount must be above zero".to_string(),
+        ));
+    }
+    Ok(amount)
+}
+
 /// Classify and normalize what the user entered as a recipient.
 ///
 /// Accepts Lightning invoices (bare or `lightning:`), bech32 addresses (bare
@@ -394,6 +427,25 @@ mod tests {
             validate_address(&MAINNET_BECH32.to_uppercase(), Network::Bitcoin),
             Ok(())
         );
+    }
+
+    #[test]
+    fn validate_accepts_regtest_signet_and_taproot() {
+        for (addr, net) in [
+            (
+                "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+                Network::Regtest,
+            ),
+            (TESTNET_BECH32, Network::Signet),
+            (TESTNET_P2PKH, Network::Regtest),
+            ("n2eMqTT929pb1RDNuqEnxdaLau1rxy3efi", Network::Regtest),
+            (
+                "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+                Network::Bitcoin,
+            ),
+        ] {
+            assert_eq!(validate_address(addr, net), Ok(()), "{addr} on {net:?}");
+        }
     }
 
     #[test]

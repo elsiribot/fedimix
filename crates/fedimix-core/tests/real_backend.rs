@@ -6,12 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fedimix_core::testing::{
-    DepositEvent, FakeClient, FakePort, FederationClient, WatchUpdate, real_backend,
+    DepositEvent, FakeClient, FakePort, FederationClient, SendHalt, WatchUpdate, halt_sends,
+    real_backend,
 };
 use fedimix_core::{
-    Amount, Backend, CoreConfig, Event, EventStream, FedimixError, HistoryItem, HistoryKind,
-    HistoryStatus, Network, NoteBucket, Notice, ReceiveMethod, ReceiveRequest, Result, Settings,
-    WalletKind,
+    Amount, Backend, ChangeDestination, CoreConfig, Event, EventStream, FedimixError, HistoryItem,
+    HistoryKind, HistoryStatus, Network, NoteBucket, Notice, OperationKind, OperationState,
+    ReceiveMethod, ReceiveRequest, Result, RunningOperation, SendAmount, SendPreview, SendRequest,
+    Settings, WalletKind,
 };
 use tempfile::TempDir;
 
@@ -427,18 +429,6 @@ async fn saving_methods_report_not_set_up() {
     let saving = backend.saving_state().await.unwrap();
     assert_eq!(saving.device, None);
     assert_eq!(saving.balance, Amount::ZERO);
-    backend.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn spending_operations_are_not_available_yet() {
-    let harness = Harness::new();
-    let backend = harness.open().await.unwrap();
-    let not_yet = Err::<(), _>(FedimixError::Internal("Not available yet.".into()));
-    assert_eq!(backend.confirm_send("p".into()).await.map(|_| ()), not_yet);
-    assert_eq!(backend.cancel_operation("o".into()).await, not_yet);
-    assert!(backend.operations().await.unwrap().is_empty());
-    backend.discard_preview("p".into()).await.unwrap();
     backend.shutdown().await.unwrap();
 }
 
@@ -1555,5 +1545,834 @@ async fn a_seed_born_with_its_store_joins_fresh_also_after_a_restart() {
     backend.join_federation(SECOND_INVITE.into()).await.unwrap();
     assert_eq!(harness.port.joins(), 2);
     assert_eq!(harness.port.recovers(), 0);
+    backend.shutdown().await.unwrap();
+}
+
+/// 200 sat. The fake needs `add_invoice` to know one; this one is lexically real.
+const INVOICE: &str = "lnbcrt2000n1abc";
+const ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+const MAINNET_ADDRESS: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+const LN_FEE: Amount = Amount { msat: 10_000 };
+const CAME_BACK: &str = "The payment failed and the money came back.";
+const NEVER_SENT: &str = "This payment was never sent, so no money left your wallet.";
+
+fn sat(n: u64) -> Amount {
+    Amount::from_sat(n)
+}
+
+fn to(destination: &str, amount: SendAmount) -> SendRequest {
+    SendRequest {
+        wallet: WalletKind::Spending,
+        destination: destination.into(),
+        amount,
+        fee_rate_sat_vb: None,
+    }
+}
+
+fn pay_request() -> SendRequest {
+    to(INVOICE, SendAmount::FromInvoice)
+}
+
+/// A backend on the first federation with `balance`, `INVOICE` payable.
+async fn funded(harness: &Harness, balance: Amount) -> Arc<fedimix_core::RealBackend> {
+    harness.first.set_balance(balance);
+    harness.first.add_invoice(INVOICE, sat(200));
+    let backend = harness.joined().await;
+    wait_balance(&*backend, balance).await;
+    backend
+}
+
+/// The states of operation `id` to its final one, and that one's `history_id`.
+async fn run_of(events: &EventStream, id: &str) -> (Vec<OperationState>, Option<String>) {
+    within("the operation's final state", async {
+        let mut states = Vec::new();
+        loop {
+            let Some(Event::Operation {
+                id: seen,
+                kind,
+                state,
+                history_id,
+            }) = events.next().await
+            else {
+                continue;
+            };
+            if seen != id {
+                continue;
+            }
+            assert_eq!(kind, OperationKind::Send);
+            let done = state.is_final();
+            states.push(state);
+            if done {
+                return (states, history_id);
+            }
+            assert_eq!(history_id, None, "no row is reported before the end");
+        }
+    })
+    .await
+}
+
+fn failed_with(sentence: &str) -> OperationState {
+    OperationState::Failed {
+        error: FedimixError::Internal(sentence.into()),
+    }
+}
+
+/// The fake's operation behind intent `id`, once it has been submitted.
+async fn operation_of(client: &FakeClient, id: &str) -> String {
+    wait_until("the submission", || async {
+        client.find_operation(id).await.unwrap().is_some()
+    })
+    .await;
+    client.find_operation(id).await.unwrap().unwrap()
+}
+
+fn row_of(rows: &[HistoryItem], id: &str) -> HistoryItem {
+    let row = rows.iter().find(|row| row.id == id);
+    row.expect("the send has a history row").clone()
+}
+
+async fn restarted(
+    harness: &Harness,
+    backend: Arc<fedimix_core::RealBackend>,
+) -> Arc<fedimix_core::RealBackend> {
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    harness.open().await.unwrap()
+}
+
+#[tokio::test]
+async fn preview_pays_once() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    assert_eq!(preview.wallet, WalletKind::Spending);
+    assert_eq!(preview.destination, INVOICE);
+    assert_eq!(preview.amount, sat(200));
+    assert_eq!(preview.fee, LN_FEE);
+    assert_eq!(preview.inputs, Vec::new());
+    assert_eq!(preview.change, ChangeDestination::None);
+    assert_eq!(preview.expires_at, 1_600);
+
+    let id = backend.confirm_send(preview.id.clone()).await.unwrap();
+    let again = backend.confirm_send(preview.id.clone()).await;
+    assert_eq!(again, Err(FedimixError::UnknownItem(preview.id)));
+    let op = operation_of(&harness.first, &id).await;
+    assert_eq!(harness.first.paid(), [INVOICE]);
+    wait_until("the running operation", || async {
+        backend.operations().await.unwrap()
+            == vec![RunningOperation {
+                id: id.clone(),
+                kind: OperationKind::Send,
+                state: OperationState::Broadcasting,
+            }]
+    })
+    .await;
+    backend.cancel_operation(id.clone()).await.unwrap();
+    let row = row_of(&rows(&*backend).await, &id);
+    assert_eq!(row.kind, HistoryKind::Paid);
+    assert_eq!(row.amount, sat(200));
+    assert!(!row.incoming);
+    assert_eq!(row.status, HistoryStatus::Pending);
+
+    harness.first.push_update(&op, settled(200));
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states, [OperationState::Broadcasting, OperationState::Done]);
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert!(backend.operations().await.unwrap().is_empty());
+    backend.cancel_operation(id).await.unwrap();
+    assert_eq!(harness.first.paid(), [INVOICE]);
+    assert_eq!(harness.first.pay_calls(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn confirming_one_preview_at_the_same_time_pays_once() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let (one, two) = (Arc::clone(&backend), Arc::clone(&backend));
+    let (first_id, second_id) = (preview.id.clone(), preview.id);
+    let first = tokio::spawn(async move { one.confirm_send(first_id).await });
+    let second = tokio::spawn(async move { two.confirm_send(second_id).await });
+    let replies = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(replies.iter().filter(|reply| reply.is_ok()).count(), 1);
+    wait_until("the payment", || async { harness.first.paid().len() == 1 }).await;
+    assert_eq!(rows(&*backend).await.len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_preview_refused() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    harness.time.store(preview.expires_at, Ordering::SeqCst);
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    assert_eq!(harness.first.pay_calls(), 0);
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discarded_preview_is_gone() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    backend.discard_preview(preview.id.clone()).await.unwrap();
+    backend.discard_preview(preview.id.clone()).await.unwrap();
+    assert_eq!(
+        backend.confirm_send(preview.id.clone()).await,
+        Err(FedimixError::UnknownItem(preview.id))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn two_previews_over_the_same_funds_second_fails() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(300)).await;
+    harness.first.add_invoice("lnbcrt2000n1abd", sat(200));
+    let first = backend.prepare_send(pay_request()).await.unwrap();
+    let second = backend
+        .prepare_send(to("lnbcrt2000n1abd", SendAmount::FromInvoice))
+        .await
+        .unwrap();
+    backend.confirm_send(first.id).await.unwrap();
+    let reply = backend.confirm_send(second.id).await;
+    assert!(
+        matches!(reply, Err(FedimixError::InsufficientFunds { .. })),
+        "{reply:?}"
+    );
+    wait_until("the first payment", || async {
+        harness.first.paid() == [INVOICE]
+    })
+    .await;
+    assert_eq!(rows(&*backend).await.len(), 1, "the second left no row");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn funds_spent_while_submitting_end_in_a_failed_row() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    harness
+        .first
+        .fail_next_pay(FedimixError::InsufficientFunds {
+            available: sat(1),
+            needed: sat(210),
+        });
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let (states, history_id) = run_of(&events, &id).await;
+    assert!(
+        matches!(
+            states.last(),
+            Some(OperationState::Failed {
+                error: FedimixError::InsufficientFunds { .. }
+            })
+        ),
+        "{states:?}"
+    );
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn refund_restores_and_labels() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    wait_balance(&*backend, sat(790)).await;
+    harness.first.set_balance(sat(1_000));
+    harness.first.push_update(&op, WatchUpdate::Refunded);
+
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states.last(), Some(&failed_with(CAME_BACK)));
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Refunded).await;
+    wait_balance(&*backend, sat(1_000)).await;
+    assert_eq!(
+        notices(&drain(&events).await),
+        0,
+        "a refund confirms nothing"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn send_failure_keeps_history_row_failed() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    let reason = "The payment failed.";
+    harness.first.push_update(
+        &op,
+        WatchUpdate::Failed {
+            reason: reason.into(),
+        },
+    );
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states.last(), Some(&failed_with(reason)));
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_terms_after_the_row_end_it_failed_for_a_new_preview() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    harness.first.fail_next_pay(FedimixError::PreviewExpired);
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(
+        states.last(),
+        Some(&OperationState::Failed {
+            error: FedimixError::PreviewExpired
+        })
+    );
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(harness.first.paid(), Vec::<String>::new());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn max_leaves_nothing_after_fee() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend
+        .prepare_send(to(ADDRESS, SendAmount::Max))
+        .await
+        .unwrap();
+    assert_eq!(preview.amount, sat(700));
+    assert_eq!(preview.fee, sat(300));
+    assert_eq!(preview.change, ChangeDestination::None);
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    wait_balance(&*backend, Amount::ZERO).await;
+    assert_eq!(harness.first.withdrawn()[0].amount, sat(700));
+    let row = row_of(&rows(&*backend).await, &id);
+    assert_eq!(row.kind, HistoryKind::Sent { change: None });
+    assert_eq!(row.amount, sat(700));
+    harness.first.push_update(&op, settled(700));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn max_of_less_than_the_fee_is_refused() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(100)).await;
+    let reply = backend.prepare_send(to(ADDRESS, SendAmount::Max)).await;
+    assert!(
+        matches!(reply, Err(FedimixError::InsufficientFunds { .. })),
+        "{reply:?}"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_above_the_balance_is_insufficient() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    assert_eq!(
+        backend
+            .prepare_send(to(ADDRESS, SendAmount::Exact(sat(701))))
+            .await,
+        Err(FedimixError::InsufficientFunds {
+            available: sat(1_000),
+            needed: sat(1_001),
+        })
+    );
+    let whole = backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(sat(700))))
+        .await
+        .unwrap();
+    assert_eq!(whole.amount, sat(700), "a send may use the whole balance");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn wrong_network_address_refused() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let reply = backend
+        .prepare_send(to(MAINNET_ADDRESS, SendAmount::Exact(sat(1))))
+        .await;
+    assert_eq!(
+        reply,
+        Err(FedimixError::InvalidDestination(
+            "This address belongs to a different bitcoin network".into()
+        ))
+    );
+    let reply = backend
+        .prepare_send(to("bcrt1qbadchecksum", SendAmount::Exact(sat(1))))
+        .await;
+    assert!(
+        matches!(reply, Err(FedimixError::InvalidDestination(_))),
+        "{reply:?}"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_invoice_refused() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let expired = FedimixError::InvalidDestination("This invoice has expired.".into());
+    harness.first.fail_next_quote(expired.clone());
+    assert_eq!(backend.prepare_send(pay_request()).await, Err(expired));
+    assert_eq!(harness.first.pay_calls(), 0);
+    backend.shutdown().await.unwrap();
+}
+
+/// LNv2 has no amount of its own to pay an amountless invoice with, so an amount
+/// entered by hand does not help (see `decisions.md`, Task 5).
+#[tokio::test]
+async fn amountless_invoice_needs_exact() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    for amount in [SendAmount::FromInvoice, SendAmount::Exact(sat(100))] {
+        let reply = backend.prepare_send(to("lnbcrt1abc", amount)).await;
+        assert!(
+            matches!(reply, Err(FedimixError::InvalidAmount(_))),
+            "{reply:?}"
+        );
+    }
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_invoice_sets_its_own_amount() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    for amount in [SendAmount::Exact(sat(100)), SendAmount::Max] {
+        let reply = backend.prepare_send(to(INVOICE, amount)).await;
+        assert!(
+            matches!(reply, Err(FedimixError::InvalidAmount(_))),
+            "{reply:?}"
+        );
+    }
+    let same = backend
+        .prepare_send(to(INVOICE, SendAmount::Exact(sat(200))))
+        .await;
+    assert_eq!(same.unwrap().amount, sat(200));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_address_needs_an_amount() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let reply = backend
+        .prepare_send(to(ADDRESS, SendAmount::FromInvoice))
+        .await;
+    assert!(
+        matches!(reply, Err(FedimixError::InvalidAmount(_))),
+        "{reply:?}"
+    );
+    let uri = format!("bitcoin:{ADDRESS}?amount=0.00000500");
+    let carried = backend
+        .prepare_send(to(&uri, SendAmount::FromInvoice))
+        .await;
+    assert_eq!(carried.unwrap().amount, sat(500));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_prepare_is_offline() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    assert_eq!(
+        backend.prepare_send(pay_request()).await,
+        Err(FedimixError::Offline)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sends_need_spending_and_a_federation() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    let reply = backend.prepare_send(pay_request()).await;
+    assert!(matches!(reply, Err(FedimixError::NotSetUp(_))), "{reply:?}");
+    let saving = SendRequest {
+        wallet: WalletKind::Saving,
+        ..pay_request()
+    };
+    assert_eq!(
+        backend.prepare_send(saving).await,
+        Err(FedimixError::NotSetUp(
+            "Saving arrives in a later version.".into()
+        ))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failure_before_the_row_is_an_error_and_leaves_none() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    assert_eq!(
+        backend.confirm_send(preview.id.clone()).await,
+        Err(FedimixError::Offline)
+    );
+    assert!(rows(&*backend).await.is_empty());
+    assert_eq!(harness.first.pay_calls(), 0);
+    harness.first.set_online(true);
+    wait_online(&*backend, true).await;
+    assert_eq!(
+        backend.confirm_send(preview.id.clone()).await,
+        Err(FedimixError::UnknownItem(preview.id)),
+        "the preview is used up: the user previews again"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+async fn on_chain_preview(backend: &dyn Backend) -> SendPreview {
+    backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(sat(500))))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_higher_fee_at_confirm_expires_the_preview() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = on_chain_preview(&*backend).await;
+    harness.first.set_withdraw_fee(sat(301));
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    assert!(harness.first.withdrawn().is_empty());
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lower_or_equal_fee_at_confirm_is_the_one_used() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(2_000)).await;
+    let preview = on_chain_preview(&*backend).await;
+    harness.first.set_withdraw_fee(sat(250));
+    backend.confirm_send(preview.id).await.unwrap();
+    wait_until("the withdrawal", || async {
+        harness.first.withdrawn().len() == 1
+    })
+    .await;
+    assert_eq!(harness.first.withdrawn()[0].fee, sat(250));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_quote_at_confirm_leaves_no_row() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = on_chain_preview(&*backend).await;
+    harness.first.fail_next_quote(FedimixError::Offline);
+    assert_eq!(
+        backend.confirm_send(preview.id).await,
+        Err(FedimixError::Offline)
+    );
+    assert!(rows(&*backend).await.is_empty());
+    assert!(harness.first.withdrawn().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_resumes_running_send() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    wait_until("the operation id on disk", || async {
+        raw_store(&harness)
+            .query_row(
+                "SELECT operation FROM watches WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            == Some(op.clone())
+    })
+    .await;
+
+    let backend = restarted(&harness, backend).await;
+    assert_eq!(
+        backend.operations().await.unwrap(),
+        vec![RunningOperation {
+            id: id.clone(),
+            kind: OperationKind::Send,
+            state: OperationState::Broadcasting,
+        }]
+    );
+    let events = backend.subscribe();
+    harness.first.push_update(&op, settled(200));
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states, [OperationState::Done]);
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(harness.first.paid(), [INVOICE]);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn crash_before_pay_resolves_failed() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+
+    let backend = restarted(&harness, backend).await;
+    let events = backend.subscribe();
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states, [failed_with(NEVER_SENT)]);
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(harness.first.pay_calls(), 0, "nothing pays by itself");
+    assert!(backend.operations().await.unwrap().is_empty());
+    assert_eq!(watches_left(&harness), 0);
+
+    let backend = restarted(&harness, backend).await;
+    let events = backend.subscribe();
+    wait_online(&*backend, true).await;
+    let later = drain(&events).await;
+    assert!(
+        !later
+            .iter()
+            .any(|event| matches!(event, Event::Operation { .. })),
+        "settled once and for all: {later:?}"
+    );
+    assert_eq!(harness.first.pay_calls(), 0);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn killed_after_submit_resumes() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    halt_sends(&backend, SendHalt::AfterSubmit);
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    assert_eq!(notices(&drain(&events).await), 0);
+
+    let backend = restarted(&harness, backend).await;
+    let events = backend.subscribe();
+    harness.first.push_update(&op, settled(200));
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(states, [OperationState::Done]);
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(harness.first.paid(), [INVOICE], "exactly one debit");
+    wait_balance(&*backend, sat(790)).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_lookup_leaves_the_row_for_the_next_connect() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.first.fail_next_find(FedimixError::Offline);
+    let backend = harness.open().await.unwrap();
+    wait_online(&*backend, true).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        row_of(&rows(&*backend).await, &id).status,
+        HistoryStatus::Pending
+    );
+    assert_eq!(backend.operations().await.unwrap().len(), 1);
+
+    harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    harness.first.set_online(true);
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unfinished_intent_waits_for_the_federation() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.first.set_online(false);
+    let backend = harness.open().await.unwrap();
+    wait_until("the client to open", || async {
+        harness.port.connects() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        row_of(&rows(&*backend).await, &id).status,
+        HistoryStatus::Pending
+    );
+    harness.first.set_online(true);
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// `find_operation` knows nothing while `pay_invoice` runs, and a reconnect must
+/// not take that for "never sent".
+#[tokio::test]
+async fn a_send_still_being_submitted_is_left_alone() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    harness.first.set_pay_held(true);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_until("the payment to start", || async {
+        harness.first.pay_calls() == 1
+    })
+    .await;
+
+    harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    harness.first.set_online(true);
+    wait_online(&*backend, true).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        row_of(&rows(&*backend).await, &id).status,
+        HistoryStatus::Pending
+    );
+
+    harness.first.set_pay_held(false);
+    let op = operation_of(&harness.first, &id).await;
+    harness.first.push_update(&op, settled(200));
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(states.last(), Some(&OperationState::Done));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_payment_in_flight() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    harness.first.set_pay_held(true);
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_until("the payment to start", || async {
+        harness.first.pay_calls() == 1
+    })
+    .await;
+
+    let closing = Arc::clone(&backend);
+    let closing = tokio::spawn(async move { closing.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!closing.is_finished());
+    harness.first.set_pay_held(false);
+    closing.await.unwrap().unwrap();
+    drop(backend);
+
+    let op = harness.first.find_operation(&id).await.unwrap();
+    let stored: Option<String> = raw_store(&harness)
+        .query_row(
+            "SELECT operation FROM watches WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, op, "the id was saved before the folder was let go");
+}
+
+#[tokio::test]
+async fn a_send_notifies_once_also_when_replayed() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let events = backend.subscribe();
+    let preview = backend.prepare_send(pay_request()).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let op = operation_of(&harness.first, &id).await;
+    harness.first.push_update(&op, settled(200));
+    within("the notice", async {
+        loop {
+            if let Some(Event::Notification(notice)) = events.next().await {
+                assert_eq!(notice, Notice::SendConfirmed { amount: sat(200) });
+                return;
+            }
+        }
+    })
+    .await;
+    wait_until("the watch to finish", || async {
+        watches_left(&harness) == 0
+    })
+    .await;
+
+    raw_store(&harness)
+        .execute("UPDATE watches SET finished = 0 WHERE id = ?1", [&id])
+        .unwrap();
+    let backend = restarted(&harness, backend).await;
+    let events = backend.subscribe();
+    let (states, history_id) = run_of(&events, &id).await;
+    assert_eq!(states, [OperationState::Done]);
+    assert_eq!(history_id, Some(id));
+    assert_eq!(notices(&drain(&events).await), 0);
+    assert!(backend.operations().await.unwrap().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_unknown_errors() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    assert_eq!(
+        backend.cancel_operation("nothing".into()).await,
+        Err(FedimixError::UnknownItem("nothing".into()))
+    );
+    assert_eq!(
+        backend.confirm_send("nothing".into()).await,
+        Err(FedimixError::UnknownItem("nothing".into()))
+    );
+    assert!(backend.operations().await.unwrap().is_empty());
+    backend.discard_preview("nothing".into()).await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_receive_is_not_an_operation_to_cancel() {
+    let harness = Harness::new();
+    let backend = funded(&harness, sat(1_000)).await;
+    let info = backend.receive(invoice_request(5)).await.unwrap();
+    let id = watch_id(&info.payload).to_string();
+    assert_eq!(
+        backend.cancel_operation(id.clone()).await,
+        Err(FedimixError::UnknownItem(id))
+    );
+    assert!(backend.operations().await.unwrap().is_empty());
     backend.shutdown().await.unwrap();
 }

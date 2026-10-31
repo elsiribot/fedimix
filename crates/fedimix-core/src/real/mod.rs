@@ -7,6 +7,7 @@
 
 mod events;
 mod receive;
+mod send;
 mod spending;
 
 use std::collections::HashMap;
@@ -19,6 +20,9 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use self::events::{Events, left_open, supervise};
+use self::send::{HeldSend, Submitting};
+#[cfg(feature = "testing")]
+pub use self::send::{SendHalt, halt_sends};
 use crate::api::*;
 use crate::backend::Backend;
 use crate::config::CoreConfig;
@@ -30,7 +34,6 @@ use crate::store::{FederationRow, Store, Watch};
 
 const DB_FILE: &str = "fedimix.db";
 const SAVING_NOT_SET_UP: &str = "Saving arrives in a later version.";
-const NOT_AVAILABLE: &str = "Not available yet.";
 const SATS_SUPPLY: u64 = 2_100_000_000_000_000;
 
 /// The time in Unix seconds. Injected so tests are deterministic.
@@ -71,10 +74,11 @@ struct Live {
     new_watches: Option<mpsc::UnboundedSender<Watch>>,
 }
 
-/// Task 8 consumes its previews under this lock.
+/// A preview is consumed under this lock, so it pays at most once.
 #[derive(Default)]
 struct State {
     live: HashMap<String, Live>,
+    previews: HashMap<String, HeldSend>,
 }
 
 enum Reached {
@@ -99,10 +103,6 @@ fn system_clock() -> Timestamp {
 
 fn saving_not_set_up() -> FedimixError {
     FedimixError::NotSetUp(SAVING_NOT_SET_UP.into())
-}
-
-fn not_available() -> FedimixError {
-    FedimixError::Internal(NOT_AVAILABLE.into())
 }
 
 /// The ranges the Settings page offers.
@@ -139,6 +139,11 @@ struct Core {
     clock: Clock,
     store: Mutex<Store>,
     state: Mutex<State>,
+    /// Sends between their row and the end of `pay_invoice` or `withdraw`. A
+    /// watch channel, so `shutdown` can wait for it to empty.
+    submitting: watch::Sender<Submitting>,
+    #[cfg(feature = "testing")]
+    halt: Mutex<Option<SendHalt>>,
     events: Events,
     gate: watch::Sender<Gate>,
     /// One per federation. Held through a join, so joins run one at a time, and
@@ -331,7 +336,14 @@ impl Core {
             supervisors.pop();
             outcome = outcome.and(closed);
         }
-        drop(held(&self.lock).take());
+        // A submission writes what became of it: the folder stays held for that.
+        if self.submissions_ended().await {
+            drop(held(&self.lock).take());
+        } else {
+            outcome = outcome.and(Err(FedimixError::Internal(
+                "A payment was still being submitted when Fedimix closed.".into(),
+            )));
+        }
         self.events.close();
         outcome
     }
@@ -372,6 +384,9 @@ impl RealBackend {
             clock,
             store: Mutex::new(store),
             state: Mutex::default(),
+            submitting: watch::Sender::default(),
+            #[cfg(feature = "testing")]
+            halt: Mutex::default(),
             events: Events::default(),
             gate: watch::Sender::new(gate),
             supervisors: tokio::sync::Mutex::default(),
@@ -490,12 +505,12 @@ impl Backend for RealBackend {
         self.core.receive(request).await
     }
 
-    async fn prepare_send(&self, _request: SendRequest) -> Result<SendPreview> {
-        Err(not_available())
+    async fn prepare_send(&self, request: SendRequest) -> Result<SendPreview> {
+        self.core.prepare_send(request).await
     }
 
-    async fn confirm_send(&self, _preview_id: String) -> Result<OperationId> {
-        Err(not_available())
+    async fn confirm_send(&self, preview_id: String) -> Result<OperationId> {
+        self.core.confirm_send(&preview_id).await
     }
 
     async fn prepare_refill(&self) -> Result<RefillPreview> {
@@ -514,12 +529,18 @@ impl Backend for RealBackend {
         Err(saving_not_set_up())
     }
 
-    async fn discard_preview(&self, _preview_id: String) -> Result<()> {
+    async fn discard_preview(&self, preview_id: String) -> Result<()> {
+        self.core.state().previews.remove(&preview_id);
         Ok(())
     }
 
-    async fn cancel_operation(&self, _id: OperationId) -> Result<()> {
-        Err(not_available())
+    /// Spending starts at `Broadcasting`, past the point of cancelling.
+    async fn cancel_operation(&self, id: OperationId) -> Result<()> {
+        if self.core.store().is_send(&id)? {
+            Ok(())
+        } else {
+            Err(FedimixError::UnknownItem(id))
+        }
     }
 
     async fn set_coin_frozen(&self, _outpoint: String, _frozen: bool) -> Result<()> {
@@ -558,7 +579,7 @@ impl Backend for RealBackend {
     }
 
     async fn operations(&self) -> Result<Vec<RunningOperation>> {
-        Ok(Vec::new())
+        self.core.running_sends()
     }
 
     async fn recovery_words(&self) -> Result<String> {
