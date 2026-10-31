@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fedimint_client::module::error::TransactionSubmitError;
 use fedimint_client::module::oplog::OperationLogEntry;
-use fedimint_client::{Client, ClientBuilder, ClientHandleArc, ClientPreview};
+use fedimint_client::{Client, ClientBuilder, ClientHandle, ClientHandleArc, ClientPreview};
 use fedimint_connectors::{ConnectorRegistry, PeerStatus};
 use fedimint_core::config::ClientConfig;
 use fedimint_core::core::OperationId;
@@ -284,18 +284,44 @@ impl FedimintPort {
         Ok(db.into())
     }
 
+    async fn build(&self, db: Database, root: &Seed) -> Result<ClientHandle> {
+        let connectors = self.connectors().await;
+        let opened = builder().await.open(connectors, db, root.root_secret());
+        tokio::time::timeout(CONNECT_TIMEOUT, opened)
+            .await
+            .map_err(|_| FedimixError::Offline)?
+            .map_err(|e| build_error(&e))
+    }
+
     async fn open_existing(
         &self,
         id: &str,
         db: Database,
         root: &Seed,
     ) -> Result<Arc<dyn FederationClient>> {
-        let connectors = self.connectors().await;
-        let opened = builder().await.open(connectors, db, root.root_secret());
-        let client = tokio::time::timeout(CONNECT_TIMEOUT, opened)
-            .await
-            .map_err(|_| FedimixError::Offline)?
-            .map_err(|e| build_error(&e))?;
+        let client = self.build(db, root).await?;
+        self.when_recovered(id, client, root).await
+    }
+
+    /// Waits for a recovery still running, which a client resumes when opened,
+    /// and has nothing to wait for otherwise. A module that cannot be used while
+    /// it recovers joins the client only on the next open. Dropping this future
+    /// closes the client and leaves the progress saved so far.
+    async fn when_recovered(
+        &self,
+        id: &str,
+        client: ClientHandle,
+        root: &Seed,
+    ) -> Result<Arc<dyn FederationClient>> {
+        client.wait_for_all_recoveries().await.map_err(|_| {
+            FedimixError::Internal("Fedimix could not recover this federation's data.".into())
+        })?;
+        if client.all_modules_usable() {
+            return FedimintClient::start(id.to_string(), Arc::new(client)).await;
+        }
+        client.shutdown().await;
+        let db = self.open_db(id).await?;
+        let client = self.build(db, root).await?;
         FedimintClient::start(id.to_string(), Arc::new(client)).await
     }
 }
@@ -357,7 +383,30 @@ impl FederationPort for FedimintPort {
             return Err(FedimixError::UnknownItem(id.to_string()));
         }
         let db = self.open_db(id).await?;
+        // An interrupted join leaves a database that holds nothing.
+        if !Client::is_initialized(&db).await {
+            return Err(FedimixError::UnknownItem(id.to_string()));
+        }
         self.open_existing(id, db, root).await
+    }
+
+    async fn recover(&self, invite: &str, root: &Seed) -> Result<Arc<dyn FederationClient>> {
+        let code = parse_invite(invite)?;
+        let preview = self.download(&code).await?;
+        let id = preview.config().calculate_federation_id().to_string();
+        let db = self.open_db(&id).await?;
+        // A recovery that was cut off goes on from what it saved.
+        if Client::is_initialized(&db).await {
+            return self.open_existing(&id, db, root).await;
+        }
+        // No backup: fedimint deprecated them, and scanning the federation's
+        // history finds what one would hold. A seed never used here is safe too.
+        let started = preview.recover(db, root.root_secret(), None);
+        let client = tokio::time::timeout(CONNECT_TIMEOUT, started)
+            .await
+            .map_err(|_| FedimixError::Offline)?
+            .map_err(|e| build_error(&e))?;
+        self.when_recovered(&id, client, root).await
     }
 }
 

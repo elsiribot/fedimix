@@ -6,7 +6,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::api::{HistoryItem, Network, Settings, Timestamp, WalletKind};
+use crate::api::{HistoryItem, HistoryStatus, Network, Settings, Timestamp, WalletKind};
 use crate::error::{FedimixError, Result};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -125,6 +125,83 @@ pub struct Watch {
     pub federation_id: String,
     pub kind: WatchKind,
     pub created_at: Timestamp,
+}
+
+/// What [`Store::upsert_history`] did. Only the store sees old and new in one
+/// transaction, so a caller that must act once on a change asks it, not the row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HistoryWrite {
+    Added,
+    Changed {
+        was: HistoryStatus,
+    },
+    /// The row already says this, or holds a final status that a replayed
+    /// earlier update must not take back.
+    Unchanged,
+}
+
+fn is_final(status: &HistoryStatus) -> bool {
+    !matches!(
+        status,
+        HistoryStatus::Pending | HistoryStatus::Confirming { .. }
+    )
+}
+
+fn upsert_in(
+    tx: &Transaction<'_>,
+    wallet: WalletKind,
+    federation_id: &str,
+    item: &HistoryItem,
+) -> Result<HistoryWrite> {
+    let wallet = wallet_name(wallet);
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT timestamp, json FROM history WHERE wallet = ?1 AND federation_id = ?2 AND id = ?3",
+            params![wallet, federation_id, item.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let mut item = item.clone();
+    let mut outcome = HistoryWrite::Added;
+    if let Some((timestamp, json)) = existing {
+        item.timestamp = from_db(timestamp);
+        // A row that no longer parses gives way to this one.
+        outcome = match serde_json::from_str::<HistoryItem>(&json) {
+            Ok(old) if old == item => return Ok(HistoryWrite::Unchanged),
+            Ok(old) if is_final(&old.status) && !is_final(&item.status) => {
+                return Ok(HistoryWrite::Unchanged);
+            }
+            Ok(old) => HistoryWrite::Changed { was: old.status },
+            Err(_) => HistoryWrite::Changed {
+                was: HistoryStatus::Pending,
+            },
+        };
+    }
+    let json = serde_json::to_string(&item).map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO history (wallet, federation_id, id, timestamp, json)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(wallet, federation_id, id) DO UPDATE SET json = excluded.json",
+        params![wallet, federation_id, item.id, to_db(item.timestamp), json],
+    )
+    .map_err(db_err)?;
+    Ok(outcome)
+}
+
+fn insert_watch(conn: &Connection, watch: &Watch) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO watches (id, federation_id, kind, created_at, finished)
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        params![
+            watch.id,
+            watch.federation_id,
+            watch.kind.as_str(),
+            to_db(watch.created_at)
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// Synchronous; callers wrap it in a `Mutex` and keep calls short.
@@ -337,31 +414,30 @@ impl Store {
         wallet: WalletKind,
         federation_id: Option<&str>,
         item: &HistoryItem,
-    ) -> Result<()> {
-        let wallet = wallet_name(wallet);
-        let federation_id = federation_id.unwrap_or("");
+    ) -> Result<HistoryWrite> {
         let tx = begin(&self.conn)?;
-        let existing: Option<i64> = tx
+        let outcome = upsert_in(&tx, wallet, federation_id.unwrap_or(""), item)?;
+        tx.commit().map_err(db_err)?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn history_item(
+        &self,
+        wallet: WalletKind,
+        federation_id: Option<&str>,
+        id: &str,
+    ) -> Result<Option<HistoryItem>> {
+        let json: Option<String> = self
+            .conn
             .query_row(
-                "SELECT timestamp FROM history WHERE wallet = ?1 AND federation_id = ?2 AND id = ?3",
-                params![wallet, federation_id, item.id],
+                "SELECT json FROM history WHERE wallet = ?1 AND federation_id = ?2 AND id = ?3",
+                params![wallet_name(wallet), federation_id.unwrap_or(""), id],
                 |r| r.get(0),
             )
             .optional()
             .map_err(db_err)?;
-        let mut item = item.clone();
-        if let Some(ts) = existing {
-            item.timestamp = from_db(ts);
-        }
-        let json = serde_json::to_string(&item).map_err(db_err)?;
-        tx.execute(
-            "INSERT INTO history (wallet, federation_id, id, timestamp, json)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(wallet, federation_id, id) DO UPDATE SET json = excluded.json",
-            params![wallet, federation_id, item.id, to_db(item.timestamp), json],
-        )
-        .map_err(db_err)?;
-        tx.commit().map_err(db_err)
+        json.map(|json| serde_json::from_str(&json).map_err(db_err))
+            .transpose()
     }
 
     /// Newest first by `(timestamp, id)` within one wallet and federation
@@ -458,19 +534,43 @@ impl Store {
     }
 
     pub(crate) fn add_watch(&self, watch: &Watch) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO watches (id, federation_id, kind, created_at, finished)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                params![
-                    watch.id,
-                    watch.federation_id,
-                    watch.kind.as_str(),
-                    to_db(watch.created_at)
-                ],
-            )
-            .map_err(db_err)?;
-        Ok(())
+        insert_watch(&self.conn, watch)
+    }
+
+    /// A Spending row and the watch that will finish it, in one write: a crash
+    /// must not leave a row nothing will ever update.
+    pub(crate) fn add_receive(&self, item: &HistoryItem, watch: &Watch) -> Result<()> {
+        let tx = begin(&self.conn)?;
+        upsert_in(&tx, WalletKind::Spending, &watch.federation_id, item)?;
+        insert_watch(&tx, watch)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// Adds a deposit watch, then keeps at most `cap` unused ones of its
+    /// federation by finishing the oldest. Unused means no deposit has shown up
+    /// yet: a watch with a history row has money on its way.
+    pub(crate) fn add_deposit_watch(&self, watch: &Watch, cap: usize) -> Result<()> {
+        let tx = begin(&self.conn)?;
+        insert_watch(&tx, watch)?;
+        tx.execute(
+            "UPDATE watches SET finished = 1 WHERE id IN (
+                SELECT w.id FROM watches w
+                WHERE w.federation_id = ?1 AND w.kind = ?2 AND w.finished = 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM history h
+                    WHERE h.federation_id = w.federation_id AND h.id = w.id
+                  )
+                ORDER BY w.created_at DESC, w.rowid DESC
+                LIMIT -1 OFFSET ?3
+            )",
+            params![
+                watch.federation_id,
+                WatchKind::Deposit.as_str(),
+                i64::try_from(cap).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
     }
 
     /// Finishing an unknown id does nothing.
@@ -673,6 +773,131 @@ mod tests {
         assert_eq!(ids(&page), ["b", "a"]);
         assert_eq!(page[1].status, HistoryStatus::Complete);
         assert_eq!(page[1].timestamp, 1);
+    }
+
+    #[test]
+    fn upsert_reports_what_it_did() {
+        let (_d, store) = open();
+        let write = |item: &HistoryItem| {
+            store
+                .upsert_history(WalletKind::Spending, Some("f"), item)
+                .unwrap()
+        };
+        let pending = item("a", 1);
+        assert_eq!(write(&pending), HistoryWrite::Added);
+        assert_eq!(write(&pending), HistoryWrite::Unchanged);
+        let done = HistoryItem {
+            status: HistoryStatus::Complete,
+            ..pending.clone()
+        };
+        assert_eq!(
+            write(&done),
+            HistoryWrite::Changed {
+                was: HistoryStatus::Pending
+            }
+        );
+        assert_eq!(write(&done), HistoryWrite::Unchanged);
+    }
+
+    #[test]
+    fn a_final_status_is_not_taken_back_by_a_replay() {
+        let (_d, store) = open();
+        let mut row = item("a", 1);
+        row.status = HistoryStatus::Complete;
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &row)
+            .unwrap();
+        row.status = HistoryStatus::Confirming {
+            confirmations: 1,
+            required: 6,
+        };
+        assert_eq!(
+            store.upsert_history(WalletKind::Spending, Some("f"), &row),
+            Ok(HistoryWrite::Unchanged)
+        );
+        let page = store
+            .history_page(WalletKind::Spending, Some("f"), None, 10)
+            .unwrap();
+        assert_eq!(page[0].status, HistoryStatus::Complete);
+    }
+
+    #[test]
+    fn a_history_row_is_found_by_id_within_its_federation() {
+        let (_d, store) = open();
+        let row = item("a", 1);
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &row)
+            .unwrap();
+        assert_eq!(
+            store.history_item(WalletKind::Spending, Some("f"), "a"),
+            Ok(Some(row))
+        );
+        assert_eq!(
+            store.history_item(WalletKind::Spending, Some("g"), "a"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_receive_writes_its_row_and_watch_together() {
+        let (_d, store) = open();
+        let watch = Watch {
+            id: "a".into(),
+            federation_id: "f".into(),
+            kind: WatchKind::LnReceive,
+            created_at: 1,
+        };
+        store.add_receive(&item("a", 1), &watch).unwrap();
+        assert_eq!(store.watches().unwrap(), vec![watch.clone()]);
+        assert!(
+            store
+                .history_item(WalletKind::Spending, Some("f"), "a")
+                .unwrap()
+                .is_some()
+        );
+
+        let raw = rusqlite::Connection::open(store.conn.path().unwrap()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER no_rows BEFORE INSERT ON watches
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+        let second = Watch {
+            id: "b".into(),
+            ..watch
+        };
+        assert!(store.add_receive(&item("b", 2), &second).is_err());
+        assert_eq!(
+            store.history_item(WalletKind::Spending, Some("f"), "b"),
+            Ok(None),
+            "no row without its watch"
+        );
+    }
+
+    #[test]
+    fn deposit_watches_drop_the_oldest_unused_past_the_cap() {
+        let (_d, store) = open();
+        let watch = |id: &str, federation: &str| Watch {
+            id: id.into(),
+            federation_id: federation.into(),
+            kind: WatchKind::Deposit,
+            created_at: 5,
+        };
+        let add = |id: &str, federation: &str| {
+            store.add_deposit_watch(&watch(id, federation), 2).unwrap();
+        };
+        add("seen", "f");
+        store
+            .upsert_history(WalletKind::Spending, Some("f"), &item("seen", 1))
+            .unwrap();
+        add("b", "f");
+        add("other", "g");
+        add("c", "f");
+        add("d", "f");
+        let ids: Vec<String> = store.watches().unwrap().into_iter().map(|w| w.id).collect();
+        // Equal times keep the order of adding: of "b", "c", "d", the two newest
+        // stay. "seen" has a row, and "other" another federation's count.
+        assert_eq!(ids, ["c", "d", "other", "seen"]);
     }
 
     #[test]

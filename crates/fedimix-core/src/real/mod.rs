@@ -6,6 +6,7 @@
 //! never nest, and neither is held across an await.
 
 mod events;
+mod receive;
 mod spending;
 
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use self::events::{Events, left_open, supervise};
@@ -25,7 +26,7 @@ use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream};
 use crate::federation::{FederationClient, FederationPort, FederationPreview, FedimintPort};
 use crate::seed::{DataDirLock, Seed};
-use crate::store::{FederationRow, Store};
+use crate::store::{FederationRow, Store, Watch};
 
 const DB_FILE: &str = "fedimix.db";
 const SAVING_NOT_SET_UP: &str = "Saving arrives in a later version.";
@@ -64,8 +65,10 @@ struct Live {
     notes: Vec<NoteBucket>,
     /// Why the last `open` failed, until one works.
     last_open_error: Option<FedimixError>,
-    /// Ends the supervisor's backoff: a join gave it a client.
+    /// Ends the supervisor's backoff: a join wants it to try now.
     wake: Arc<Notify>,
+    /// Reaches the connection's watches with one that started after them.
+    new_watches: Option<mpsc::UnboundedSender<Watch>>,
 }
 
 /// Task 8 consumes its previews under this lock.
@@ -77,8 +80,6 @@ struct State {
 enum Reached {
     Known(String),
     Joined(FederationPreview, Arc<dyn FederationClient>),
-    /// A known federation that could not open, joined again.
-    Repaired(String, Arc<dyn FederationClient>),
 }
 
 /// A panic can happen with a lock held. The data stays valid, as nothing
@@ -169,13 +170,6 @@ impl Core {
         }
     }
 
-    /// Follows the operations the store still lists for this federation, once
-    /// `client` is connected. A stream that ends with no final update must keep
-    /// its watch: the next connection comes back here.
-    fn resume_watches(&self, _client: &Arc<dyn FederationClient>) {
-        // Task 7.
-    }
-
     fn info(&self, row: &FederationRow) -> FederationInfo {
         let open = *self.gate.borrow() == Gate::Open;
         let online = self.state().live.get(&row.id).is_some_and(|l| l.online);
@@ -197,22 +191,23 @@ impl Core {
         Ok(self.info(row))
     }
 
-    /// Whether `id` cannot open for a reason that waiting will not cure.
-    fn needs_repair(&self, id: &str) -> bool {
-        self.state().live.get(id).is_some_and(|live| {
-            live.client.is_none()
-                && !matches!(live.last_open_error, None | Some(FedimixError::Offline))
-        })
+    /// Tells the supervisor of a known federation that failed to open, for a
+    /// reason that waiting will not cure, to try now. It is the supervisor that
+    /// recovers a client database that is gone.
+    fn retry_open(&self, id: &str) {
+        if let Some(live) = self.state().live.get(id)
+            && live.client.is_none()
+            && !matches!(live.last_open_error, None | Some(FedimixError::Offline))
+        {
+            live.wake.notify_one();
+        }
     }
 
-    /// Preview, network check, join; a known federation needs none of them
-    /// unless it will not open. Nothing but port calls, so it can be dropped
-    /// halfway.
+    /// Preview, network check, join; a known federation needs none of them.
+    /// Nothing but port calls, so it can be dropped halfway.
     async fn reach(&self, invite: &str) -> Result<Reached> {
         let id = self.port.federation_id_of(invite)?;
-        let known = self.store().federations()?.iter().any(|row| row.id == id);
-        let repair = known && self.needs_repair(&id);
-        if known && !repair {
+        if self.store().federations()?.iter().any(|row| row.id == id) {
             return Ok(Reached::Known(id));
         }
         let preview = self.port.preview(invite).await?;
@@ -229,14 +224,8 @@ impl Core {
                 ));
             }
         }
-        // A supervisor's `open` cannot succeed alongside this: both need the
-        // client database, which one process at a time can hold.
         let client = self.port.join(invite, &self.seed).await?;
-        Ok(if repair {
-            Reached::Repaired(id, client)
-        } else {
-            Reached::Joined(preview, client)
-        })
+        Ok(Reached::Joined(preview, client))
     }
 
     async fn join(self: &Arc<Self>, invite: &str) -> Result<FederationInfo> {
@@ -252,15 +241,8 @@ impl Core {
             }
         };
         let (preview, client) = match reached {
-            Reached::Known(id) => return self.federation(&id),
-            Reached::Repaired(id, client) => {
-                let mut state = self.state();
-                let live = state.live.entry(id.clone()).or_default();
-                live.client = Some(client);
-                live.last_open_error = None;
-                live.wake.notify_one();
-                drop(state);
-                self.events.emit(&Event::FederationChanged);
+            Reached::Known(id) => {
+                self.retry_open(&id);
                 return self.federation(&id);
             }
             Reached::Joined(preview, client) => (preview, client),
@@ -481,8 +463,8 @@ impl Backend for RealBackend {
         Err(saving_not_set_up())
     }
 
-    async fn receive(&self, _request: ReceiveRequest) -> Result<ReceiveInfo> {
-        Err(not_available())
+    async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo> {
+        self.core.receive(request).await
     }
 
     async fn prepare_send(&self, _request: SendRequest) -> Result<SendPreview> {

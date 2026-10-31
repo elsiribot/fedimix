@@ -4,10 +4,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fedimix_core::testing::{FakeClient, FakePort, FederationClient, real_backend};
+use fedimix_core::testing::{
+    DepositEvent, FakeClient, FakePort, FederationClient, WatchUpdate, real_backend,
+};
 use fedimix_core::{
-    Amount, Backend, CoreConfig, Event, EventStream, FedimixError, Network, NoteBucket, Result,
-    Settings, WalletKind,
+    Amount, Backend, CoreConfig, Event, EventStream, FedimixError, HistoryItem, HistoryKind,
+    HistoryStatus, Network, NoteBucket, Notice, ReceiveMethod, ReceiveRequest, Result, Settings,
+    WalletKind,
 };
 use tempfile::TempDir;
 
@@ -668,15 +671,15 @@ async fn join_reports_the_balance_of_an_existing_client_database() {
 }
 
 #[tokio::test]
-async fn join_repairs_a_federation_that_will_not_open() {
+async fn join_retries_a_federation_that_will_not_open_at_once() {
     let harness = Harness::new();
     let backend = harness.joined().await;
     backend.shutdown().await.unwrap();
     drop(backend);
 
-    harness
-        .port
-        .set_open_error(Some(FedimixError::UnknownItem("one".into())));
+    let unreadable =
+        FedimixError::Internal("Fedimix could not open this federation's data.".into());
+    harness.port.set_open_error(Some(unreadable));
     let backend = harness.open().await.unwrap();
     wait_until("the open to fail", || async {
         harness.port.open_failures() > 0
@@ -688,7 +691,8 @@ async fn join_repairs_a_federation_that_will_not_open() {
     harness.first.set_balance(Amount::from_sat(5));
     let joined = backend.join_federation(INVITE.into()).await.unwrap();
     assert_eq!(joined.id, "one");
-    assert_eq!(harness.port.joins(), joins + 1);
+    assert_eq!(harness.port.joins(), joins, "never a fresh start");
+    assert_eq!(harness.port.recovers(), 0, "the data is there");
     assert_eq!(backend.federations().await.unwrap().len(), 1);
     // The supervisor takes it at once, not at the end of its backoff.
     tokio::time::timeout(Duration::from_millis(500), wait_online(&*backend, true))
@@ -696,7 +700,6 @@ async fn join_repairs_a_federation_that_will_not_open() {
         .unwrap();
     wait_balance(&*backend, Amount::from_sat(5)).await;
     backend.shutdown().await.unwrap();
-    assert_eq!(harness.first.shutdowns(), 2);
 }
 
 #[tokio::test]
@@ -840,5 +843,563 @@ async fn only_a_lasting_connection_resets_the_backoff() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let attempts = port.attempts();
     assert_eq!(attempts.len(), short.len() + 2, "{:?}", gaps(port));
+    backend.shutdown().await.unwrap();
+}
+
+const FIRST_FEDERATION: &str = "one";
+
+fn invoice_request(sat: u64) -> ReceiveRequest {
+    ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::Lightning {
+            amount: Amount::from_sat(sat),
+            description: "test".into(),
+            expiry_secs: 600,
+        },
+    }
+}
+
+fn address_request() -> ReceiveRequest {
+    ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::OnChain,
+    }
+}
+
+fn settled(sat: u64) -> WatchUpdate {
+    WatchUpdate::Settled {
+        amount: Amount::from_sat(sat),
+        fee: Amount::from_sat(1),
+        txid: None,
+    }
+}
+
+fn confirming(confirmations: u32, sat: u64) -> WatchUpdate {
+    WatchUpdate::Confirming {
+        confirmations,
+        required: 6,
+        amount: Amount::from_sat(sat),
+    }
+}
+
+fn deposit_event(cursor: u64, id: &str, confirmed: bool) -> DepositEvent {
+    DepositEvent {
+        cursor,
+        id: id.into(),
+        amount: Amount::from_sat(40_000),
+        fee: Amount::from_sat(100),
+        txid: Some("txid".into()),
+        confirmed,
+    }
+}
+
+/// The watch id `FakeClient` gave a payload: what follows its first `-` of two.
+fn watch_id(payload: &str) -> &str {
+    payload.split_once('-').unwrap().1
+}
+
+async fn rows(backend: &dyn Backend) -> Vec<HistoryItem> {
+    let page = backend.history(WalletKind::Spending, None, 100).await;
+    page.unwrap().items
+}
+
+async fn wait_status(backend: &dyn Backend, id: &str, status: HistoryStatus) {
+    wait_until("the history row", || async {
+        rows(backend)
+            .await
+            .iter()
+            .any(|row| row.id == id && row.status == status)
+    })
+    .await;
+}
+
+/// What arrives within a moment, for tests of what must not.
+async fn drain(events: &EventStream) -> Vec<Event> {
+    let mut seen = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), events.next()).await
+    {
+        seen.push(event);
+    }
+    seen
+}
+
+fn notices(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::Notification(_)))
+        .count()
+}
+
+/// Opens `fedimix.db` beside a backend, for what the API cannot show.
+fn raw_store(harness: &Harness) -> rusqlite::Connection {
+    rusqlite::Connection::open(harness.dir.path().join("fedimix.db")).unwrap()
+}
+
+#[tokio::test]
+async fn invoice_settles_into_history() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+
+    let info = backend.receive(invoice_request(5_000)).await.unwrap();
+    assert_eq!(info.uri, format!("lightning:{}", info.payload));
+    assert_eq!(info.expires_at, Some(1_600));
+    assert_eq!(info.min_deposit, None);
+    let id = watch_id(&info.payload).to_string();
+    let row = rows(&*backend)
+        .await
+        .pop()
+        .expect("the row exists on return");
+    assert_eq!(row.id, id);
+    assert_eq!(row.kind, HistoryKind::ReceivedLightning);
+    assert_eq!(row.status, HistoryStatus::Pending);
+    assert_eq!(row.amount, Amount::from_sat(5_000));
+    assert!(row.incoming);
+    assert_eq!(row.timestamp, 1_000);
+
+    harness.first.push_update(&id, settled(4_990));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    let row = rows(&*backend).await.pop().unwrap();
+    assert_eq!(row.amount, Amount::from_sat(4_990));
+    wait_event(
+        &events,
+        &Event::Notification(Notice::DepositConfirmed {
+            amount: Amount::from_sat(4_990),
+        }),
+    )
+    .await;
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 0);
+}
+
+fn watches_left(harness: &Harness) -> i64 {
+    raw_store(harness)
+        .query_row("SELECT COUNT(*) FROM watches WHERE finished = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn unpaid_invoice_expires() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    let info = backend.receive(invoice_request(5_000)).await.unwrap();
+    let id = watch_id(&info.payload).to_string();
+    harness.first.push_update(&id, WatchUpdate::Expired);
+    wait_status(&*backend, &id, HistoryStatus::Expired).await;
+    assert_eq!(notices(&drain(&events).await), 0);
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 0);
+}
+
+#[tokio::test]
+async fn deposit_walks_through_confirming() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    let info = backend.receive(address_request()).await.unwrap();
+    assert_eq!(info.uri, format!("bitcoin:{}", info.payload));
+    assert_eq!(info.expires_at, None);
+    assert!(
+        rows(&*backend).await.is_empty(),
+        "an address alone adds no row"
+    );
+    let id = watch_id(&info.payload).to_string();
+
+    harness.first.push_update(&id, confirming(1, 40_000));
+    let at_one = HistoryStatus::Confirming {
+        confirmations: 1,
+        required: 6,
+    };
+    wait_status(&*backend, &id, at_one).await;
+    let row = rows(&*backend).await.pop().unwrap();
+    assert_eq!(row.kind, HistoryKind::Deposit);
+    assert_eq!(row.amount, Amount::from_sat(40_000));
+
+    harness.first.push_update(&id, settled(39_900));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    wait_event(
+        &events,
+        &Event::Notification(Notice::DepositConfirmed {
+            amount: Amount::from_sat(39_900),
+        }),
+    )
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_resumes_watches() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let invoice = backend.receive(invoice_request(5_000)).await.unwrap();
+    let address = backend.receive(address_request()).await.unwrap();
+    let (invoice, address) = (watch_id(&invoice.payload), watch_id(&address.payload));
+    harness.first.push_update(address, confirming(1, 40_000));
+    wait_until("the deposit's row", || async {
+        rows(&*backend).await.len() == 2
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    harness.first.push_update(invoice, settled(4_990));
+    harness.first.push_update(address, settled(39_900));
+    let backend = harness.open().await.unwrap();
+    wait_status(&*backend, invoice, HistoryStatus::Complete).await;
+    wait_status(&*backend, address, HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 0);
+}
+
+#[tokio::test]
+async fn a_watch_stream_that_ends_keeps_its_watch() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let info = backend.receive(invoice_request(5_000)).await.unwrap();
+    let id = watch_id(&info.payload).to_string();
+    // Every stream ends with no final update, as a closed client's do.
+    let client: Arc<dyn FederationClient> = harness.first.clone();
+    client.shutdown().await.unwrap();
+    wait_online(&*backend, false).await;
+    assert_eq!(rows(&*backend).await[0].status, HistoryStatus::Pending);
+    assert_eq!(watches_left(&harness), 1);
+
+    wait_online(&*backend, true).await;
+    harness.first.push_update(&id, settled(4_990));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 0);
+}
+
+#[tokio::test]
+async fn a_replayed_completion_notifies_nobody() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    let info = backend.receive(address_request()).await.unwrap();
+    let id = watch_id(&info.payload).to_string();
+    harness.first.push_update(&id, confirming(1, 40_000));
+    harness.first.push_update(&id, settled(39_900));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+    assert_eq!(notices(&drain(&events).await), 1);
+    drop(backend);
+
+    // A crash between writing the row and finishing the watch leaves this.
+    raw_store(&harness)
+        .execute("UPDATE watches SET finished = 0", [])
+        .unwrap();
+    let backend = harness.open().await.unwrap();
+    let events = backend.subscribe();
+    wait_until("the replay to end", || async {
+        watches_left(&harness) == 0
+    })
+    .await;
+    assert_eq!(rows(&*backend).await[0].status, HistoryStatus::Complete);
+    let seen = drain(&events).await;
+    assert_eq!(notices(&seen), 0, "{seen:?}");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_deposits_reach_history_and_notify_once() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    let info = backend.receive(address_request()).await.unwrap();
+    assert!(
+        rows(&*backend).await.is_empty(),
+        "an address alone adds no row"
+    );
+    assert_eq!(watches_left(&harness), 0, "this generation has no watch");
+
+    harness
+        .first
+        .push_deposit(deposit_event(1, "outpoint", false));
+    wait_status(&*backend, "outpoint", HistoryStatus::Pending).await;
+    harness
+        .first
+        .push_deposit(deposit_event(2, "outpoint", true));
+    wait_status(&*backend, "outpoint", HistoryStatus::Complete).await;
+    let row = rows(&*backend).await.pop().unwrap();
+    assert_eq!(row.kind, HistoryKind::Deposit);
+    assert_eq!(row.amount, Amount::from_sat(40_000));
+    let seen = drain(&events).await;
+    assert_eq!(notices(&seen), 1, "{seen:?}");
+    assert!(info.uri.starts_with("bitcoin:"));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_cursor_is_not_replayed_after_restart() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    let backend = harness.joined().await;
+    harness.first.push_deposit(deposit_event(1, "first", true));
+    wait_status(&*backend, "first", HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    let cursor: i64 = raw_store(&harness)
+        .query_row(
+            "SELECT value FROM cursors WHERE name = 'deposits:one'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursor, 1);
+
+    // A row the log would rewrite if it were read again.
+    raw_store(&harness)
+        .execute("DELETE FROM history", [])
+        .unwrap();
+    harness.first.push_deposit(deposit_event(2, "second", true));
+    let backend = harness.open().await.unwrap();
+    wait_status(&*backend, "second", HistoryStatus::Complete).await;
+    assert_eq!(rows(&*backend).await.len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deposit_at_or_below_minimum_is_stated() {
+    let harness = Harness::new();
+    harness.first.set_min_deposit(Ok(Amount::from_sat(1_234)));
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    let info = backend.receive(address_request()).await.unwrap();
+    assert_eq!(info.min_deposit, Some(Amount::from_sat(1_234)));
+
+    // The generation with watches reports a deposit it did not credit.
+    let id = watch_id(&info.payload).to_string();
+    harness.first.push_update(&id, confirming(0, 1_000));
+    let reason =
+        "This deposit was too small to cover the federation's fee, so it was not credited.";
+    harness.first.push_update(
+        &id,
+        WatchUpdate::Failed {
+            reason: reason.into(),
+        },
+    );
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(rows(&*backend).await[0].amount, Amount::from_sat(1_000));
+    assert_eq!(notices(&drain(&events).await), 0);
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 0);
+}
+
+#[tokio::test]
+async fn a_deposit_watch_failing_with_no_deposit_adds_no_row() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let info = backend.receive(address_request()).await.unwrap();
+    let id = watch_id(&info.payload).to_string();
+    harness.first.push_update(
+        &id,
+        WatchUpdate::Failed {
+            reason: "Fedimix has no record of this operation.".into(),
+        },
+    );
+    wait_until("the watch to finish", || async {
+        watches_left(&harness) == 0
+    })
+    .await;
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receive_while_offline_is_offline() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    assert_eq!(
+        backend.receive(invoice_request(1)).await,
+        Err(FedimixError::Offline)
+    );
+    assert_eq!(
+        backend.receive(address_request()).await,
+        Err(FedimixError::Offline)
+    );
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 0);
+}
+
+#[tokio::test]
+async fn no_lightning_module_is_a_sentence() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let error = FedimixError::NotSetUp("This federation does not support Lightning.".into());
+    harness.first.fail_next_invoice(error.clone());
+    assert_eq!(backend.receive(invoice_request(1)).await, Err(error));
+    assert!(rows(&*backend).await.is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receive_needs_spending_and_a_federation() {
+    let harness = Harness::new();
+    let backend = harness.open().await.unwrap();
+    let saving = ReceiveRequest {
+        wallet: WalletKind::Saving,
+        method: ReceiveMethod::OnChain,
+    };
+    assert_eq!(
+        backend.receive(saving).await,
+        Err(FedimixError::NotSetUp(
+            "Saving arrives in a later version.".into()
+        ))
+    );
+    assert_eq!(
+        backend.receive(address_request()).await,
+        Err(FedimixError::NotSetUp(
+            "Join a federation before receiving.".into()
+        ))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unused_deposit_watches_stop_at_the_cap() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let first = backend.receive(address_request()).await.unwrap();
+    let first = watch_id(&first.payload).to_string();
+    let second = backend.receive(address_request()).await.unwrap();
+    let second = watch_id(&second.payload).to_string();
+    // A deposit on its way must not lose its watch, however old.
+    harness.first.push_update(&first, confirming(0, 40_000));
+    wait_until("the deposit's row", || async {
+        rows(&*backend).await.len() == 1
+    })
+    .await;
+    for _ in 0..100 {
+        backend.receive(address_request()).await.unwrap();
+    }
+    backend.shutdown().await.unwrap();
+    assert_eq!(watches_left(&harness), 101, "100 unused, and the one paid");
+    let kept = |id: &str| {
+        raw_store(&harness)
+            .query_row(
+                "SELECT finished = 0 FROM watches WHERE id = ?1",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
+    assert!(kept(&first));
+    assert!(!kept(&second), "the oldest address nobody paid went");
+}
+
+/// A backend whose first federation has lost its client database.
+async fn lost_client_database(harness: &Harness) -> Arc<fedimix_core::RealBackend> {
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+    let backend = harness.open().await.unwrap();
+    wait_until("the recovery to start", || async {
+        harness.port.recovers() > 0
+    })
+    .await;
+    harness.port.set_open_error(None);
+    backend
+}
+
+#[tokio::test]
+async fn a_lost_client_database_recovers_in_the_background() {
+    let harness = Harness::new();
+    harness.first.set_balance(Amount::from_sat(4_000));
+    harness.port.set_recover_held(true);
+    let joins = {
+        let backend = lost_client_database(&harness).await;
+        let quickly = Duration::from_secs(1);
+        let state = tokio::time::timeout(quickly, backend.spending_state()).await;
+        assert!(!state.unwrap().unwrap().federation.unwrap().online);
+        assert_eq!(
+            backend.receive(invoice_request(1)).await,
+            Err(FedimixError::Offline)
+        );
+
+        harness.port.set_recover_held(false);
+        wait_online(&*backend, true).await;
+        wait_balance(&*backend, Amount::from_sat(4_000)).await;
+        backend.shutdown().await.unwrap();
+        harness.port.joins()
+    };
+    assert_eq!(joins, 1, "only the first join, never a fresh start");
+    assert_eq!(harness.port.recovers(), 1);
+}
+
+#[tokio::test]
+async fn a_cut_off_recovery_starts_again_on_the_next_connect() {
+    let harness = Harness::new();
+    harness.port.set_recover_held(true);
+    let backend = lost_client_database(&harness).await;
+    // A proxy aborts the connection task in the middle of the recovery.
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+    backend.set_settings(with_proxy()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    harness.port.set_recover_held(false);
+    backend.set_settings(Settings::default()).await.unwrap();
+    wait_until("a second recovery", || async {
+        harness.port.recovers() == 2
+    })
+    .await;
+    harness.port.set_open_error(None);
+    wait_online(&*backend, true).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_recovery_is_tried_again() {
+    let harness = Harness::new();
+    harness
+        .port
+        .set_recover_error(Some(FedimixError::Internal("It failed.".into())));
+    let backend = lost_client_database(&harness).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!backend.federations().await.unwrap()[0].online);
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(harness.port.recovers() > 1);
+    harness.port.set_recover_error(None);
+    harness.port.set_open_error(None);
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert!(backend.federations().await.unwrap()[0].online);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_reads_the_new_deposit_log_from_the_start() {
+    let harness = Harness::new();
+    harness.first.set_deposit_watches(false);
+    let backend = harness.joined().await;
+    harness.first.push_deposit(deposit_event(1, "old", true));
+    harness.first.push_deposit(deposit_event(2, "older", true));
+    wait_status(&*backend, "older", HistoryStatus::Complete).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // The recovered client starts an empty log; position 2 means nothing in it.
+    harness.first.lose_deposit_log();
+    harness.first.push_deposit(deposit_event(1, "new", true));
+    harness
+        .port
+        .set_open_error(Some(FedimixError::UnknownItem(FIRST_FEDERATION.into())));
+    let backend = harness.open().await.unwrap();
+    wait_until("the recovery", || async { harness.port.recovers() > 0 }).await;
+    harness.port.set_open_error(None);
+    wait_status(&*backend, "new", HistoryStatus::Complete).await;
     backend.shutdown().await.unwrap();
 }

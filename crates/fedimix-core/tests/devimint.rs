@@ -17,7 +17,11 @@ use fedimix_core::testing::{
     DataDirLock, DepositEvent, FederationClient, FederationPort, FedimintPort, Seed, Watch,
     WatchKind, WatchUpdate,
 };
-use fedimix_core::{Amount, Backend, CoreConfig, FedimixError, Network, RealBackend, SendAmount};
+use fedimix_core::{
+    Amount, Backend, CoreConfig, Event, EventStream, FedimixError, HistoryItem, HistoryStatus,
+    Network, Notice, RealBackend, ReceiveInfo, ReceiveMethod, ReceiveRequest, SendAmount,
+    WalletKind,
+};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use tempfile::TempDir;
@@ -645,8 +649,8 @@ async fn withdraw_quote_reports_the_real_problem() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs devimint"]
 async fn restart_keeps_federation_and_balance() {
-    // Receive is not in `RealBackend` yet, so fund the folder through the port.
-    // Joining then finds the client database and opens it.
+    // Funded through the port. Joining then finds the client database and opens
+    // it.
     let wallet = Wallet::new();
     let client = funded(&wallet, 10_000).await;
     let balance = client.balance().await.unwrap();
@@ -692,4 +696,271 @@ async fn connected_with(backend: &RealBackend, balance: Amount) {
     })
     .await
     .expect("the federation connects with its balance");
+}
+
+fn folder() -> (TempDir, CoreConfig) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = CoreConfig {
+        data_dir: dir.path().to_str().unwrap().to_string(),
+        network: Network::Regtest,
+    };
+    (dir, config)
+}
+
+/// A backend in `config`'s folder, connected to the federation.
+async fn joined_backend(config: &CoreConfig) -> Arc<RealBackend> {
+    let backend = RealBackend::open(config.clone()).await.unwrap();
+    backend.join_federation(invite()).await.unwrap();
+    wait_online(&backend).await;
+    backend
+}
+
+async fn wait_online(backend: &RealBackend) {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            let state = backend.spending_state().await.unwrap();
+            if state.federation.is_some_and(|f| f.online) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the federation connects");
+}
+
+async fn invoice(backend: &RealBackend, sat: u64) -> ReceiveInfo {
+    let request = ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::Lightning {
+            amount: Amount::from_sat(sat),
+            description: "test".into(),
+            expiry_secs: 3600,
+        },
+    };
+    backend.receive(request).await.unwrap()
+}
+
+async fn address(backend: &RealBackend) -> ReceiveInfo {
+    let request = ReceiveRequest {
+        wallet: WalletKind::Spending,
+        method: ReceiveMethod::OnChain,
+    };
+    backend.receive(request).await.unwrap()
+}
+
+/// Pays with a new invoice each try, as [`pay_with_lnd`] does.
+async fn pay_backend_with_lnd(backend: &RealBackend, sat: u64) {
+    const TRIES: u32 = 8;
+    for attempt in 1..=TRIES {
+        let info = invoice(backend, sat).await;
+        assert_eq!(info.uri, format!("lightning:{}", info.payload));
+        let pay = format!("timeout 30 $FM_LNCLI payinvoice --force {}", info.payload);
+        match sh(&pay) {
+            Ok(_) => return,
+            Err(e) => eprintln!("payinvoice attempt {attempt} failed: {e}"),
+        }
+    }
+    panic!("LND could not pay {TRIES} invoices");
+}
+
+async fn rows(backend: &RealBackend) -> Vec<HistoryItem> {
+    let page = backend.history(WalletKind::Spending, None, 100).await;
+    page.unwrap().items
+}
+
+async fn completed(backend: &RealBackend) -> Option<HistoryItem> {
+    let rows = rows(backend).await;
+    rows.into_iter()
+        .find(|row| row.status == HistoryStatus::Complete)
+}
+
+/// Waits for a `Complete` row and its `Notice`, and that there is one of each.
+async fn wait_received(backend: &RealBackend, events: &EventStream) -> HistoryItem {
+    let notice = tokio::time::timeout(PATIENCE, async {
+        loop {
+            if let Some(Event::Notification(Notice::DepositConfirmed { amount })) =
+                events.next().await
+            {
+                return amount;
+            }
+        }
+    })
+    .await
+    .expect("the notice arrives");
+    let row = completed(backend)
+        .await
+        .expect("the row precedes the notice");
+    assert_eq!(row.amount, notice);
+    row
+}
+
+/// As [`wait_received`], mining a block a second.
+async fn mine_until_received(backend: &RealBackend, events: &EventStream) -> HistoryItem {
+    let waiting = wait_received(backend, events);
+    let mut waiting = std::pin::pin!(waiting);
+    loop {
+        tokio::select! {
+            row = &mut waiting => return row,
+            () = tokio::time::sleep(Duration::from_secs(1)) => mine(1),
+        }
+    }
+}
+
+async fn wait_balance(backend: &RealBackend, wanted: impl Fn(Amount) -> bool) -> Amount {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            let balance = backend.spending_state().await.unwrap().balance;
+            if wanted(balance) {
+                return balance;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the balance arrives")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn receive_lightning_end_to_end() {
+    let (_dir, config) = folder();
+    let backend = joined_backend(&config).await;
+    let events = backend.subscribe();
+    let paid = Amount::from_sat(5_000);
+    pay_backend_with_lnd(&backend, paid.as_sat()).await;
+
+    let row = wait_received(&backend, &events).await;
+    assert!(row.incoming);
+    assert!(row.amount <= paid && row.amount > Amount::ZERO, "{row:?}");
+    let balance = wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    assert!(balance <= row.amount, "{balance:?} {row:?}");
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn receive_onchain_end_to_end() {
+    const DEPOSIT_SAT: u64 = 100_000;
+    let (_dir, config) = folder();
+    let backend = joined_backend(&config).await;
+    let events = backend.subscribe();
+    let info = address(&backend).await;
+    assert_eq!(info.uri, format!("bitcoin:{}", info.payload));
+    assert!(info.min_deposit.unwrap() > Amount::ZERO);
+    assert!(
+        rows(&backend).await.is_empty(),
+        "an address alone adds no row"
+    );
+
+    fund(&info.payload, DEPOSIT_SAT);
+    let row = mine_until_received(&backend, &events).await;
+    assert!(row.amount < Amount::from_sat(DEPOSIT_SAT), "{row:?}");
+    let balance = wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    assert!(balance <= row.amount, "{balance:?} {row:?}");
+    backend.shutdown().await.unwrap();
+}
+
+/// The folder opens again once a dropped backend has let go of it.
+async fn reopened_after_drop(config: &CoreConfig) -> Arc<RealBackend> {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            match RealBackend::open(config.clone()).await {
+                Ok(backend) => return backend,
+                Err(e) => eprintln!("not yet: {e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a dropped backend lets go of its folder")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn killed_mid_deposit_recovers() {
+    const DEPOSIT_SAT: u64 = 100_000;
+
+    // No watch at all before the restart, so the state machines' replay answers
+    // it, not an outcome the operation log kept.
+    let wallet = Wallet::new();
+    let client = wallet.join().await;
+    let (deposit, watch_id) = client.deposit_address().await.unwrap();
+    fund(&deposit, DEPOSIT_SAT);
+    let client = wallet.restart(client).await;
+    match &watch_id {
+        Some(id) => {
+            let stream = client.watch(watch(id, WatchKind::Deposit));
+            let update = mine_until(stream, WatchUpdate::is_final).await;
+            assert!(matches!(update, WatchUpdate::Settled { .. }), "{update:?}");
+        }
+        None => {
+            mine_until(client.deposits(0), |e: &DepositEvent| e.confirmed).await;
+        }
+    }
+    assert!(client.balance().await.unwrap() > Amount::ZERO);
+    client.shutdown().await.unwrap();
+
+    // Through the backend: its watch or log reader stops with the deposit in
+    // mid-air, and the row turns up only after the restart.
+    let (_dir, config) = folder();
+    let backend = joined_backend(&config).await;
+    let info = address(&backend).await;
+    fund(&info.payload, DEPOSIT_SAT);
+    drop(backend);
+    mine(12);
+
+    let backend = reopened_after_drop(&config).await;
+    let events = backend.subscribe();
+    let row = mine_until_received(&backend, &events).await;
+    assert!(row.amount < Amount::from_sat(DEPOSIT_SAT), "{row:?}");
+    wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn lost_client_db_recovers_balance() {
+    let (dir, config) = folder();
+    let backend = joined_backend(&config).await;
+    let id = backend
+        .spending_state()
+        .await
+        .unwrap()
+        .federation
+        .unwrap()
+        .id;
+    let events = backend.subscribe();
+    pay_backend_with_lnd(&backend, 10_000).await;
+    wait_received(&backend, &events).await;
+    let balance = wait_balance(&backend, |balance| balance > Amount::ZERO).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    std::fs::remove_dir_all(dir.path().join("federations").join(&id).join("client")).unwrap();
+
+    let backend = RealBackend::open(config).await.unwrap();
+    connected_with(&backend, balance).await;
+
+    // The next notes must not reuse a nonce the lost database had used.
+    pay_backend_with_lnd(&backend, 5_000).await;
+    wait_balance(&backend, |now| now > balance).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn an_empty_client_database_counts_as_lost() {
+    let wallet = Wallet::new();
+    let id = wallet.port.federation_id_of(&invite()).unwrap();
+    let federation_dir = wallet.dir.path().join("federations").join(&id);
+    std::fs::create_dir_all(federation_dir.join("client")).unwrap();
+    std::fs::set_permissions(&federation_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        wallet.port.open(&id, &wallet.seed).await.err(),
+        Some(FedimixError::UnknownItem(id.clone()))
+    );
+    let client = wallet.port.recover(&invite(), &wallet.seed).await.unwrap();
+    assert_eq!(client.balance().await.unwrap(), Amount::ZERO);
+    client.shutdown().await.unwrap();
 }

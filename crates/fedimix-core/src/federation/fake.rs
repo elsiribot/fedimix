@@ -37,6 +37,10 @@ impl<T: Clone + Send + Sync + 'static> Log<T> {
         self.items.send_modify(|items| items.push(item));
     }
 
+    fn clear(&self) {
+        self.items.send_modify(Vec::clear);
+    }
+
     /// Follows from index `from`; ends when `alive` turns false.
     fn follow(&self, from: usize, alive: watch::Receiver<bool>) -> BoxStream<'static, T> {
         let items = self.items.subscribe();
@@ -189,6 +193,11 @@ impl FakeClient {
 
     pub fn push_deposit(&self, event: DepositEvent) {
         self.deposits.push(event);
+    }
+
+    /// Forgets the log of deposits, as a recovered client database has.
+    pub fn lose_deposit_log(&self) {
+        self.deposits.clear();
     }
 
     /// Makes the next balance stream panic, as a bug in a task would.
@@ -437,6 +446,10 @@ pub struct FakePort {
     /// While set, `open` fails with this after connecting.
     open_error: Mutex<Option<FedimixError>>,
     open_failures: AtomicU32,
+    /// While set, `recover` hangs, as it does for a long federation history.
+    recover_held: watch::Sender<bool>,
+    recover_error: Mutex<Option<FedimixError>>,
+    recovers: AtomicU32,
 }
 
 impl FakePort {
@@ -478,6 +491,21 @@ impl FakePort {
     /// Calls of `open` that hit [`Self::set_open_error`].
     pub fn open_failures(&self) -> u32 {
         self.open_failures.load(Ordering::SeqCst)
+    }
+
+    /// `recover` hangs until this is set back to `false`.
+    pub fn set_recover_held(&self, held: bool) {
+        self.recover_held.send_replace(held);
+    }
+
+    /// While set, `recover` fails with this.
+    pub fn set_recover_error(&self, error: Option<FedimixError>) {
+        *self.recover_error.lock().unwrap() = error;
+    }
+
+    /// Calls of `recover` that got through to the federation.
+    pub fn recovers(&self) -> u32 {
+        self.recovers.load(Ordering::SeqCst)
     }
 
     pub fn attempts(&self) -> Vec<tokio::time::Instant> {
@@ -559,6 +587,17 @@ impl FederationPort for FakePort {
             .find(|(preview, _)| preview.id == id)
             .ok_or_else(|| FedimixError::UnknownItem(id.to_string()))?;
         Ok(reopened(Arc::clone(client)))
+    }
+
+    async fn recover(&self, invite: &str, _root: &Seed) -> Result<Arc<dyn FederationClient>> {
+        self.connect().await?;
+        let client = self.by_invite(invite)?.1;
+        self.recovers.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.recover_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
+        let recover_error = self.recover_error.lock().unwrap().clone();
+        recover_error.map_or(Ok(()), Err)?;
+        Ok(reopened(client))
     }
 }
 

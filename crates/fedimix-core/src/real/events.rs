@@ -142,12 +142,14 @@ async fn close_client(core: &Core, id: &str) -> Result<()> {
 }
 
 /// Returns when the client's streams end: a closed client has not ended the
-/// federation, so the supervisor connects again.
+/// federation, so the supervisor connects again. Everything here can stop at any
+/// await: a proxy or a shutdown aborts this task, and with it the watches it
+/// started, which the next connection takes up from the store.
 async fn connect_and_forward(core: Arc<Core>, id: String) {
     let attached = core.state().live.get(&id).and_then(|l| l.client.clone());
     let client = match attached {
         Some(client) => client,
-        None => match core.port.open(&id, &core.seed).await {
+        None => match core.connect(&id).await {
             Ok(client) => {
                 let mut state = core.state();
                 let live = state.live.entry(id.clone()).or_default();
@@ -164,7 +166,7 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
             }
         },
     };
-    core.resume_watches(&client);
+    let mut watches = core.resume_watches(&client, &id);
     let mut balances = client.balance_changes();
     let mut online = client.online_changes();
     loop {
@@ -177,6 +179,7 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
                 Some(status) => forward_online(&core, &id, status),
                 None => return,
             },
+            () = watches.tend() => {}
         }
     }
 }

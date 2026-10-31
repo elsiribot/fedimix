@@ -383,7 +383,8 @@ pub struct ReceiveInfo {
     pub uri: String,
     /// When an invoice stops being payable; addresses do not expire.
     pub expires_at: Option<Timestamp>,
-    /// On-chain deposits below this are not credited.
+    /// On-chain deposits below this are not credited. It is a floor, not a
+    /// promise: a deposit just above it can still fall short of the fees.
     pub min_deposit: Option<Amount>,
 }
 

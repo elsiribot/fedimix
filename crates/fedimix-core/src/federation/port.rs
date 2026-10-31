@@ -123,7 +123,16 @@ pub trait FederationPort: Send + Sync {
     fn federation_id_of(&self, invite: &str) -> Result<String>;
     async fn preview(&self, invite: &str) -> Result<FederationPreview>;
     async fn join(&self, invite: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;
+    /// `UnknownItem` means this device holds no client data for `id`. `Offline`
+    /// is the only other error that waiting can cure. Returns once the client
+    /// is usable, so this also waits out a recovery that was cut off earlier.
     async fn open(&self, id: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;
+    /// Rebuilds a client whose data was lost, from what the federation holds
+    /// and `root`, then returns it ready to use. This takes as long as the
+    /// federation's history does, and can be cut off at any await: the next
+    /// `open` or `recover` carries on from what was saved. Never a fresh join:
+    /// that would derive ecash nonces the seed has already used.
+    async fn recover(&self, invite: &str, root: &Seed) -> Result<Arc<dyn FederationClient>>;
 }
 
 /// One federation's client. Calls that only read report `Offline` if the
