@@ -124,11 +124,11 @@ fn lnd_invoice(sat: u64) -> String {
     reply["payment_request"].as_str().unwrap().to_string()
 }
 
-/// Pays with a new invoice each try. The product picks a gateway at random:
-/// LND cannot pay an invoice from its own gateway ("self-payments not allowed")
-/// and often finds no route to the second LDK node, so most tries fail fast.
+/// Pays with a new invoice each try. The product picks a gateway at random, and
+/// LND cannot pay an invoice from its own gateway ("self-payments not allowed").
+/// The other two work: `scripts/fund-gateways.sh` gives each ecash.
 async fn pay_with_lnd(client: &dyn FederationClient, amount: Amount) -> String {
-    const TRIES: u32 = 15;
+    const TRIES: u32 = 8;
     for attempt in 1..=TRIES {
         let (invoice, watch_id) = client
             .lightning_invoice(amount, "test", 3600)
@@ -202,23 +202,6 @@ async fn until_final(stream: BoxStream<'static, WatchUpdate>) -> WatchUpdate {
     last.clone()
 }
 
-async fn wait_for_balance(client: &dyn FederationClient, at_least: Amount) -> Amount {
-    let mut changes = client.balance_changes();
-    tokio::time::timeout(PATIENCE, async {
-        loop {
-            let balance = changes
-                .next()
-                .await
-                .expect("the stream outlives the client");
-            if balance >= at_least {
-                return balance;
-            }
-        }
-    })
-    .await
-    .expect("the balance must arrive")
-}
-
 /// A joined wallet holding about `sat`, received over Lightning.
 async fn funded(wallet: &Wallet, sat: u64) -> Arc<dyn FederationClient> {
     let client = wallet.join().await;
@@ -268,7 +251,7 @@ async fn pay(client: &dyn FederationClient, invoice: &str, amount: Amount) -> St
     let quote = client.lightning_quote(invoice).await.unwrap();
     assert_eq!(quote.amount, amount);
     assert!(quote.fee > Amount::ZERO);
-    client.pay_invoice(invoice).await.unwrap()
+    client.pay_invoice(&quote, "test").await.unwrap()
 }
 
 fn is_sentence(text: &str) -> bool {
@@ -417,17 +400,17 @@ async fn lightning_receive_credits_balance() {
 #[ignore = "needs devimint"]
 async fn pay_invoice_settles() {
     const LND_TRIES: u32 = 3;
-    const TRIES: u32 = 15;
+    const TRIES: u32 = 5;
     let wallet = Wallet::new();
     let client = funded(&wallet, 20_000).await;
     let other = Wallet::new();
     let other_client = other.join().await;
     let paid = Amount::from_sat(2_000);
 
-    // With no gateway named, an LND invoice goes to LND's own gateway, which
-    // cannot pay itself. After those tries, pay another wallet on the
-    // federation: its invoices name a random gateway, and some of them refund
-    // too. A refund must bring the money back.
+    // With no gateway named, an LND invoice goes to LND's own gateway. Its node
+    // issued the invoice, so it looks for a direct swap, finds none and refunds
+    // without trying Lightning. After those tries, pay another wallet on the
+    // federation. A refund must bring the money back.
     let mut settled = None;
     for attempt in 1..=TRIES {
         let invoice = if attempt <= LND_TRIES {
@@ -450,7 +433,11 @@ async fn pay_invoice_settles() {
             }
             WatchUpdate::Refunded => {
                 eprintln!("REFUNDED on attempt {attempt}");
-                wait_for_balance(&*client, before.saturating_sub(Amount::from_sat(100))).await;
+                let restored = client.balance().await.unwrap();
+                assert!(
+                    restored >= before.saturating_sub(Amount::from_sat(100)),
+                    "{restored:?} of {before:?}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -490,7 +477,7 @@ async fn withdraw_returns_txid() {
     assert!(max.amount > sent);
     assert!(max.amount.checked_add(max.fee).unwrap() <= before);
 
-    let id = client.withdraw(&quote).await.unwrap();
+    let id = client.withdraw(&quote, "test").await.unwrap();
     let update = until_final(client.watch(watch(&id, WatchKind::Withdraw))).await;
     let WatchUpdate::Settled { amount, txid, .. } = update.clone() else {
         panic!("{update:?}");
@@ -559,4 +546,97 @@ async fn unknown_invite_is_a_sentence() {
     );
     let reply = wallet.port.preview(&dead.to_string()).await;
     assert_eq!(reply.err(), Some(FedimixError::Offline));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn deposit_at_or_below_fee_is_not_settled() {
+    let wallet = Wallet::new();
+    let client = wallet.join().await;
+    let (address, watch_id) = client.deposit_address().await.unwrap();
+    // Only a generation with deposit watches can report a final state here: the
+    // other one never logs a deposit it cannot claim.
+    let Some(id) = watch_id else {
+        return;
+    };
+    fund(&address, client.min_deposit().await.unwrap().as_sat());
+    let stream = client.watch(watch(&id, WatchKind::Deposit));
+    match mine_until(stream, WatchUpdate::is_final).await {
+        WatchUpdate::Failed { reason } => assert!(is_sentence(&reason), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(client.balance().await.unwrap(), Amount::ZERO);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn changed_gateway_terms_refuse_the_payment() {
+    let wallet = Wallet::new();
+    let client = funded(&wallet, 10_000).await;
+    let before = client.balance().await.unwrap();
+    let mut quote = client.lightning_quote(&lnd_invoice(1_000)).await.unwrap();
+    quote.terms.fee_ppm += 1;
+    assert_eq!(
+        client.pay_invoice(&quote, "test").await.err(),
+        Some(FedimixError::PreviewExpired)
+    );
+    assert_eq!(client.balance().await.unwrap(), before);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn find_operation_locates_a_payment() {
+    let wallet = Wallet::new();
+    let client = funded(&wallet, 100_000).await;
+    assert_eq!(client.find_operation("never-sent").await.unwrap(), None);
+
+    let quote = client.lightning_quote(&lnd_invoice(2_000)).await.unwrap();
+    let paid = client.pay_invoice(&quote, "intent-pay").await.unwrap();
+    let address = btc("getnewaddress");
+    let quote = client
+        .withdraw_quote(&address, SendAmount::Exact(Amount::from_sat(20_000)))
+        .await
+        .unwrap();
+    let withdrawn = client.withdraw(&quote, "intent-withdraw").await.unwrap();
+
+    let client = wallet.restart(client).await;
+    assert_eq!(
+        client.find_operation("intent-pay").await.unwrap(),
+        Some(paid)
+    );
+    assert_eq!(
+        client.find_operation("intent-withdraw").await.unwrap(),
+        Some(withdrawn)
+    );
+    assert_eq!(client.find_operation("never-sent").await.unwrap(), None);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn withdraw_quote_reports_the_real_problem() {
+    let wallet = Wallet::new();
+    let client = wallet.join().await;
+    let address = btc("getnewaddress");
+
+    // More than the federation holds is about the balance, not the connection.
+    let reply = client
+        .withdraw_quote(&address, SendAmount::Exact(Amount::from_sat(1 << 50)))
+        .await;
+    assert!(
+        matches!(reply, Err(FedimixError::InsufficientFunds { .. })),
+        "{reply:?}"
+    );
+
+    // Dust is refused before anyone confirms it.
+    let reply = client
+        .withdraw_quote(&address, SendAmount::Exact(Amount::from_sat(100)))
+        .await;
+    assert!(
+        matches!(reply, Err(FedimixError::InvalidAmount(_))),
+        "{reply:?}"
+    );
+    client.shutdown().await.unwrap();
 }

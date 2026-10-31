@@ -12,8 +12,8 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 
 use super::port::{
-    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote, WatchUpdate,
-    WithdrawQuote, WithdrawTerms,
+    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote,
+    LightningTerms, WatchUpdate, WithdrawQuote, WithdrawTerms,
 };
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
@@ -82,6 +82,8 @@ pub(crate) struct FakeClient {
     invoice_amounts: Mutex<HashMap<String, Amount>>,
     paid: Mutex<Vec<String>>,
     withdrawn: Mutex<Vec<WithdrawQuote>>,
+    /// Watch ids of submitted operations, by intent.
+    intents: Mutex<HashMap<String, String>>,
     watches: Mutex<HashMap<String, Arc<Log<WatchUpdate>>>>,
     deposits: Log<DepositEvent>,
     shutdowns: AtomicU32,
@@ -108,6 +110,7 @@ impl FakeClient {
             invoice_amounts: Mutex::default(),
             paid: Mutex::default(),
             withdrawn: Mutex::default(),
+            intents: Mutex::default(),
             watches: Mutex::default(),
             deposits: Log::new(),
             shutdowns: AtomicU32::new(0),
@@ -204,6 +207,15 @@ impl FakeClient {
         format!("{prefix}-{n}")
     }
 
+    fn submitted(&self, prefix: &str, intent: &str) -> String {
+        let id = self.next_id(prefix);
+        self.intents
+            .lock()
+            .unwrap()
+            .insert(intent.to_string(), id.clone());
+        id
+    }
+
     /// Takes `amount` plus `fee` from the balance, or refuses.
     fn debit(&self, amount: Amount, fee: Amount) -> Result<()> {
         let needed = amount.checked_add(fee).expect("test amounts fit");
@@ -274,17 +286,23 @@ impl FederationClient for FakeClient {
             FedimixError::InvalidDestination("That is not a valid Lightning invoice.".into())
         })?;
         Ok(LightningQuote {
+            invoice: invoice.to_string(),
             amount,
             fee: *self.lightning_fee.lock().unwrap(),
+            terms: LightningTerms {
+                gateway: "http://gateway.fake/".into(),
+                fee_base_msat: 0,
+                fee_ppm: 0,
+                expiration_delta: 0,
+            },
         })
     }
 
-    async fn pay_invoice(&self, invoice: &str) -> Result<String> {
+    async fn pay_invoice(&self, quote: &LightningQuote, intent: &str) -> Result<String> {
         Self::take_error(&self.pay_errors)?;
-        let quote = self.lightning_quote(invoice).await?;
         self.debit(quote.amount, quote.fee)?;
-        self.paid.lock().unwrap().push(invoice.to_string());
-        Ok(self.next_id("ln-send"))
+        self.paid.lock().unwrap().push(quote.invoice.clone());
+        Ok(self.submitted("ln-send", intent))
     }
 
     async fn withdraw_quote(&self, address: &str, amount: SendAmount) -> Result<WithdrawQuote> {
@@ -307,11 +325,15 @@ impl FederationClient for FakeClient {
         })
     }
 
-    async fn withdraw(&self, quote: &WithdrawQuote) -> Result<String> {
+    async fn withdraw(&self, quote: &WithdrawQuote, intent: &str) -> Result<String> {
         Self::take_error(&self.withdraw_errors)?;
         self.debit(quote.amount, quote.fee)?;
         self.withdrawn.lock().unwrap().push(quote.clone());
-        Ok(self.next_id("withdraw"))
+        Ok(self.submitted("withdraw", intent))
+    }
+
+    async fn find_operation(&self, intent: &str) -> Result<Option<String>> {
+        Ok(self.intents.lock().unwrap().get(intent).cloned())
     }
 
     /// Ends after a final update, as the real one does.
@@ -501,13 +523,29 @@ mod tests {
         client.add_invoice("inv", Amount::from_sat(100));
         client.set_lightning_fee(Amount::from_sat(1));
         client.set_balance(Amount::from_sat(150));
-        client.pay_invoice("inv").await.unwrap();
+        let quote = client.lightning_quote("inv").await.unwrap();
+        client.pay_invoice(&quote, "first").await.unwrap();
         assert_eq!(client.balance().await.unwrap(), Amount::from_sat(49));
         assert!(matches!(
-            client.pay_invoice("inv").await,
+            client.pay_invoice(&quote, "second").await,
             Err(FedimixError::InsufficientFunds { .. })
         ));
         assert_eq!(client.paid(), ["inv"]);
+    }
+
+    #[tokio::test]
+    async fn only_a_submitted_intent_is_found() {
+        let client = FakeClient::new("fed", "Fed");
+        client.set_balance(Amount::from_sat(1_000));
+        let quote = client
+            .withdraw_quote("bcrt1", SendAmount::Exact(Amount::from_sat(1)))
+            .await
+            .unwrap();
+        client.fail_next_withdraw(FedimixError::Offline);
+        assert!(client.withdraw(&quote, "lost").await.is_err());
+        let id = client.withdraw(&quote, "sent").await.unwrap();
+        assert_eq!(client.find_operation("sent").await.unwrap(), Some(id));
+        assert_eq!(client.find_operation("lost").await.unwrap(), None);
     }
 
     #[tokio::test]

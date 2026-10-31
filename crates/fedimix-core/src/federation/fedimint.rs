@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fedimint_client::module::error::TransactionSubmitError;
+use fedimint_client::module::oplog::OperationLogEntry;
 use fedimint_client::{Client, ClientBuilder, ClientHandleArc, ClientPreview};
 use fedimint_connectors::{ConnectorRegistry, PeerStatus};
 use fedimint_core::config::ClientConfig;
@@ -16,22 +17,25 @@ use fedimint_core::core::OperationId;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::AmountUnit;
+use fedimint_core::util::SafeUrl;
 use fedimint_core::{NumPeers, PeerId};
 use fedimint_lnv2_client::{
     LightningClientModule, LightningOperationMeta, ReceiveError as LnReceiveError,
-    ReceiveOperationState, SelectGatewayError, SendOperationState, SendPaymentError,
+    ReceiveOperationState, SelectGatewayError, SendOperationMeta, SendOperationState,
+    SendPaymentError, SendWithTermsError,
 };
 use fedimint_lnv2_common::Bolt11InvoiceDescription;
+use fedimint_lnv2_common::gateway_api::PaymentFee;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use lightning_invoice::{Bolt11Invoice, Currency};
 use tokio::sync::{OnceCell, mpsc, watch};
 use tokio::task::JoinSet;
 
-use super::onchain::{Mint, OnChain, config_network, follow_deposits, no_on_chain};
+use super::onchain::{Mint, OnChain, config_network, follow_deposits, no_on_chain, send_meta};
 use super::port::{
-    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote, WatchUpdate,
-    WithdrawQuote,
+    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote,
+    LightningTerms, WatchUpdate, WithdrawQuote,
 };
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
@@ -48,6 +52,12 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 const STREAM_BUFFER: usize = 16;
 pub(super) const NO_RECORD: &str = "Fedimix has no record of this operation.";
+pub(super) const UNREADABLE: &str =
+    "This operation finished, but Fedimix could not read its details.";
+/// The key in an operation's custom metadata that holds the caller's intent.
+pub(super) const INTENT_KEY: &str = "fedimix_intent";
+/// How many of the newest operations `find_operation` reads.
+const FIND_LIMIT: usize = 1000;
 
 pub(super) fn failed(reason: &str) -> WatchUpdate {
     WatchUpdate::Failed {
@@ -65,6 +75,14 @@ fn fedimint_amount(amount: Amount) -> fedimint_core::Amount {
 
 pub(super) fn sat_amount(amount: bitcoin::Amount) -> Amount {
     Amount::from_sat(amount.to_sat())
+}
+
+/// Two amounts added, for a fee the user is shown: refuses rather than hide an
+/// overflow.
+pub(super) fn total_of(a: Amount, b: Amount) -> Result<Amount> {
+    a.checked_add(b).ok_or_else(|| {
+        FedimixError::Internal("The federation's fee is too large to add up.".into())
+    })
 }
 
 pub(super) fn whole_sats(amount: Amount) -> Result<bitcoin::Amount> {
@@ -430,14 +448,14 @@ async fn follow_ln_receive(client: &Client, op: OperationId, tx: &mpsc::Sender<W
     while let Some(state) = states.next().await {
         let update = match state {
             ReceiveOperationState::Pending | ReceiveOperationState::Claiming => continue,
-            ReceiveOperationState::Claimed => {
-                let (amount, fee) = received(client, op).await.unwrap_or_default();
-                WatchUpdate::Settled {
+            ReceiveOperationState::Claimed => received(client, op).await.map_or_else(
+                || failed(UNREADABLE),
+                |(amount, fee)| WatchUpdate::Settled {
                     amount,
                     fee,
                     txid: None,
-                }
-            }
+                },
+            ),
             ReceiveOperationState::Expired => WatchUpdate::Expired,
             ReceiveOperationState::Failure => failed("The federation did not credit this payment."),
             ReceiveOperationState::Uneconomical => {
@@ -459,24 +477,29 @@ async fn received(client: &Client, op: OperationId) -> Option<(Amount, Amount)> 
     }
 }
 
-/// Waits for the change, which is still being issued when the payment succeeds:
-/// a settled operation must leave the balance whole.
-async fn paid(client: &Client, op: OperationId) -> Option<(Amount, Amount)> {
+/// Waits for the funding transaction's change. Fedimint reports both success and
+/// a refund while it is still being issued, and a final update must leave the
+/// balance whole. An issuance error is ignored: the outcome stands either way.
+async fn sent(client: &Client, op: OperationId) -> Option<SendOperationMeta> {
     let entry = client.operation_log().get_operation(op).await?;
-    match entry.try_meta::<LightningOperationMeta>().ok()? {
-        LightningOperationMeta::Send(meta) => {
-            let fee = meta.gateway_fee();
-            let change = meta.change_outpoint_range.into_iter().collect();
-            let _ = client
-                .await_primary_bitcoin_module_outputs(op, change)
-                .await;
-            Some((
-                amount_of(meta.contract.amount.saturating_sub(fee)),
-                amount_of(fee),
-            ))
-        }
-        _ => None,
-    }
+    let LightningOperationMeta::Send(meta) = entry.try_meta::<LightningOperationMeta>().ok()?
+    else {
+        return None;
+    };
+    let change = meta.change_outpoint_range.into_iter().collect();
+    let _ = client
+        .await_primary_bitcoin_module_outputs(op, change)
+        .await;
+    Some(meta)
+}
+
+async fn paid(client: &Client, op: OperationId) -> Option<(Amount, Amount)> {
+    let meta = sent(client, op).await?;
+    let fee = meta.gateway_fee();
+    Some((
+        amount_of(meta.contract.amount.saturating_sub(fee)),
+        amount_of(fee),
+    ))
 }
 
 async fn follow_ln_send(client: &Client, op: OperationId, tx: &mpsc::Sender<WatchUpdate>) {
@@ -494,19 +517,35 @@ async fn follow_ln_send(client: &Client, op: OperationId, tx: &mpsc::Sender<Watc
             SendOperationState::Funding
             | SendOperationState::Funded
             | SendOperationState::Refunding => continue,
-            SendOperationState::Success(_) => {
-                let (amount, fee) = paid(client, op).await.unwrap_or_default();
-                WatchUpdate::Settled {
+            SendOperationState::Success(_) => paid(client, op).await.map_or_else(
+                || failed(UNREADABLE),
+                |(amount, fee)| WatchUpdate::Settled {
                     amount,
                     fee,
                     txid: None,
-                }
+                },
+            ),
+            SendOperationState::Refunded => {
+                sent(client, op).await;
+                WatchUpdate::Refunded
             }
-            SendOperationState::Refunded => WatchUpdate::Refunded,
             SendOperationState::Failure => failed("The payment failed."),
         };
         let _ = tx.send(update).await;
     }
+}
+
+/// The intent recorded on a payment or withdrawal.
+fn intent_of(entry: &OperationLogEntry) -> Option<String> {
+    let meta = if entry.operation_module_kind() == fedimint_lnv2_common::KIND.as_str() {
+        match entry.try_meta::<LightningOperationMeta>().ok()? {
+            LightningOperationMeta::Send(meta) => meta.custom_meta,
+            _ => return None,
+        }
+    } else {
+        send_meta(entry)?
+    };
+    Some(meta.get(INTENT_KEY)?.as_str()?.to_string())
 }
 
 async fn follow(client: &Client, watch: Watch, tx: mpsc::Sender<WatchUpdate>) {
@@ -625,10 +664,10 @@ impl FederationClient for FedimintClient {
         {
             return Err(wrong_currency());
         }
-        let (_, routing) = read(ln.select_gateway(Some(parsed.clone())))
+        let (gateway, routing) = read(ln.select_gateway(Some(parsed.clone())))
             .await?
             .map_err(|e| no_gateway(&e))?;
-        let (send_fee, _) = routing.send_parameters(&parsed);
+        let (send_fee, expiration_delta) = routing.send_parameters(&parsed);
         let contract = send_fee.add_to(msat);
         let available = amount_of(balance_of(&client).await?);
         let quote = read(ln.send_fee_quote(contract))
@@ -637,25 +676,49 @@ impl FederationClient for FedimintClient {
         let amount = Amount { msat };
         let total = amount_of(contract + quote.total().get_bitcoin());
         Ok(LightningQuote {
+            invoice: invoice.to_string(),
             amount,
             fee: total.saturating_sub(amount),
+            terms: LightningTerms {
+                gateway: gateway.to_string(),
+                fee_base_msat: send_fee.base.msats,
+                fee_ppm: send_fee.parts_per_million,
+                expiration_delta,
+            },
         })
     }
 
-    async fn pay_invoice(&self, invoice: &str) -> Result<String> {
+    async fn pay_invoice(&self, quote: &LightningQuote, intent: &str) -> Result<String> {
         let client = self.client()?;
         let ln = client
             .get_first_module::<LightningClientModule>()
             .map_err(|_| no_lightning())?;
-        let parsed = parse_invoice(invoice)?;
-        let needed = Amount {
-            msat: parsed.amount_milli_satoshis().unwrap_or(0),
+        let parsed = parse_invoice(&quote.invoice)?;
+        let gateway = SafeUrl::parse(&quote.terms.gateway).map_err(|_| {
+            FedimixError::Internal("This quote names a gateway Fedimix cannot read.".into())
+        })?;
+        let send_fee = PaymentFee {
+            base: fedimint_core::Amount::from_msats(quote.terms.fee_base_msat),
+            parts_per_million: quote.terms.fee_ppm,
         };
         let available = amount_of(balance_of(&client).await?);
+        let needed = total_of(quote.amount, quote.fee)?;
         let op = ln
-            .send(parsed, None, serde_json::json!({}))
+            .send_with_terms(
+                parsed,
+                gateway,
+                send_fee,
+                quote.terms.expiration_delta,
+                serde_json::json!({ INTENT_KEY: intent }),
+            )
             .await
-            .map_err(|e| pay_error(&e, available, needed))?;
+            .map_err(|e| match e {
+                SendWithTermsError::TermsChanged { .. } => FedimixError::PreviewExpired,
+                SendWithTermsError::Send(e) => pay_error(&e, available, needed),
+                _ => {
+                    FedimixError::Internal("The Lightning gateway did not take the payment.".into())
+                }
+            })?;
         Ok(op.fmt_full().to_string())
     }
 
@@ -668,12 +731,26 @@ impl FederationClient for FedimintClient {
             .await
     }
 
-    async fn withdraw(&self, quote: &WithdrawQuote) -> Result<String> {
+    async fn withdraw(&self, quote: &WithdrawQuote, intent: &str) -> Result<String> {
         let client = self.client()?;
         let wallet = OnChain::of(&client)?;
         let balance = balance_of(&client).await?;
-        let op = wallet.withdraw(quote, balance, self.network()?).await?;
+        let op = wallet
+            .withdraw(quote, intent, balance, self.network()?)
+            .await?;
         Ok(op.fmt_full().to_string())
+    }
+
+    async fn find_operation(&self, intent: &str) -> Result<Option<String>> {
+        let client = self.client()?;
+        let newest = client
+            .operation_log()
+            .paginate_operations_rev(FIND_LIMIT, None)
+            .await;
+        Ok(newest
+            .iter()
+            .find(|(_, entry)| intent_of(entry).as_deref() == Some(intent))
+            .map(|(key, _)| key.operation_id.fmt_full().to_string()))
     }
 
     fn watch(&self, watch: Watch) -> BoxStream<'static, WatchUpdate> {
@@ -690,8 +767,9 @@ impl FederationClient for FedimintClient {
 
     async fn shutdown(self: Arc<Self>) -> Result<()> {
         self.stop.send_replace(true);
-        let tasks = std::mem::take(&mut *self.tasks.lock().expect("no holder panics"));
-        tasks.join_all().await;
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().expect("no holder panics"));
+        // Not `join_all`: a panicked stream task must not skip closing the client.
+        while tasks.join_next().await.is_some() {}
         let client = self.client.write().expect("no writer panics").take();
         let Some(mut client) = client else {
             return Ok(());

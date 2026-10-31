@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use bitcoin::Address;
 use bitcoin::address::NetworkUnchecked;
+use fedimint_client::module::oplog::OperationLogEntry;
 use fedimint_client::{Client, ClientModuleInstance};
 use fedimint_core::config::{ClientConfig, ClientModuleConfig};
 use fedimint_core::core::OperationId;
@@ -16,7 +17,7 @@ use fedimint_mint_client::MintClientModule as MintV1;
 use fedimint_mintv2_client::MintClientModule as MintV2;
 use fedimint_wallet_client::{
     DepositAddressInfo, DepositStateV2, MaxWithdrawableAmountError, WalletClientModule as WalletV1,
-    WalletOperationMeta, WalletOperationMetaVariant, WithdrawState,
+    WalletOperationMeta, WalletOperationMetaVariant, WithdrawFeesError, WithdrawState,
 };
 use fedimint_wallet_common::PegOutFees;
 use fedimint_walletv2_client::events::{
@@ -30,12 +31,17 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::fedimint::{
-    NO_RECORD, amount_of, failed, quote_error, read, sat_amount, submit_error, whole_sats,
+    INTENT_KEY, NO_RECORD, UNREADABLE, amount_of, failed, quote_error, read, sat_amount,
+    submit_error, total_of, whole_sats,
 };
 use super::port::{DepositEvent, WatchUpdate, WithdrawQuote, WithdrawTerms};
 use crate::api::{Amount, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
 
+const TOO_SMALL: &str =
+    "This deposit was too small to cover the federation's fee, so it was not credited.";
+const CANNOT_SEND: &str = "The federation cannot send that much on chain right now.";
+const NO_TXID: &str = "The federation accepted this withdrawal but reported no transaction, so the money may have left the wallet.";
 const NOT_CLAIMED: &str = "The federation did not credit this deposit.";
 const NO_FEERATE: &str =
     "The federation has not agreed on a Bitcoin fee rate yet. Try again in a few minutes.";
@@ -163,22 +169,25 @@ impl<'c> OnChain<'c> {
                 ));
             }
         };
+        if exact.is_some_and(|send| send < parsed.script_pubkey().minimal_non_dust()) {
+            return Err(too_small_to_send());
+        }
         let available = amount_of(balance);
+        let requested = match amount {
+            SendAmount::Exact(a) => a,
+            _ => Amount::ZERO,
+        };
         match self {
             Self::V1(w) => {
                 let (send, fees) = match exact {
                     Some(send) => {
                         let fees = read(w.get_withdraw_fees(&parsed, send)).await?;
-                        (send, fees.map_err(|_| FedimixError::Offline)?)
+                        let fees = fees.map_err(|e| fees_error(&e, available, Some(requested)))?;
+                        (send, fees)
                     }
                     None => {
                         let max = read(w.max_withdrawable_amount(&parsed, balance)).await?;
-                        max.map_err(|e| match e {
-                            MaxWithdrawableAmountError::BalanceTooLow { .. } => {
-                                too_little(available)
-                            }
-                            _ => FedimixError::Offline,
-                        })?
+                        max.map_err(|e| max_v1_error(&e, available))?
                     }
                 };
                 let funded = send + fees.amount();
@@ -188,7 +197,10 @@ impl<'c> OnChain<'c> {
                 Ok(WithdrawQuote {
                     address: address.to_string(),
                     amount: sat_amount(send),
-                    fee: add(sat_amount(fees.amount()), quote.total().get_bitcoin()),
+                    fee: total_of(
+                        sat_amount(fees.amount()),
+                        amount_of(quote.total().get_bitcoin()),
+                    )?,
                     terms: WithdrawTerms::V1 {
                         sats_per_kvb: fees.fee_rate.sats_per_kvb,
                         total_weight: fees.total_weight,
@@ -203,16 +215,12 @@ impl<'c> OnChain<'c> {
                     }
                     Err(_) => return Err(FedimixError::Offline),
                 };
-                let send =
-                    match exact {
-                        Some(send) => send,
-                        None => read(w.max_sendable_amount(balance, miner)).await?.map_err(
-                            |e| match e {
-                                SendError::InsufficientFunds => too_little(available),
-                                _ => FedimixError::Offline,
-                            },
-                        )?,
-                    };
+                let send = match exact {
+                    Some(send) => send,
+                    None => read(w.max_sendable_amount(balance, miner))
+                        .await?
+                        .map_err(|e| max_v2_error(&e, available))?,
+                };
                 let funded = send + miner;
                 let quote = read(w.send_fee_quote(funded))
                     .await?
@@ -220,7 +228,7 @@ impl<'c> OnChain<'c> {
                 Ok(WithdrawQuote {
                     address: address.to_string(),
                     amount: sat_amount(send),
-                    fee: add(sat_amount(miner), quote.total().get_bitcoin()),
+                    fee: total_of(sat_amount(miner), amount_of(quote.total().get_bitcoin()))?,
                     terms: WithdrawTerms::V2 {
                         miner_fee_sat: miner.to_sat(),
                     },
@@ -233,13 +241,15 @@ impl<'c> OnChain<'c> {
     pub(super) async fn withdraw(
         &self,
         quote: &WithdrawQuote,
+        intent: &str,
         balance: fedimint_core::Amount,
         network: bitcoin::Network,
     ) -> Result<OperationId> {
+        let meta = serde_json::json!({ INTENT_KEY: intent });
         let address = parse_address(&quote.address, network)?;
         let value = whole_sats(quote.amount)?;
         let available = amount_of(balance);
-        let needed = quote.amount.checked_add(quote.fee).unwrap_or(quote.amount);
+        let needed = total_of(quote.amount, quote.fee)?;
         match (self, quote.terms) {
             (
                 Self::V1(w),
@@ -249,36 +259,30 @@ impl<'c> OnChain<'c> {
                 },
             ) => {
                 let fees = PegOutFees::new(sats_per_kvb, total_weight);
-                w.withdraw(&address, value, fees, serde_json::json!({}))
+                w.withdraw(&address, value, fees, meta)
                     .await
                     .map_err(|e| submit_error(&e, available, needed))
             }
             (Self::V2(w), WithdrawTerms::V2 { miner_fee_sat }) => {
                 let miner = bitcoin::Amount::from_sat(miner_fee_sat);
-                w.send(
-                    address.into_unchecked(),
-                    value,
-                    Some(miner),
-                    serde_json::json!({}),
-                )
-                .await
-                .map_err(|e| match e {
-                    SendError::InsufficientFunds => {
-                        FedimixError::InsufficientFunds { available, needed }
-                    }
-                    SendError::DustValue => FedimixError::InvalidAmount(
-                        "That amount is too small to send on chain.".into(),
-                    ),
-                    SendError::WrongNetwork => FedimixError::InvalidDestination(
-                        "This address belongs to a different Bitcoin network.".into(),
-                    ),
-                    SendError::UnsupportedAddress => FedimixError::InvalidDestination(
-                        "This federation cannot send to this kind of address.".into(),
-                    ),
-                    _ => FedimixError::Internal(
-                        "The federation did not accept the withdrawal.".into(),
-                    ),
-                })
+                w.send(address.into_unchecked(), value, Some(miner), meta)
+                    .await
+                    .map_err(|e| match e {
+                        SendError::InsufficientFunds => {
+                            FedimixError::InsufficientFunds { available, needed }
+                        }
+                        SendError::DustValue => too_small_to_send(),
+                        SendError::WrongNetwork => FedimixError::InvalidDestination(
+                            "This address belongs to a different Bitcoin network.".into(),
+                        ),
+                        SendError::UnsupportedAddress => FedimixError::InvalidDestination(
+                            "This federation cannot send to this kind of address.".into(),
+                        ),
+                        SendError::Failed(e) => submit_error(&e, available, needed),
+                        _ => FedimixError::Internal(
+                            "The federation did not accept the withdrawal.".into(),
+                        ),
+                    })
             }
             _ => Err(FedimixError::Internal(
                 "This quote was made for a different federation.".into(),
@@ -333,11 +337,7 @@ impl<'c> OnChain<'c> {
                 DepositStateV2::Claimed {
                     btc_deposited,
                     btc_out_point,
-                } => WatchUpdate::Settled {
-                    amount: sat_amount(btc_deposited).saturating_sub(fee),
-                    fee,
-                    txid: Some(btc_out_point.txid.to_string()),
-                },
+                } => claimed_update(sat_amount(btc_deposited), fee, btc_out_point.txid),
                 DepositStateV2::Failed(_) => failed(NOT_CLAIMED),
             };
             if tx.send(update).await.is_err() {
@@ -347,8 +347,56 @@ impl<'c> OnChain<'c> {
     }
 }
 
-fn add(a: Amount, b: fedimint_core::Amount) -> Amount {
-    a.checked_add(amount_of(b)).unwrap_or(a)
+/// `Claimed` is not proof of a credit: the client declines a deposit at or below
+/// the fee, records the claim as done with no ecash, and the state still reads
+/// `Claimed`.
+fn claimed_update(deposited: Amount, fee: Amount, txid: bitcoin::Txid) -> WatchUpdate {
+    if deposited <= fee {
+        return failed(TOO_SMALL);
+    }
+    WatchUpdate::Settled {
+        amount: deposited.saturating_sub(fee),
+        fee,
+        txid: Some(txid.to_string()),
+    }
+}
+
+/// Why the federation gave no peg-out quote. `requested` is `None` for a sweep,
+/// which never exceeds the balance.
+fn fees_error(
+    error: &WithdrawFeesError,
+    available: Amount,
+    requested: Option<Amount>,
+) -> FedimixError {
+    match (error, requested) {
+        (WithdrawFeesError::Federation(_), _) => FedimixError::Offline,
+        (_, Some(needed)) if needed > available => {
+            FedimixError::InsufficientFunds { available, needed }
+        }
+        _ => FedimixError::InvalidAmount(CANNOT_SEND.into()),
+    }
+}
+
+fn max_v1_error(error: &MaxWithdrawableAmountError, available: Amount) -> FedimixError {
+    match error {
+        MaxWithdrawableAmountError::BalanceTooLow { .. } => too_little(available),
+        MaxWithdrawableAmountError::Fees(e) => fees_error(e, available, None),
+        MaxWithdrawableAmountError::Quote(e) => quote_error(e, available, available),
+        _ => FedimixError::Internal(CANNOT_SEND.into()),
+    }
+}
+
+fn max_v2_error(error: &SendError, available: Amount) -> FedimixError {
+    match error {
+        SendError::InsufficientFunds => too_little(available),
+        SendError::Failed(e) => quote_error(e, available, available),
+        SendError::Federation(_) => FedimixError::Offline,
+        _ => FedimixError::Internal(CANNOT_SEND.into()),
+    }
+}
+
+fn too_small_to_send() -> FedimixError {
+    FedimixError::InvalidAmount("That amount is too small to send on chain.".into())
 }
 
 fn too_little(available: Amount) -> FedimixError {
@@ -370,7 +418,9 @@ async fn withdraw_v1(
         match state {
             WithdrawState::Created => {}
             WithdrawState::Succeeded(txid) => {
-                let (amount, fee) = withdrawn_v1(client, op).await.unwrap_or_default();
+                let Some((amount, fee)) = withdrawn_v1(client, op).await else {
+                    return failed(UNREADABLE);
+                };
                 return WatchUpdate::Settled {
                     amount,
                     fee,
@@ -400,16 +450,19 @@ async fn withdraw_v2(
 ) -> WatchUpdate {
     match w.await_final_send_operation_state(op).await {
         Ok(FinalSendOperationState::Success(txid)) => {
-            let (amount, fee) = withdrawn_v2(client, op).await.unwrap_or_default();
+            let Some((amount, fee)) = withdrawn_v2(client, op).await else {
+                return failed(UNREADABLE);
+            };
             WatchUpdate::Settled {
                 amount,
                 fee,
                 txid: Some(txid.to_string()),
             }
         }
-        Ok(FinalSendOperationState::Aborted | FinalSendOperationState::Failure) => {
+        Ok(FinalSendOperationState::Aborted) => {
             failed("The federation did not accept the withdrawal.")
         }
+        Ok(FinalSendOperationState::Failure) => failed(NO_TXID),
         Err(_) => failed(NO_RECORD),
     }
 }
@@ -432,6 +485,17 @@ async fn withdrawn_v2(client: &Client, op: OperationId) -> Option<(Amount, Amoun
                 .await;
             Some((sat_amount(value), sat_amount(fee)))
         }
+        WalletOperationMetaV2::Receive(_) => None,
+    }
+}
+
+/// The custom metadata of a wallet send, of either generation.
+pub(super) fn send_meta(entry: &OperationLogEntry) -> Option<serde_json::Value> {
+    if entry.operation_module_kind() == fedimint_wallet_common::KIND.as_str() {
+        return Some(entry.try_meta::<WalletOperationMeta>().ok()?.extra_meta);
+    }
+    match entry.try_meta::<WalletOperationMetaV2>().ok()? {
+        WalletOperationMetaV2::Send(meta) => Some(meta.custom_meta),
         WalletOperationMetaV2::Receive(_) => None,
     }
 }
@@ -570,5 +634,69 @@ impl<'c> Mint<'c> {
                 count: u32::try_from(count).unwrap_or(u32::MAX),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AVAILABLE: Amount = Amount { msat: 5_000_000 };
+
+    fn sats(sat: u64) -> Amount {
+        Amount::from_sat(sat)
+    }
+
+    fn txid() -> bitcoin::Txid {
+        "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_claim_that_does_not_beat_the_fee_is_not_settled() {
+        for deposited in [sats(999), sats(1_000)] {
+            assert_eq!(
+                claimed_update(deposited, sats(1_000), txid()),
+                failed(TOO_SMALL)
+            );
+        }
+        assert_eq!(
+            claimed_update(sats(1_001), sats(1_000), txid()),
+            WatchUpdate::Settled {
+                amount: sats(1),
+                fee: sats(1_000),
+                txid: Some(txid().to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn no_quote_is_not_offline() {
+        let no_quote = WithdrawFeesError::NoQuote;
+        assert_eq!(
+            fees_error(&no_quote, AVAILABLE, Some(sats(6_000))),
+            FedimixError::InsufficientFunds {
+                available: AVAILABLE,
+                needed: sats(6_000),
+            }
+        );
+        assert_eq!(
+            fees_error(&no_quote, AVAILABLE, Some(sats(4_000))),
+            FedimixError::InvalidAmount(CANNOT_SEND.into())
+        );
+        assert_eq!(
+            fees_error(&no_quote, AVAILABLE, None),
+            FedimixError::InvalidAmount(CANNOT_SEND.into())
+        );
+    }
+
+    #[test]
+    fn a_sweep_without_a_quote_is_not_offline() {
+        let error = MaxWithdrawableAmountError::Fees(WithdrawFeesError::NoQuote);
+        assert_eq!(
+            max_v1_error(&error, AVAILABLE),
+            FedimixError::InvalidAmount(CANNOT_SEND.into())
+        );
     }
 }

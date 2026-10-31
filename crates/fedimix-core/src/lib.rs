@@ -34,7 +34,7 @@ pub use handle::Fedimix;
 pub mod testing {
     pub use crate::federation::{
         DepositEvent, FederationClient, FederationPort, FederationPreview, FedimintPort,
-        LightningQuote, WatchUpdate, WithdrawQuote,
+        LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};

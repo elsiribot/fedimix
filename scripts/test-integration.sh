@@ -17,6 +17,7 @@ run() {
         -u FM_ENABLE_MODULE_MINTV2 -u FM_ENABLE_MODULE_WALLETV2 \
         FM_FED_SIZE=1 "$@" \
         devimint dev-fed --exec \
+        scripts/fund-gateways.sh \
         env "LD_LIBRARY_PATH=${FEDIMIX_TEST_LD_LIBRARY_PATH:-}" FEDIMIX_EXPECT_MODULES="$gen" \
         cargo test -p fedimix-core --test devimint -- --ignored --test-threads=1 \
         2>&1 | tee "$out"

@@ -9,6 +9,6 @@ mod port;
 
 pub use fedimint::FedimintPort;
 pub use port::{
-    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote, WatchUpdate,
-    WithdrawQuote,
+    DepositEvent, FederationClient, FederationPort, FederationPreview, LightningQuote,
+    LightningTerms, WatchUpdate, WithdrawQuote,
 };
