@@ -9,6 +9,7 @@
 // Used by the Saving operations from Task 5 on.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -23,7 +24,9 @@ use async_hwi::ledger::{HidApi, Ledger};
 use async_hwi::{Error as HwiError, HWI};
 use async_trait::async_trait;
 
-use super::signer::{DevicePort, HwiSigner, Signer, map_hwi_error, on_thread};
+use super::signer::{
+    DevicePort, HwiSigner, Signer, kind_name, map_hwi_error, on_thread, still_waiting,
+};
 use super::wallet::DeviceAccount;
 use crate::api::{DeviceInfo, DeviceKind, Network};
 use crate::error::{FedimixError, Result};
@@ -42,7 +45,12 @@ pub(super) struct Found {
 pub(super) trait Scanner: Send + Sync {
     fn kind(&self) -> DeviceKind;
     async fn scan(&self) -> Result<Vec<Found>>;
-    async fn open(&self, found: &Found) -> Result<Arc<dyn Signer>>;
+    async fn open(
+        &self,
+        found: &Found,
+        account: Option<&DeviceAccount>,
+        busy: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Arc<dyn Signer>>;
 }
 
 fn kind_slug(kind: DeviceKind) -> &'static str {
@@ -161,18 +169,16 @@ impl NoiseConfig for NoiseStore {
 /// The real [`DevicePort`]: every kind async-hwi supports.
 pub struct HwiPort {
     scanners: Vec<Arc<dyn Scanner>>,
-    account: Arc<Mutex<Option<DeviceAccount>>>,
+    /// One lock per device id, held by a signer while a device call runs.
+    busy: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl HwiPort {
     /// `data_dir` holds BitBox02's pairing key; `network` tells Jade and
     /// BitBox02 which coin to use.
     pub fn new(data_dir: &Path, network: Network) -> Self {
-        let account = Arc::new(Mutex::new(None));
         let scanners: Vec<Arc<dyn Scanner>> = vec![
-            Arc::new(LedgerScanner {
-                account: account.clone(),
-            }),
+            Arc::new(LedgerScanner),
             Arc::new(ColdcardScanner),
             Arc::new(JadeScanner {
                 network: btc_network(network),
@@ -182,22 +188,28 @@ impl HwiPort {
                 noise_dir: data_dir.join("bitbox"),
             }),
         ];
-        HwiPort { scanners, account }
+        HwiPort::with_scanners_inner(scanners)
+    }
+
+    fn with_scanners_inner(scanners: Vec<Arc<dyn Scanner>>) -> Self {
+        HwiPort {
+            scanners,
+            busy: Mutex::new(HashMap::new()),
+        }
     }
 
     #[cfg(test)]
     pub(super) fn with_scanners(scanners: Vec<Arc<dyn Scanner>>) -> Self {
-        HwiPort {
-            scanners,
-            account: Arc::new(Mutex::new(None)),
-        }
+        HwiPort::with_scanners_inner(scanners)
     }
 
-    /// The account Saving was set up with. A Ledger needs it to sign: its
-    /// policy names the account's key. Without it Ledger can list and read
-    /// keys, which is all setup needs.
-    pub fn set_account(&self, account: Option<DeviceAccount>) {
-        *self.account.lock().unwrap_or_else(|p| p.into_inner()) = account;
+    fn busy_for(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.busy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Every scanner's answer, in order. One kind failing leaves the rest.
@@ -242,11 +254,32 @@ impl DevicePort for HwiPort {
         }
     }
 
-    async fn connect(&self, id: &str) -> Result<Arc<dyn Signer>> {
+    async fn connect(&self, id: &str, account: Option<&DeviceAccount>) -> Result<Arc<dyn Signer>> {
         for (scanner, found) in self.scan_all().await {
-            if let Some(f) = found.ok().and_then(|v| v.into_iter().find(|f| f.id == id)) {
-                return scanner.open(&f).await;
+            let Some(f) = found.ok().and_then(|v| v.into_iter().find(|f| f.id == id)) else {
+                continue;
+            };
+            // A cancelled call may still be running on this device; a second
+            // handle on it could interleave with that command.
+            let busy = self.busy_for(id);
+            drop(busy.try_lock().map_err(|_| still_waiting())?);
+            let signer = scanner.open(&f, account, busy).await?;
+            if let Some(account) = account {
+                let name = kind_name(scanner.kind());
+                let wrong = || {
+                    FedimixError::Internal(format!(
+                        "The {name} you connected is not the device Saving was set up with. Connect the right one."
+                    ))
+                };
+                if scanner.kind() != account.kind {
+                    return Err(wrong());
+                }
+                let fingerprint = signer.fingerprint().await?;
+                if !fingerprint.eq_ignore_ascii_case(&account.fingerprint) {
+                    return Err(wrong());
+                }
             }
+            return Ok(signer);
         }
         Err(FedimixError::DeviceNotConnected("hardware wallet".into()))
     }
@@ -254,9 +287,7 @@ impl DevicePort for HwiPort {
 
 // ---- Ledger ----
 
-struct LedgerScanner {
-    account: Arc<Mutex<Option<DeviceAccount>>>,
-}
+struct LedgerScanner;
 
 #[async_trait]
 impl Scanner for LedgerScanner {
@@ -286,14 +317,14 @@ impl Scanner for LedgerScanner {
     // `Ledger::with_wallet` with the default `wpkh(@0/**)` policy and
     // `hmac = None` for the account the DeviceAccount holds, as the Ledger app
     // treats that policy as standard. The name of a default policy is empty.
-    async fn open(&self, found: &Found) -> Result<Arc<dyn Signer>> {
+    async fn open(
+        &self,
+        found: &Found,
+        account: Option<&DeviceAccount>,
+        busy: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Arc<dyn Signer>> {
         let path = found.path.clone();
-        let account = self
-            .account
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-            .filter(|a| a.kind == DeviceKind::Ledger);
+        let account = account.filter(|a| a.kind == DeviceKind::Ledger).cloned();
         let ledger = on_thread(move |handle| -> std::result::Result<_, HwiError> {
             let api = HidApi::new().map_err(device_error)?;
             let info = Ledger::enumerate(&api)
@@ -316,7 +347,7 @@ impl Scanner for LedgerScanner {
         })
         .await?
         .map_err(|e| map_hwi_error(DeviceKind::Ledger, &e))?;
-        Ok(Arc::new(HwiSigner::new(ledger, DeviceKind::Ledger)))
+        Ok(Arc::new(HwiSigner::new(ledger, DeviceKind::Ledger, busy)))
     }
 }
 
@@ -351,7 +382,12 @@ impl Scanner for ColdcardScanner {
         .map_err(|e: HwiError| map_hwi_error(DeviceKind::Coldcard, &e))
     }
 
-    async fn open(&self, found: &Found) -> Result<Arc<dyn Signer>> {
+    async fn open(
+        &self,
+        found: &Found,
+        _account: Option<&DeviceAccount>,
+        busy: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Arc<dyn Signer>> {
         let serial = found.path.clone();
         let coldcard = on_thread(move |_| -> std::result::Result<_, HwiError> {
             let api = async_hwi::coldcard::api::Api::new().map_err(device_error)?;
@@ -360,7 +396,11 @@ impl Scanner for ColdcardScanner {
         })
         .await?
         .map_err(|e| map_hwi_error(DeviceKind::Coldcard, &e))?;
-        Ok(Arc::new(HwiSigner::new(coldcard, DeviceKind::Coldcard)))
+        Ok(Arc::new(HwiSigner::new(
+            coldcard,
+            DeviceKind::Coldcard,
+            busy,
+        )))
     }
 }
 
@@ -397,10 +437,15 @@ impl Scanner for JadeScanner {
 
     // `auth` may need the PIN on the device, and then talks to Blockstream's
     // PIN server over plain HTTPS, outside any proxy set in Settings.
-    async fn open(&self, found: &Found) -> Result<Arc<dyn Signer>> {
+    async fn open(
+        &self,
+        found: &Found,
+        _account: Option<&DeviceAccount>,
+        busy: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Arc<dyn Signer>> {
         let (path, network) = (found.path.clone(), self.network);
         let jade = on_thread(move |handle| -> std::result::Result<_, HwiError> {
-            let transport = SerialTransport::new(path).map_err(device_error)?;
+            let transport = SerialTransport::new(path).map_err(|_| HwiError::DeviceNotFound)?;
             let jade = Jade::new(transport).with_network(network);
             handle.block_on(async {
                 jade.ping().await.map_err(HwiError::from)?;
@@ -410,7 +455,7 @@ impl Scanner for JadeScanner {
         })
         .await?
         .map_err(|e| map_hwi_error(DeviceKind::Jade, &e))?;
-        Ok(Arc::new(HwiSigner::new(jade, DeviceKind::Jade)))
+        Ok(Arc::new(HwiSigner::new(jade, DeviceKind::Jade, busy)))
     }
 }
 
@@ -451,7 +496,12 @@ impl Scanner for BitBoxScanner {
     // computer; `wait_confirm` returns once the user confirms on the device,
     // which can take as long as the user takes. Later connections find the
     // device's key in the noise store and need no confirmation.
-    async fn open(&self, found: &Found) -> Result<Arc<dyn Signer>> {
+    async fn open(
+        &self,
+        found: &Found,
+        _account: Option<&DeviceAccount>,
+        busy: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Arc<dyn Signer>> {
         let (path, network, dir) = (found.path.clone(), self.network, self.noise_dir.clone());
         let bitbox = on_thread(move |handle| -> std::result::Result<_, HwiError> {
             let api = HidApi::new().map_err(device_error)?;
@@ -459,7 +509,9 @@ impl Scanner for BitBoxScanner {
                 .device_list()
                 .find(|d| is_bitbox02(d) && d.path().to_string_lossy() == path.as_str())
                 .ok_or(HwiError::DeviceNotFound)?;
-            let device = info.open_device(&api).map_err(device_error)?;
+            let device = info
+                .open_device(&api)
+                .map_err(|_| HwiError::DeviceNotFound)?;
             handle.block_on(async {
                 let pairing = PairingBitbox02::<TokioRuntime>::connect(
                     device,
@@ -472,7 +524,7 @@ impl Scanner for BitBoxScanner {
         })
         .await?
         .map_err(|e| map_hwi_error(DeviceKind::BitBox, &e))?;
-        Ok(Arc::new(HwiSigner::new(bitbox, DeviceKind::BitBox)))
+        Ok(Arc::new(HwiSigner::new(bitbox, DeviceKind::BitBox, busy)))
     }
 }
 
@@ -600,7 +652,12 @@ mod tests {
                     .collect()
             })
         }
-        async fn open(&self, found: &Found) -> Result<Arc<dyn Signer>> {
+        async fn open(
+            &self,
+            found: &Found,
+            _account: Option<&DeviceAccount>,
+            _busy: Arc<tokio::sync::Mutex<()>>,
+        ) -> Result<Arc<dyn Signer>> {
             self.opened.lock().unwrap().push(found.path.clone());
             Ok(Arc::new(crate::saving::SoftSigner::from_seed(
                 &[1; 32],
@@ -654,13 +711,73 @@ mod tests {
             ledger.clone(),
             jade.clone(),
         ]);
-        port.connect("jade:/dev/ttyUSB0").await.unwrap();
+        port.connect("jade:/dev/ttyUSB0", None).await.unwrap();
         assert_eq!(*jade.opened.lock().unwrap(), vec!["/dev/ttyUSB0"]);
         assert!(ledger.opened.lock().unwrap().is_empty());
         assert!(matches!(
-            port.connect("ledger:/dev/gone").await,
+            port.connect("ledger:/dev/gone", None).await,
             Err(FedimixError::DeviceNotConnected(_))
         ));
+    }
+
+    fn soft_fingerprint() -> String {
+        let soft = crate::saving::SoftSigner::from_seed(&[1; 32], bitcoin::Network::Regtest);
+        futures::executor::block_on(soft.fingerprint()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_a_device_that_is_not_the_one_saving_was_set_up_with() {
+        let jade = FakeScanner::ok(DeviceKind::Jade, &["/dev/ttyUSB0"]);
+        let port = HwiPort::with_scanners(vec![jade]);
+        let mut account = account(DeviceKind::Jade);
+        account.fingerprint = "00000000".into();
+        let refused = port.connect("jade:/dev/ttyUSB0", Some(&account)).await;
+        match refused {
+            Err(FedimixError::Internal(s)) => {
+                assert!(s.contains("Jade"), "names the device: {s}");
+                assert!(s.ends_with('.'), "{s}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+        // The right fingerprint (in either case) and no account both connect.
+        account.fingerprint = soft_fingerprint().to_uppercase();
+        port.connect("jade:/dev/ttyUSB0", Some(&account))
+            .await
+            .unwrap();
+        port.connect("jade:/dev/ttyUSB0", None).await.unwrap();
+        // The same fingerprint under another kind is another device.
+        account.kind = DeviceKind::Ledger;
+        assert!(
+            port.connect("jade:/dev/ttyUSB0", Some(&account))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_a_device_with_an_abandoned_call_is_told_at_once() {
+        let jade = FakeScanner::ok(DeviceKind::Jade, &["/dev/ttyUSB0"]);
+        let port = HwiPort::with_scanners(vec![jade.clone()]);
+        // A call that was cancelled but still runs holds the device's lock.
+        let held = port.busy_for("jade:/dev/ttyUSB0").try_lock_owned().unwrap();
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            port.connect("jade:/dev/ttyUSB0", None),
+        )
+        .await
+        .expect("connect must not wait");
+        assert_eq!(
+            blocked.map(|_| ()),
+            Err(FedimixError::Internal(
+                "Your device is still waiting for an answer. Reject it on the device, then try again.".into()
+            ))
+        );
+        assert!(
+            jade.opened.lock().unwrap().is_empty(),
+            "no second handle was opened"
+        );
+        drop(held);
+        port.connect("jade:/dev/ttyUSB0", None).await.unwrap();
     }
 
     #[test]

@@ -25,6 +25,7 @@ use bitcoin::bip32::DerivationPath;
 use bitcoin::psbt::Psbt;
 use tokio::runtime::Handle;
 
+use super::wallet::DeviceAccount;
 use crate::api::{DeviceInfo, DeviceKind};
 use crate::error::{FedimixError, Result};
 
@@ -51,7 +52,7 @@ pub trait DevicePort: Send + Sync {
     async fn list(&self) -> Result<Vec<DeviceInfo>>;
     /// Opens the device `id` from a recent `list`. May need a confirmation on
     /// the device (BitBox02 pairing, Jade PIN).
-    async fn connect(&self, id: &str) -> Result<Arc<dyn Signer>>;
+    async fn connect(&self, id: &str, account: Option<&DeviceAccount>) -> Result<Arc<dyn Signer>>;
 }
 
 /// The name a person knows the device by, for sentences.
@@ -81,7 +82,8 @@ pub(super) fn map_hwi_error(kind: DeviceKind, error: &HwiError) -> FedimixError 
             FedimixError::DeviceNotConnected(name.to_string())
         }
         HwiError::Device(text) => map_device_text(kind, text),
-        HwiError::UnimplementedMethod | HwiError::MissingPolicy => internal(format!(
+        HwiError::MissingPolicy => internal("Set up this device again in Fedimix."),
+        HwiError::UnimplementedMethod => internal(format!(
             "Your {name} cannot do that with this version of Fedimix."
         )),
         HwiError::UnsupportedVersion => internal(format!(
@@ -118,13 +120,45 @@ fn map_device_text(kind: DeviceKind, text: &str) -> FedimixError {
         DeviceKind::Ledger if text.contains("Unknown") || text.contains("Transport") => {
             not_connected()
         }
+        // Coldcard's Display is its Debug: `Hid(HidApiError { .. })`. Untested.
         DeviceKind::Coldcard if text.contains("Hid(") => not_connected(),
-        DeviceKind::Jade if text.contains("Transport") || text.contains("Io(") => not_connected(),
-        DeviceKind::BitBox if text.contains("Hid") || text.contains("NotFound") => not_connected(),
+        // Jade's transport errors display as the io or serial message; an
+        // unplugged adapter is EIO, ENODEV or EPIPE on the stream.
+        DeviceKind::Jade if is_gone_io_text(text) => not_connected(),
+        // bitbox-api displays `hid error: ..`, `communication error: ..` and
+        // `could not find device or device is busy`.
+        DeviceKind::BitBox
+            if text.starts_with("hid error")
+                || text.starts_with("communication error")
+                || text.contains("could not find device") =>
+        {
+            not_connected()
+        }
         _ => internal(format!(
             "Your {name} reported a problem. Unplug it, plug it back in and try again."
         )),
     }
+}
+
+fn is_gone_io_text(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "input/output error",
+        "no such device",
+        "broken pipe",
+        "device not configured",
+        "no device",
+    ]
+    .iter()
+    .any(|gone| text.contains(gone))
+}
+
+const STILL_WAITING: &str =
+    "Your device is still waiting for an answer. Reject it on the device, then try again.";
+
+/// The sentence for a device whose cancelled call has not ended.
+pub(super) fn still_waiting() -> FedimixError {
+    internal(STILL_WAITING)
 }
 
 /// Runs `f` on a thread of its own and waits for it. If the caller's future is
@@ -139,7 +173,9 @@ where
     std::thread::Builder::new()
         .name("fedimix-device".into())
         .spawn(move || {
-            let _ = tx.send(f(handle));
+            // Constructors such as tokio_serial's need a reactor on this thread.
+            let _enter = handle.enter();
+            let _ = tx.send(f(handle.clone()));
         })
         .map_err(|_| internal("Fedimix could not start talking to the device. Try again."))?;
     rx.await
@@ -150,9 +186,10 @@ where
 ///
 /// Dropping a call's future ends the wait, not the call: the device keeps
 /// showing its prompt until the user answers or unplugs it, and the answer is
-/// discarded. The next call on this signer waits for that one to end (two
-/// commands must not interleave on one device), so after cancelling, drop the
-/// signer and `connect` again.
+/// discarded. Until then every call on this signer, and `DevicePort::connect`
+/// for the device (they share `busy`), fails at once with [`still_waiting`]:
+/// two commands must not interleave on one device, and a second handle must not
+/// be opened on a device that is mid-command.
 pub(super) struct HwiSigner<T: HWI + Send + Sync + 'static> {
     hwi: Arc<T>,
     kind: DeviceKind,
@@ -160,11 +197,11 @@ pub(super) struct HwiSigner<T: HWI + Send + Sync + 'static> {
 }
 
 impl<T: HWI + Send + Sync + 'static> HwiSigner<T> {
-    pub(super) fn new(hwi: T, kind: DeviceKind) -> Self {
+    pub(super) fn new(hwi: T, kind: DeviceKind, busy: Arc<tokio::sync::Mutex<()>>) -> Self {
         HwiSigner {
             hwi: Arc::new(hwi),
             kind,
-            busy: Arc::new(tokio::sync::Mutex::new(())),
+            busy,
         }
     }
 
@@ -174,8 +211,14 @@ impl<T: HWI + Send + Sync + 'static> HwiSigner<T> {
         F: FnOnce(Arc<T>, Handle) -> std::result::Result<R, HwiError> + Send + 'static,
     {
         // Owned, and moved into the thread: held until the device call ends,
-        // whether or not anyone still waits for it.
-        let guard = self.busy.clone().lock_owned().await;
+        // whether or not anyone still waits for it. A call whose caller gave up
+        // is still running on the device, so a new one is refused at once
+        // rather than queued behind a prompt that may stand for ever.
+        let guard = self
+            .busy
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| still_waiting())?;
         let hwi = self.hwi.clone();
         let out = on_thread(move |handle| {
             let _guard = guard;
@@ -338,6 +381,10 @@ mod tests {
         }
     }
 
+    fn idle() -> Arc<tokio::sync::Mutex<()>> {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
     fn psbt() -> Psbt {
         built_psbt(&Xpriv::new_master(bitcoin::Network::Regtest, &SEED).unwrap())
     }
@@ -346,7 +393,7 @@ mod tests {
     async fn rejection_maps_to_device_rejected() {
         let hwi = FakeHwi::new(async_hwi::DeviceKind::Ledger);
         *hwi.sign_result.lock().unwrap() = Some(Err(HwiError::UserRefused));
-        let signer = HwiSigner::new(hwi, DeviceKind::Ledger);
+        let signer = HwiSigner::new(hwi, DeviceKind::Ledger, idle());
         let mut psbt = psbt();
         assert_eq!(
             signer.sign(&mut psbt).await,
@@ -360,6 +407,7 @@ mod tests {
         let signer = HwiSigner::new(
             FakeHwi::new(async_hwi::DeviceKind::Coldcard),
             DeviceKind::Coldcard,
+            idle(),
         );
         let mut psbt = psbt();
         signer.sign(&mut psbt).await.unwrap();
@@ -438,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn bitbox_psbt_is_pruned_for_the_device_and_restored() {
         let hwi = FakeHwi::new(async_hwi::DeviceKind::BitBox02);
-        let signer = HwiSigner::new(hwi, DeviceKind::BitBox);
+        let signer = HwiSigner::new(hwi, DeviceKind::BitBox, idle());
         let mut psbt = psbt();
         // A second key of the same fingerprint, another path.
         let (pk, (fp, _)) = psbt.inputs[0]
@@ -470,18 +518,19 @@ mod tests {
     #[tokio::test]
     async fn other_kinds_see_the_psbt_as_it_is() {
         let hwi = FakeHwi::new(async_hwi::DeviceKind::Ledger);
-        let signer = HwiSigner::new(hwi, DeviceKind::Ledger);
+        let signer = HwiSigner::new(hwi, DeviceKind::Ledger, idle());
         let mut psbt = psbt();
         signer.sign(&mut psbt).await.unwrap();
         assert_eq!(*signer.hwi.seen.lock().unwrap(), vec![1]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn dropping_a_sign_stops_the_wait_and_the_next_call_follows_the_first() {
+    async fn after_a_dropped_sign_a_retry_is_told_at_once_then_works() {
         let (release, gate) = mpsc::channel();
         let mut hwi = FakeHwi::new(async_hwi::DeviceKind::Jade);
         hwi.gate = Some(Mutex::new(gate));
-        let signer = Arc::new(HwiSigner::new(hwi, DeviceKind::Jade));
+        let busy = idle();
+        let signer = HwiSigner::new(hwi, DeviceKind::Jade, busy.clone());
 
         // The user is slow: the sign is dropped after 100 ms.
         let mut psbt = psbt();
@@ -489,20 +538,106 @@ mod tests {
         assert!(waited.is_err(), "still waiting, and now dropped");
         assert!(psbt.inputs[0].partial_sigs.is_empty());
 
-        // Another command does not interleave: it waits for the first to end.
-        let again = {
-            let signer = signer.clone();
-            tokio::spawn(async move { signer.fingerprint().await })
-        };
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!again.is_finished());
+        // Any retry answers at once, without queueing behind the device.
+        let retry = tokio::time::timeout(Duration::from_millis(500), signer.fingerprint()).await;
+        assert_eq!(
+            retry.expect("a retry must not wait"),
+            Err(FedimixError::Internal(STILL_WAITING.into()))
+        );
+        let retry = tokio::time::timeout(Duration::from_millis(500), signer.sign(&mut psbt)).await;
+        assert_eq!(
+            retry.expect("a retry must not wait"),
+            Err(FedimixError::Internal(STILL_WAITING.into()))
+        );
+        assert!(
+            busy.try_lock().is_err(),
+            "the port can see the device is busy"
+        );
         assert_eq!(*signer.hwi.calls.lock().unwrap(), vec!["sign"]);
 
+        // The user answers on the device; the call ends; the signer works again.
         release.send(()).unwrap();
-        assert_eq!(again.await.unwrap().unwrap(), "deadbeef");
+        let mut result = Err(FedimixError::Cancelled);
+        for _ in 0..100 {
+            result = signer.fingerprint().await;
+            if result.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(result.unwrap(), "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn the_thread_a_device_call_runs_on_can_use_the_runtime() {
+        // What tokio_serial's open does: needs a reactor on the calling thread.
+        let made = on_thread(|_| {
+            let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            std_socket.set_nonblocking(true).unwrap();
+            tokio::net::UdpSocket::from_std(std_socket).is_ok()
+        })
+        .await;
+        assert_eq!(made, Ok(true));
+    }
+
+    #[test]
+    fn real_bitbox_and_jade_errors_say_the_device_is_gone() {
+        use async_hwi::bitbox::api::usb::UsbError;
+        use async_hwi::jade::{JadeError, TransportError};
+        let not_connected = |kind, e: HwiError| {
+            assert_eq!(
+                map_hwi_error(kind, &e),
+                FedimixError::DeviceNotConnected(kind_name(kind).into()),
+                "{e}"
+            );
+        };
+        // bitbox-api's own messages, through async-hwi's own conversions.
+        not_connected(DeviceKind::BitBox, UsbError::NotFound.into());
+        // `Error::Hid` and `Error::Communication` display as "hid error: {0}"
+        // and "communication error: {0}" (bitbox-api error.rs).
+        not_connected(
+            DeviceKind::BitBox,
+            HwiError::Device("hid error: hidapi error: could not read".into()),
+        );
+        not_connected(
+            DeviceKind::BitBox,
+            HwiError::Device("communication error: timeout".into()),
+        );
+        // Unplugging a Jade surfaces as an io error from the serial stream.
+        for errno in [5, 19, 32] {
+            let io = std::io::Error::from_raw_os_error(errno);
+            not_connected(
+                DeviceKind::Jade,
+                JadeError::Transport(TransportError::Io(io)).into(),
+            );
+        }
+        // Other Jade and BitBox trouble is a sentence, not "not connected".
+        for (kind, e) in [
+            (
+                DeviceKind::Jade,
+                HwiError::from(JadeError::Transport(TransportError::NonceMismatch)),
+            ),
+            (
+                DeviceKind::Jade,
+                HwiError::from(JadeError::HandShakeRefused),
+            ),
+            (
+                DeviceKind::BitBox,
+                HwiError::Device("noise channel error".into()),
+            ),
+        ] {
+            assert!(
+                matches!(map_hwi_error(kind, &e), FedimixError::Internal(_)),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_policy_says_to_set_the_device_up_again() {
         assert_eq!(
-            *signer.hwi.calls.lock().unwrap(),
-            vec!["sign", "fingerprint"]
+            map_hwi_error(DeviceKind::Ledger, &HwiError::MissingPolicy),
+            FedimixError::Internal("Set up this device again in Fedimix.".into())
         );
     }
 }
