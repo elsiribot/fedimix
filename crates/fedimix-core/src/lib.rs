@@ -30,7 +30,8 @@ pub use real::RealBackend;
 /// For the integration tests only, which cannot reach crate-private items and
 /// do not see `cfg(test)` code. The fake and the backend constructor need the
 /// `testing` feature, which only this crate's dev-dependency on itself turns
-/// on. Not an API: nothing here may name a fedimint or bitcoin type.
+/// on. Not an API: items here may name fedimint, bitcoin or bdk types and
+/// change freely, but nothing outside this module may.
 #[doc(hidden)]
 pub mod testing {
     #[cfg(feature = "testing")]

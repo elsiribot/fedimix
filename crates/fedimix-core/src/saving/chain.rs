@@ -21,6 +21,8 @@ use crate::error::{FedimixError, Result};
 
 /// How long one request to the chain server may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a whole scan or sync may take, however many requests it makes.
+const SCAN_DEADLINE: Duration = Duration::from_secs(5 * 60);
 /// Esplora: how many requests a scan has in flight.
 const ESPLORA_PARALLEL: usize = 4;
 /// Electrum: how many scripts a scan asks for in one batch.
@@ -71,7 +73,7 @@ pub fn connect_chain(backend: &ChainBackend, proxy: Option<&str>) -> Result<Arc<
                 // socks5h: the proxy resolves host names, so DNS does not leak.
                 builder = builder.proxy(&format!("socks5h://{proxy}"));
             }
-            let client = builder.build_async().map_err(|e| esplora_error(&e))?;
+            let client = builder.build_async().map_err(|_| bad_setup())?;
             Ok(Arc::new(EsploraChain { client }))
         }
         ChainBackend::Electrum { url } => {
@@ -98,21 +100,52 @@ fn no_server() -> FedimixError {
 }
 
 /// `host:port` of a proxy setting, with or without a `socks5://` or
-/// `socks5h://` prefix.
+/// `socks5h://` prefix (any case). An IPv6 host is bracketed. Credentials and
+/// other schemes are refused, as the two backends cannot both honour them.
 fn proxy_host_port(proxy: &str) -> Result<String> {
-    let proxy = proxy.trim();
-    let bare = proxy
-        .strip_prefix("socks5h://")
-        .or_else(|| proxy.strip_prefix("socks5://"))
-        .unwrap_or(proxy)
-        .trim_end_matches('/');
-    match bare.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {
-            Ok(bare.to_string())
+    let bad = |sentence: &str| FedimixError::NotSetUp(sentence.into());
+    let shape = || bad("Write the proxy as host:port, like 127.0.0.1:9050.");
+    let proxy = proxy.trim().trim_end_matches('/');
+    let lower = proxy.to_ascii_lowercase();
+    let bare = if lower.starts_with("socks5h://") {
+        &proxy["socks5h://".len()..]
+    } else if lower.starts_with("socks5://") {
+        &proxy["socks5://".len()..]
+    } else if proxy.contains("://") {
+        return Err(bad("Only socks5:// and socks5h:// proxies are supported."));
+    } else {
+        proxy
+    };
+    if bare.contains('@') {
+        return Err(bad(
+            "A proxy that needs a user name and password is not supported yet.",
+        ));
+    }
+    let (host, port) = if let Some(rest) = bare.strip_prefix('[') {
+        let (inside, port) = rest.split_once("]:").ok_or_else(shape)?;
+        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(shape());
         }
-        _ => Err(FedimixError::NotSetUp(
-            "The proxy must look like 127.0.0.1:9050.".into(),
-        )),
+        (format!("[{inside}]"), port)
+    } else {
+        let (host, port) = bare.rsplit_once(':').ok_or_else(shape)?;
+        if host.contains(':') {
+            return Err(bad(
+                "Write an IPv6 proxy address in brackets, like [::1]:9050.",
+            ));
+        }
+        let name_ok = !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+        if !name_ok {
+            return Err(shape());
+        }
+        (host.to_string(), port)
+    };
+    match port.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(format!("{host}:{port}")),
+        _ => Err(shape()),
     }
 }
 
@@ -120,6 +153,12 @@ fn proxy_host_port(proxy: &str) -> Result<String> {
 fn refused(reason: &str) -> FedimixError {
     let reason = reason.trim().trim_end_matches('.');
     FedimixError::Internal(format!("The chain server refused the request: {reason}."))
+}
+
+fn bad_setup() -> FedimixError {
+    FedimixError::NotSetUp(
+        "The chain server address or the proxy cannot be used. Check them in Settings.".into(),
+    )
 }
 
 fn unreadable() -> FedimixError {
@@ -140,18 +179,56 @@ async fn already_known(
 }
 
 /// The estimate for `target` from a map of blocks to sat/vB: the entry for
-/// the nearest target at or above it, else the highest below. An estimate
-/// that is not a positive number is no estimate.
+/// the nearest target at or below it (as fast as asked, never cheaper), else
+/// the nearest above, the slowest fallback only when nothing faster exists.
+/// An entry that is not a positive number is skipped.
 fn pick_estimate(estimates: &std::collections::HashMap<u16, f64>, target: u16) -> Option<f64> {
-    let key = estimates
-        .keys()
-        .filter(|k| **k >= target)
-        .min()
-        .or_else(|| estimates.keys().max())?;
-    estimates
-        .get(key)
-        .copied()
-        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    let mut keys: Vec<u16> = estimates.keys().copied().collect();
+    keys.sort_unstable();
+    let (below, above): (Vec<u16>, Vec<u16>) = keys.into_iter().partition(|k| *k <= target);
+    below
+        .into_iter()
+        .rev()
+        .chain(above)
+        .filter_map(|k| estimates.get(&k).copied())
+        .find(|rate| rate.is_finite() && *rate > 0.0)
+}
+
+/// The text of a server's refusal: electrs sends a bare string, ElectrumX and
+/// Fulcrum an object with a `message`.
+fn protocol_message(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("message").and_then(|m| m.as_str()))
+}
+
+/// Whether a server's refusal of `transaction_get` means it does not know the
+/// transaction, as opposed to being busy or broken. Servers word it
+/// differently: ElectrumX and Fulcrum say "No such mempool or blockchain
+/// transaction", electrs says "missing transaction".
+fn is_not_found(error: &electrum_client::Error) -> bool {
+    let electrum_client::Error::Protocol(value) = error else {
+        return false;
+    };
+    let message = protocol_message(value).unwrap_or_default().to_lowercase();
+    [
+        "no such mempool or blockchain transaction",
+        "missing transaction",
+        "transaction not found",
+    ]
+    .iter()
+    .any(|known| message.contains(known))
+}
+
+/// `future`, or [`FedimixError::Offline`] when it has not finished within
+/// `limit`. The per-request timeouts do not bound a scan of many requests.
+async fn deadline<T>(
+    limit: Duration,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, future)
+        .await
+        .unwrap_or(Err(FedimixError::Offline))
 }
 
 // Esplora
@@ -163,6 +240,7 @@ struct EsploraChain {
 fn esplora_error(error: &esplora_client::Error) -> FedimixError {
     use esplora_client::Error;
     match error {
+        Error::Reqwest(e) if e.is_builder() => bad_setup(),
         Error::Reqwest(e) if !e.is_decode() => FedimixError::Offline,
         Error::HttpResponse { status, .. } if matches!(*status, 502..=504) => FedimixError::Offline,
         Error::HttpResponse { message, .. } => refused(message),
@@ -177,17 +255,23 @@ impl ChainClient for EsploraChain {
         request: FullScanRequest<KeychainKind>,
         stop_gap: usize,
     ) -> Result<FullScanResponse<KeychainKind>> {
-        self.client
-            .full_scan(request, stop_gap, ESPLORA_PARALLEL)
-            .await
-            .map_err(|e| esplora_error(&e))
+        deadline(SCAN_DEADLINE, async {
+            self.client
+                .full_scan(request, stop_gap, ESPLORA_PARALLEL)
+                .await
+                .map_err(|e| esplora_error(&e))
+        })
+        .await
     }
 
     async fn sync(&self, request: SyncRequest<(KeychainKind, u32)>) -> Result<SyncResponse> {
-        self.client
-            .sync(request, ESPLORA_PARALLEL)
-            .await
-            .map_err(|e| esplora_error(&e))
+        deadline(SCAN_DEADLINE, async {
+            self.client
+                .sync(request, ESPLORA_PARALLEL)
+                .await
+                .map_err(|e| esplora_error(&e))
+        })
+        .await
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
@@ -218,7 +302,9 @@ impl ChainClient for EsploraChain {
 
 // Electrum
 
-/// electrum-client blocks, so every call runs in `spawn_blocking`. The
+/// electrum-client blocks, so every call runs in `spawn_blocking`. A call
+/// whose future is dropped (a deadline, or shutdown) keeps its thread until
+/// the socket times out, up to 30 s per read; runtime shutdown waits for it. The
 /// connection is made on first use, and again after a failure, so an
 /// unreachable server is an error of a call, not of `connect_chain`.
 struct ElectrumChain {
@@ -231,15 +317,14 @@ struct ElectrumChain {
 fn electrum_error(error: &electrum_client::Error) -> FedimixError {
     use electrum_client::Error;
     match error {
-        Error::Protocol(value) => refused(
-            value
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("it gave no reason"),
-        ),
+        Error::Protocol(value) => refused(protocol_message(value).unwrap_or("it gave no reason")),
         Error::InvalidResponse(_) | Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) => {
             unreadable()
         }
+        // The address cannot be checked for a secure connection: a setup mistake.
+        Error::MissingDomain | Error::InvalidDNSNameError(_) => FedimixError::NotSetUp(
+            "The Electrum address needs a server name that can be checked for a secure connection. Check it in Settings.".into(),
+        ),
         // Sockets, proxies, TLS and timeouts: the server cannot be reached.
         _ => FedimixError::Offline,
     }
@@ -303,15 +388,20 @@ impl ChainClient for ElectrumHandle {
         request: FullScanRequest<KeychainKind>,
         stop_gap: usize,
     ) -> Result<FullScanResponse<KeychainKind>> {
-        self.0
-            .call(move |c| c.full_scan(request, stop_gap, ELECTRUM_BATCH, true))
-            .await
+        deadline(
+            SCAN_DEADLINE,
+            self.0
+                .call(move |c| c.full_scan(request, stop_gap, ELECTRUM_BATCH, true)),
+        )
+        .await
     }
 
     async fn sync(&self, request: SyncRequest<(KeychainKind, u32)>) -> Result<SyncResponse> {
-        self.0
-            .call(move |c| c.sync(request, ELECTRUM_BATCH, true))
-            .await
+        deadline(
+            SCAN_DEADLINE,
+            self.0.call(move |c| c.sync(request, ELECTRUM_BATCH, true)),
+        )
+        .await
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
@@ -339,12 +429,15 @@ impl ChainClient for ElectrumHandle {
     }
 
     async fn tx_seen(&self, txid: Txid) -> Result<bool> {
-        match self.0.call(move |c| c.inner.transaction_get(&txid)).await {
-            Ok(_) => Ok(true),
-            // "No such mempool or blockchain transaction" is a refusal.
-            Err(FedimixError::Internal(_)) => Ok(false),
-            Err(e) => Err(e),
-        }
+        // Only a server saying it does not know the transaction is `false`;
+        // any other failure is an error, so no caller acts on a guess.
+        self.0
+            .call(move |c| match c.inner.transaction_get(&txid) {
+                Ok(_) => Ok(true),
+                Err(e) if is_not_found(&e) => Ok(false),
+                Err(e) => Err(e),
+            })
+            .await
     }
 }
 
@@ -356,17 +449,101 @@ mod tests {
 
     #[test]
     fn proxy_forms_normalise_to_host_port() {
-        for form in [
-            "127.0.0.1:9050",
-            "socks5://127.0.0.1:9050",
-            "socks5h://127.0.0.1:9050",
-            " socks5h://127.0.0.1:9050/ ",
+        for (form, want) in [
+            ("127.0.0.1:9050", "127.0.0.1:9050"),
+            ("socks5://127.0.0.1:9050", "127.0.0.1:9050"),
+            ("socks5h://127.0.0.1:9050", "127.0.0.1:9050"),
+            (" SOCKS5H://127.0.0.1:9050/ ", "127.0.0.1:9050"),
+            ("localhost:9050", "localhost:9050"),
+            ("[::1]:9050", "[::1]:9050"),
+            ("socks5h://[::1]:9050", "[::1]:9050"),
         ] {
-            assert_eq!(proxy_host_port(form).unwrap(), "127.0.0.1:9050", "{form}");
+            assert_eq!(proxy_host_port(form).unwrap(), want, "{form}");
         }
-        for bad in ["", "9050", "socks5h://", "host:", "host:http"] {
-            assert!(proxy_host_port(bad).is_err(), "{bad}");
+    }
+
+    #[test]
+    fn bad_proxies_get_a_sentence() {
+        for bad in [
+            "",
+            "9050",
+            "socks5h://",
+            "host:",
+            "host:http",
+            "host:0",
+            "http://127.0.0.1:9050",
+            "user:pw@127.0.0.1:9050",
+            "socks5h://user@127.0.0.1:9050",
+            "::1:9050",
+            "[::1]",
+            "[nonsense]:9050",
+            "bad host:9050",
+        ] {
+            match proxy_host_port(bad) {
+                Err(FedimixError::NotSetUp(sentence)) => {
+                    assert!(sentence.ends_with('.'), "{bad}: {sentence}")
+                }
+                other => panic!("{bad}: {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn only_a_missing_transaction_answer_means_not_seen() {
+        use electrum_client::Error;
+        let refusal =
+            |message: &str| Error::Protocol(serde_json::json!({"code": -5, "message": message}));
+        for message in [
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+            "missing transaction",
+            "Transaction not found",
+        ] {
+            assert!(is_not_found(&refusal(message)), "{message}");
+        }
+        // electrs sends the message as a bare string.
+        assert!(is_not_found(&Error::Protocol(serde_json::json!(
+            "missing transaction"
+        ))));
+        assert!(!is_not_found(&Error::Protocol(serde_json::json!(
+            "server busy"
+        ))));
+        for other in [
+            refusal("server busy"),
+            refusal("txindex is disabled"),
+            Error::Protocol(serde_json::json!("odd")),
+            Error::Message("No such mempool or blockchain transaction".into()),
+            Error::InvalidResponse(serde_json::json!(null)),
+            Error::MissingDomain,
+        ] {
+            assert!(!is_not_found(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn setup_mistakes_are_not_offline() {
+        use electrum_client::Error;
+        for e in [Error::MissingDomain, Error::InvalidDNSNameError("x".into())] {
+            assert!(
+                matches!(electrum_error(&e), FedimixError::NotSetUp(_)),
+                "{e:?}"
+            );
+        }
+        assert_eq!(
+            electrum_error(&Error::IOError(std::io::ErrorKind::TimedOut.into())),
+            FedimixError::Offline
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_that_never_ends_is_offline() {
+        let slow = deadline(
+            Duration::from_secs(300),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        assert_eq!(slow, Err(FedimixError::Offline));
+        let fast = deadline(Duration::from_secs(300), async { Ok(1) }).await;
+        assert_eq!(fast, Ok(1));
     }
 
     #[test]
@@ -383,12 +560,21 @@ mod tests {
     }
 
     #[test]
-    fn estimate_picks_the_nearest_target_at_or_above() {
+    fn estimate_prefers_the_nearest_target_at_or_below() {
         let map = HashMap::from([(2, 9.0), (6, 4.0), (144, 1.0)]);
         assert_eq!(pick_estimate(&map, 6), Some(4.0));
-        assert_eq!(pick_estimate(&map, 3), Some(4.0));
+        assert_eq!(pick_estimate(&map, 7), Some(4.0));
+        assert_eq!(pick_estimate(&map, 3), Some(9.0));
+        // Nothing faster than the target: the nearest slower one.
+        assert_eq!(pick_estimate(&map, 1), Some(9.0));
         assert_eq!(pick_estimate(&map, 500), Some(1.0));
+        // Sparse: never the cheap 24-block rate when a faster one exists.
+        let sparse = HashMap::from([(2, 9.0), (144, 1.0)]);
+        assert_eq!(pick_estimate(&sparse, 6), Some(9.0));
         assert_eq!(pick_estimate(&HashMap::new(), 6), None);
         assert_eq!(pick_estimate(&HashMap::from([(6, 0.0)]), 6), None);
+        // A bad value falls through to the next candidate.
+        let holes = HashMap::from([(2, 9.0), (6, f64::NAN), (12, 0.0), (144, 1.0)]);
+        assert_eq!(pick_estimate(&holes, 6), Some(9.0));
     }
 }
