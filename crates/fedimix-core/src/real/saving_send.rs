@@ -61,6 +61,7 @@ use crate::store::{SignedState, SignedTx};
 /// The confirmation target of the fee estimate.
 const FEE_TARGET_BLOCKS: u16 = 6;
 const REGTEST_FEE_RATE: u32 = 2;
+const SIGNET_FEE_RATE: u32 = 1;
 /// Change goes to the federation only above this many minimum deposits, as the
 /// minimum moves on v2.
 const CHANGE_MARGIN: u64 = 2;
@@ -186,6 +187,8 @@ fn rate_of(estimate: Option<f64>, network: Network) -> Result<FeeRate> {
             Ok(FeeRate::from_sat_per_kwu(kwu))
         }
         None if network == Network::Regtest => Ok(FeeRate::from_sat_per_vb_u32(REGTEST_FEE_RATE)),
+        // Signet coins are free and its servers often have no estimate.
+        None if network == Network::Signet => Ok(FeeRate::from_sat_per_vb_u32(SIGNET_FEE_RATE)),
         None => Err(FedimixError::NotSetUp(NO_ESTIMATE.into())),
     }
 }
@@ -1367,12 +1370,11 @@ mod tests {
         assert_eq!(vb(rate_of(Some(3.5), Network::Bitcoin).unwrap()), 3.5);
         assert_eq!(vb(rate_of(Some(0.2), Network::Bitcoin).unwrap()), 1.0);
         assert_eq!(vb(rate_of(None, Network::Regtest).unwrap()), 2.0);
-        for network in [Network::Bitcoin, Network::Signet] {
-            assert_eq!(
-                rate_of(None, network),
-                Err(FedimixError::NotSetUp(NO_ESTIMATE.into()))
-            );
-        }
+        assert_eq!(vb(rate_of(None, Network::Signet).unwrap()), 1.0);
+        assert_eq!(
+            rate_of(None, Network::Bitcoin),
+            Err(FedimixError::NotSetUp(NO_ESTIMATE.into()))
+        );
     }
 
     fn ledger_row(n: u8, kind: OperationKind, coin: u8) -> (SignedTx, Transaction, bool) {
