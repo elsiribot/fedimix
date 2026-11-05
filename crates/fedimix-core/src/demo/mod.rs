@@ -13,6 +13,7 @@ use crate::backend::Backend;
 use crate::destination::{DestinationKind, parse_destination, requested_amount};
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream, Notice};
+use crate::scheduler::split;
 
 mod fixtures;
 use fixtures::BASE_TS;
@@ -31,19 +32,6 @@ const TX_VBYTES: u64 = 140;
 const NOTIFY_DELAY: Duration = Duration::from_secs(2);
 const OPERATION_STEP: Duration = Duration::from_millis(300);
 const PREVIEW_TTL: Duration = Duration::from_secs(600);
-/// Spec section 1: the 1-2-5 series from 1 BTC down to 0.001.
-const EXIT_DENOMINATIONS_SAT: [u64; 10] = [
-    100_000_000,
-    50_000_000,
-    20_000_000,
-    10_000_000,
-    5_000_000,
-    2_000_000,
-    1_000_000,
-    500_000,
-    200_000,
-    100_000,
-];
 /// `send-stuck`: a send held in Broadcasting, and the shortened wait.
 const STUCK_BROADCAST_HOLD: Duration = Duration::from_secs(4);
 const STUCK_SEND_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -626,7 +614,7 @@ impl State {
         self.spending_balance = sum([self.spending_balance, arrived].into_iter());
         // The overshoot leaves again in denominations; what is too small for
         // one stays in Spending.
-        let denominations = split_denominations(p.overshoot);
+        let denominations = split(p.overshoot);
         let queued = sum(denominations.iter().copied());
         self.for_spending = sum([self.for_spending, arrived.saturating_sub(queued)].into_iter());
         self.moving = sum([self.moving, queued].into_iter());
@@ -728,20 +716,6 @@ impl State {
             Event::Notification(Notice::ExitLanded { amount: denom }),
         ])
     }
-}
-
-/// Greedy split into exit denominations, largest first; the rest is too
-/// small for any of them.
-fn split_denominations(amount: Amount) -> Vec<Amount> {
-    let mut rest = amount.as_sat();
-    let mut out = Vec::new();
-    for denom in EXIT_DENOMINATIONS_SAT {
-        while rest >= denom {
-            rest -= denom;
-            out.push(Amount::from_sat(denom));
-        }
-    }
-    out
 }
 
 /// The newest [`SNAPSHOT_HISTORY`] rows of `history` (newest first).

@@ -1,5 +1,7 @@
 //! Fedimix core logic, independent of any UI toolkit.
 
+#[expect(dead_code, reason = "the real backend uses it from Phase 4 Task 4 on")]
+mod anonymity;
 pub mod api;
 pub mod backend;
 pub mod config;
@@ -12,6 +14,8 @@ mod federation;
 pub mod handle;
 mod real;
 mod saving;
+#[expect(dead_code, reason = "the real backend uses it from Phase 4 Task 5 on")]
+mod scheduler;
 mod seed;
 mod store;
 
@@ -34,6 +38,7 @@ pub use real::RealBackend;
 /// change freely, but nothing outside this module may.
 #[doc(hidden)]
 pub mod testing {
+    pub use crate::anonymity::{DepositSource, SessionDeposit};
     #[cfg(feature = "testing")]
     pub use crate::federation::fake::{FakeClient, FakePort, regtest_address};
     pub use crate::federation::{
