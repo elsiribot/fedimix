@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+use bitcoin::bip32::Xpriv;
 use fedimint_bip39::{Bip39RootSecretStrategy, Language, Mnemonic};
 use fedimint_client::RootSecret;
 use fedimint_client::secret::RootSecretStrategy;
@@ -100,6 +101,26 @@ impl Seed {
         RootSecret::StandardDoubleDerive(Bip39RootSecretStrategy::<WORD_COUNT>::to_root_secret(
             &self.mnemonic,
         ))
+    }
+
+    /// The master key of the software Saving wallet: BIP32 from the BIP39 seed
+    /// of these same words, with an empty passphrase, so one backup restores
+    /// both wallets. Made for each use and never kept; see `SeedSigner`.
+    pub(crate) fn saving_master_key(&self, network: bitcoin::Network) -> Result<Xpriv> {
+        let seed = self.mnemonic.to_seed_normalized("");
+        Xpriv::new_master(network, &seed).map_err(|_| {
+            FedimixError::Internal(
+                "Fedimix could not make the software wallet's key from your recovery words.".into(),
+            )
+        })
+    }
+
+    /// A phrase from words, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_phrase(words: &str) -> Seed {
+        Seed {
+            mnemonic: Mnemonic::parse_in_normalized(Language::English, words).unwrap(),
+        }
     }
 
     fn load(mut file: File, path: &Path) -> Result<Seed> {

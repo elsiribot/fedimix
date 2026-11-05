@@ -21,11 +21,12 @@ use async_hwi::ledger::{HidApi, Ledger};
 use async_hwi::{Error as HwiError, HWI};
 use async_trait::async_trait;
 
+use super::seed_signer::SeedSigner;
 use super::signer::{
     DevicePort, HwiSigner, Signer, kind_name, map_hwi_error, on_thread, still_waiting,
 };
 use super::wallet::DeviceAccount;
-use crate::api::{DeviceInfo, DeviceKind, Network};
+use crate::api::{DeviceInfo, DeviceKind, Network, SOFTWARE_DEVICE_ID, SOFTWARE_DEVICE_NAME};
 use crate::error::{FedimixError, Result};
 
 /// A device a scanner saw, before it is opened.
@@ -279,6 +280,68 @@ impl DevicePort for HwiPort {
             return Ok(signer);
         }
         Err(FedimixError::DeviceNotConnected("hardware wallet".into()))
+    }
+}
+
+// ---- The software wallet ----
+
+const OTHER_WORDS: &str = "The recovery words in this folder are not the ones Saving was set up with, so they cannot sign for it. Restore the seed file from your backup.";
+
+/// A [`DevicePort`] that offers the software wallet after the hardware ones,
+/// always: it needs nothing plugged in.
+pub struct WithSoftware {
+    hardware: Arc<dyn DevicePort>,
+    software: Arc<SeedSigner>,
+}
+
+impl WithSoftware {
+    pub fn new(hardware: Arc<dyn DevicePort>, software: Arc<SeedSigner>) -> Self {
+        WithSoftware { hardware, software }
+    }
+}
+
+fn software_entry() -> DeviceInfo {
+    DeviceInfo {
+        id: SOFTWARE_DEVICE_ID.to_string(),
+        name: SOFTWARE_DEVICE_NAME.to_string(),
+        kind: DeviceKind::Software,
+        connected: true,
+    }
+}
+
+#[async_trait]
+impl DevicePort for WithSoftware {
+    /// A hardware listing that failed is logged, not returned: the software
+    /// wallet can still be used, and hiding it would leave the person nothing.
+    async fn list(&self) -> Result<Vec<DeviceInfo>> {
+        let mut devices = self.hardware.list().await.unwrap_or_else(|e| {
+            eprintln!("fedimix: looking for hardware wallets: {e}");
+            Vec::new()
+        });
+        devices.retain(|device| device.id != SOFTWARE_DEVICE_ID);
+        devices.push(software_entry());
+        Ok(devices)
+    }
+
+    /// The software wallet is checked as a device is at connect: the account
+    /// must be a software one with this fingerprint.
+    async fn connect(&self, id: &str, account: Option<&DeviceAccount>) -> Result<Arc<dyn Signer>> {
+        if id != SOFTWARE_DEVICE_ID {
+            return self.hardware.connect(id, account).await;
+        }
+        if let Some(account) = account {
+            if account.kind != DeviceKind::Software {
+                let name = kind_name(account.kind);
+                return Err(FedimixError::Internal(format!(
+                    "Saving was set up with your {name}, not with this computer. Connect your {name}."
+                )));
+            }
+            let fingerprint = self.software.fingerprint().await?;
+            if !fingerprint.eq_ignore_ascii_case(&account.fingerprint) {
+                return Err(FedimixError::Internal(OTHER_WORDS.into()));
+            }
+        }
+        Ok(Arc::clone(&self.software) as Arc<dyn Signer>)
     }
 }
 
@@ -775,6 +838,82 @@ mod tests {
         );
         drop(held);
         port.connect("jade:/dev/ttyUSB0", None).await.unwrap();
+    }
+
+    const WORDS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn with_software(scanners: Vec<Arc<dyn Scanner>>) -> WithSoftware {
+        let seed = Arc::new(crate::seed::Seed::from_phrase(WORDS));
+        WithSoftware::new(
+            Arc::new(HwiPort::with_scanners(scanners)),
+            Arc::new(SeedSigner::new(seed, Network::Regtest)),
+        )
+    }
+
+    fn the_software_entry() -> DeviceInfo {
+        DeviceInfo {
+            id: "software".into(),
+            name: "This computer".into(),
+            kind: DeviceKind::Software,
+            connected: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn software_is_listed_after_devices() {
+        let port = with_software(vec![
+            FakeScanner::ok(DeviceKind::Ledger, &["/dev/hidraw1"]),
+            FakeScanner::ok(DeviceKind::Jade, &["/dev/ttyUSB0"]),
+        ]);
+        let list = port.list().await.unwrap();
+        let ids: Vec<_> = list.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["ledger:/dev/hidraw1", "jade:/dev/ttyUSB0", "software"]
+        );
+        assert_eq!(list[2], the_software_entry());
+        assert_eq!(
+            with_software(vec![]).list().await.unwrap(),
+            [the_software_entry()]
+        );
+    }
+
+    #[tokio::test]
+    async fn software_is_listed_when_no_device_answers() {
+        let port = with_software(vec![
+            FakeScanner::failing(DeviceKind::Ledger),
+            FakeScanner::failing(DeviceKind::BitBox),
+        ]);
+        assert_eq!(port.list().await.unwrap(), [the_software_entry()]);
+    }
+
+    #[tokio::test]
+    async fn software_connects_only_as_the_account_it_set_up() {
+        let jade = FakeScanner::ok(DeviceKind::Jade, &["/dev/ttyUSB0"]);
+        let port = with_software(vec![jade.clone()]);
+        let signer = port.connect("software", None).await.unwrap();
+        assert_eq!(signer.kind(), DeviceKind::Software);
+        assert_eq!(signer.fingerprint().await.unwrap(), "73c5da0a");
+        let mut account = account(DeviceKind::Software);
+        account.fingerprint = "73C5DA0A".into();
+        port.connect("software", Some(&account)).await.unwrap();
+        // Other words in the seed file: another wallet.
+        account.fingerprint = "aabbccdd".into();
+        match port.connect("software", Some(&account)).await {
+            Err(FedimixError::Internal(s)) => {
+                assert!(s.contains("recovery words"), "{s}");
+                assert!(!s.contains("abandon"), "{s}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+        // A hardware account never connects to the software wallet.
+        let mut account = account.clone();
+        account.kind = DeviceKind::Ledger;
+        account.fingerprint = "73c5da0a".into();
+        assert!(port.connect("software", Some(&account)).await.is_err());
+        // Hardware ids go to the hardware port.
+        port.connect("jade:/dev/ttyUSB0", None).await.unwrap();
+        assert_eq!(*jade.opened.lock().unwrap(), vec!["/dev/ttyUSB0"]);
     }
 
     #[test]

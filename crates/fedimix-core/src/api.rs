@@ -125,11 +125,18 @@ pub enum DeviceKind {
     Coldcard,
     Jade,
     BitBox,
-    /// Test signer; never offered outside tests.
+    /// Software wallet on this computer
     Software,
 }
 
-/// A hardware wallet. The device Saving was set up with stays in
+/// The id of the software wallet in `detect_devices`, for `setup_saving`. It is
+/// listed after any hardware wallet, always, as [`SOFTWARE_DEVICE_NAME`].
+pub const SOFTWARE_DEVICE_ID: &str = "software";
+/// The name the software wallet is listed under.
+pub const SOFTWARE_DEVICE_NAME: &str = "This computer";
+
+/// A hardware wallet, or the software wallet on this computer, which is always
+/// `connected`. The device Saving was set up with stays in
 /// `SavingState::device` while unplugged, as `Some` with `connected: false`;
 /// `None` means Saving is not set up.
 #[derive(Debug, Clone, PartialEq)]

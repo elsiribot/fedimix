@@ -111,13 +111,19 @@ impl SavingLive {
 }
 
 /// The device of a stored account, unseen since the start: no id from a listing
-/// survives a restart, as it names a USB path.
+/// survives a restart, as it names a USB path. The software wallet needs no
+/// listing to be there.
 fn stored_device(account: &DeviceAccount) -> DeviceInfo {
+    let software = account.kind == DeviceKind::Software;
     DeviceInfo {
-        id: account.fingerprint.clone(),
+        id: if software {
+            SOFTWARE_DEVICE_ID.to_string()
+        } else {
+            account.fingerprint.clone()
+        },
         name: account.name.clone(),
         kind: account.kind,
-        connected: false,
+        connected: software,
     }
 }
 

@@ -78,6 +78,22 @@ To restore by hand on a new device:
 3. Start Fedimix with `--data-dir` on that folder.
 4. Join each federation with its invite code. Fedimix rebuilds the balance from
    the federation, which can take a while; the old history does not come back.
+5. If Saving was the software wallet, set it up again with "This computer": the
+   same words give the same Saving account, and its first scan finds the coins.
+
+## Saving without a hardware wallet
+
+Saving is meant for a hardware wallet (Ledger, Coldcard, Jade, BitBox02). If you
+have none, Saving can be a software wallet on this computer, listed after any
+hardware wallet as "This computer". Its key comes from the same recovery words
+as Spending (BIP84, account `m/84'/0'/0'` on bitcoin, `m/84'/1'/0'` on test
+networks, no passphrase), so one phrase restores both wallets. It signs only
+when you confirm a send or a refill, and it talks to no server, so a proxy
+does not affect it.
+
+A hardware wallet is safer for large amounts: with the software wallet, anyone
+who can read the `seed` file can spend Saving too, not just Spending. Moving to
+a hardware wallet later means a new Saving wallet and a send to it.
 
 ## Not yet
 

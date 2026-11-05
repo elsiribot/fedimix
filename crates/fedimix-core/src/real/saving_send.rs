@@ -3,7 +3,8 @@
 //! preview on, so everything here holds of it too.
 //!
 //! A preview holds an unsigned PSBT. Confirming takes the one Saving operation:
-//! `AwaitingDevice`, `Signing`, `Broadcasting`, `Done`. Until the device has
+//! `AwaitingDevice`, `Signing`, `Broadcasting`, `Done`; the software wallet,
+//! always there, starts at `Signing`. Until the device has
 //! signed, only memory changes, so a rejection, a cancel or a crash leaves
 //! nothing. The signed transaction is then stored before anything is sent, and
 //! from that row on the send belongs to the store, not to this process or to the
@@ -148,6 +149,15 @@ impl Drop for OpGuard {
 pub(super) fn margin_of(min_deposit: Amount) -> Amount {
     Amount {
         msat: min_deposit.msat.saturating_mul(CHANGE_MARGIN),
+    }
+}
+
+/// Where a confirmed operation starts. The software wallet is always there, so
+/// it skips `AwaitingDevice`; it still signs only from the user's confirm.
+fn first_state(account: Option<&DeviceAccount>) -> OperationState {
+    match account {
+        Some(account) if account.kind == DeviceKind::Software => OperationState::Signing,
+        _ => OperationState::AwaitingDevice,
     }
 }
 
@@ -709,6 +719,7 @@ impl Core {
         id: &str,
         kind: OperationKind,
         generation: u64,
+        first: OperationState,
     ) -> Result<Arc<Notify>> {
         let cancel = Arc::new(Notify::new());
         let mut live = self.saving();
@@ -723,7 +734,7 @@ impl Core {
         live.op = Some(SavingOp {
             id: id.to_string(),
             kind,
-            state: OperationState::AwaitingDevice,
+            state: first,
             cancel: Arc::clone(&cancel),
             cancelled: false,
         });
@@ -738,16 +749,17 @@ impl Core {
         let wallet = self.saving_wallet()?;
         self.check_preview(&held, &wallet)?;
         let id = fresh_id("saving");
+        let first = first_state(self.store().device_account()?.as_ref());
         // Books nothing: it keeps `shutdown` waiting for the task's writes.
         let reservation = self.reserve("", &id, Amount::ZERO, Amount::ZERO)?;
-        let cancel = self.claim_operation(&id, held.kind, held.generation)?;
+        let cancel = self.claim_operation(&id, held.kind, held.generation, first.clone())?;
         let guard = OpGuard {
             core: Arc::clone(self),
             id: id.clone(),
         };
         // After the reservation: `shutdown` closes the gate, then waits for those.
         self.ensure_running()?;
-        self.report_saving(&id, OperationState::AwaitingDevice, None);
+        self.report_saving(&id, first, None);
         // A task of its own: a caller that goes away must not cut a send off.
         let core = Arc::clone(self);
         let task_id = id.clone();
@@ -870,7 +882,9 @@ impl Core {
         let account = self.store().device_account()?;
         let account = account.ok_or_else(|| FedimixError::NotSetUp(NO_ACCOUNT.into()))?;
         let signer = self.wait_for_device(&account, held.expires_at).await?;
-        self.set_op_state(id, OperationState::Signing);
+        if account.kind != DeviceKind::Software {
+            self.set_op_state(id, OperationState::Signing);
+        }
         let mut psbt = held.psbt.clone();
         signer.sign(&mut psbt).await?;
         Ok(psbt)

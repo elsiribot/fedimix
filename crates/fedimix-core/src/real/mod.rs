@@ -36,7 +36,9 @@ use crate::config::CoreConfig;
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream};
 use crate::federation::{FederationClient, FederationPort, FederationPreview, FedimintPort};
-use crate::saving::{ChainClient, DevicePort, HwiPort, SavingWallet, connect_chain};
+use crate::saving::{
+    ChainClient, DevicePort, HwiPort, SavingWallet, SeedSigner, WithSoftware, connect_chain,
+};
 use crate::seed::{DataDirLock, Seed};
 use crate::store::{FederationRow, SignedState, Store, Watch};
 
@@ -165,7 +167,7 @@ struct Core {
     port: Arc<dyn FederationPort>,
     chain_factory: ChainFactory,
     devices: Arc<dyn DevicePort>,
-    seed: Seed,
+    seed: Arc<Seed>,
     /// `false` when the seed is older than the store: the store was lost, so
     /// this seed may have been used at a federation the store does not list.
     seed_born_with_store: bool,
@@ -497,7 +499,10 @@ impl RealBackend {
         {
             return Err(Seed::missing(&dir));
         }
-        let seed = Seed::load_or_create(&dir, &lock)?;
+        let seed = Arc::new(Seed::load_or_create(&dir, &lock)?);
+        // The software wallet signs from the same words, so it is made here.
+        let software = SeedSigner::new(Arc::clone(&seed), config.network);
+        let devices: Arc<dyn DevicePort> = Arc::new(WithSoftware::new(devices, Arc::new(software)));
         let store = Store::open(&db)?;
         store.bind_network(config.network)?;
         let seed_born_with_store = store.seed_born_with_store(seed_is_new)?;

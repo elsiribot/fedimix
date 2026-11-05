@@ -9,18 +9,20 @@ mod fake_chain;
 #[cfg(feature = "testing")]
 mod fake_devices;
 mod labels;
+mod seed_signer;
 mod signer;
 #[cfg(feature = "testing")]
 mod soft_signer;
 mod wallet;
 
 pub use chain::{ChainClient, connect_chain, is_invalid, is_refusal, require_server};
-pub use devices::HwiPort;
+pub use devices::{HwiPort, WithSoftware};
 #[cfg(feature = "testing")]
 pub use fake_chain::{BroadcastGoes, FakeChain};
 #[cfg(feature = "testing")]
 pub use fake_devices::FakeDevices;
 pub use labels::{Label, Labels, SentRecord, Tag};
+pub use seed_signer::SeedSigner;
 pub use signer::{DevicePort, Signer};
 #[cfg(feature = "testing")]
 pub use soft_signer::SoftSigner;

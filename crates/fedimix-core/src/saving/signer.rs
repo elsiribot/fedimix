@@ -26,8 +26,9 @@ use super::wallet::DeviceAccount;
 use crate::api::{DeviceInfo, DeviceKind};
 use crate::error::{FedimixError, Result};
 
-/// A key holder that can sign a PSBT: a hardware wallet, or under the `testing`
-/// feature a software stand-in.
+/// A key holder that can sign a PSBT: a hardware wallet, the software wallet
+/// on this computer (`SeedSigner`), or under the `testing` feature a software
+/// stand-in.
 #[async_trait]
 pub trait Signer: Send + Sync {
     fn kind(&self) -> DeviceKind;
@@ -60,7 +61,7 @@ pub(super) fn kind_name(kind: DeviceKind) -> &'static str {
         DeviceKind::Coldcard => "Coldcard",
         DeviceKind::Jade => "Jade",
         DeviceKind::BitBox => "BitBox02",
-        DeviceKind::Software => "software signer",
+        DeviceKind::Software => "software wallet",
     }
 }
 

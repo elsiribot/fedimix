@@ -509,7 +509,10 @@ async fn saving_methods_report_not_set_up() {
         not_set_up
     );
     assert_eq!(backend.exit_now("p".into()).await.map(|_| ()), not_set_up);
-    assert!(backend.detect_devices().await.unwrap().is_empty());
+    // No device, but the software wallet is always there.
+    let found = backend.detect_devices().await.unwrap();
+    let kinds: Vec<_> = found.iter().map(|d| d.kind).collect();
+    assert_eq!(kinds, [DeviceKind::Software]);
     assert!(backend.suggested_federations().await.unwrap().is_empty());
     let saving = backend.saving_state().await.unwrap();
     assert_eq!(saving.device, None);
@@ -3138,7 +3141,7 @@ async fn a_settled_send_keeps_the_amount_of_its_row() {
 // ---- Saving ----
 
 const CHAIN_URL: &str = "http://chain.test";
-const DEVICE: &str = "software:one";
+const DEVICE: &str = "ledger:one";
 const SEED: [u8; 32] = [7; 32];
 const SCANNING: &str = "Fedimix is still scanning your device's history.";
 const NO_SERVER: &str = "Enter a chain server in Settings.";
@@ -3263,7 +3266,7 @@ impl SavingHarness {
         devices.add(
             DEVICE,
             "Test device",
-            DeviceKind::Software,
+            DeviceKind::Ledger,
             soft_signer(bitcoin::Network::Regtest),
         );
         Self {
@@ -3309,9 +3312,14 @@ impl SavingHarness {
 
     /// Set up, with the first scan done at height 1.
     async fn ready(&self) -> Real {
+        self.ready_with(DEVICE).await
+    }
+
+    /// As [`Self::ready`], set up with the device `id`.
+    async fn ready_with(&self, id: &str) -> Real {
         let backend = self.with_server().await;
         self.chain.push_full_scan(first_scan(1));
-        backend.setup_saving(DEVICE.into()).await.unwrap();
+        backend.setup_saving(id.into()).await.unwrap();
         wait_chain(&*backend, true).await;
         backend
     }
@@ -3356,7 +3364,7 @@ async fn setup_stores_the_account_and_never_a_private_key() {
     let state = backend.saving_state().await.unwrap();
     let device = state.device.unwrap();
     assert_eq!(device.name, "Test device");
-    assert_eq!(device.kind, DeviceKind::Software);
+    assert_eq!(device.kind, DeviceKind::Ledger);
     assert!(device.connected);
     assert!(backend.spending_state().await.unwrap().saving_ready);
     assert_eq!(saving.devices.connects(), 1);
@@ -3392,14 +3400,14 @@ async fn setup_twice_is_refused() {
 async fn a_device_on_the_wrong_kind_of_network_gets_a_sentence() {
     let saving = SavingHarness::new();
     saving.devices.add(
-        "software:main",
+        "ledger:main",
         "Main device",
-        DeviceKind::Software,
+        DeviceKind::Ledger,
         soft_signer(bitcoin::Network::Bitcoin),
     );
     let backend = saving.with_server().await;
     assert_eq!(
-        backend.setup_saving("software:main".into()).await,
+        backend.setup_saving("ledger:main".into()).await,
         Err(FedimixError::NotSetUp(
             "The hardware wallet account is for the main network, but Fedimix is running on a test network."
                 .into()
@@ -3647,13 +3655,13 @@ impl Signer for ScriptedSigner {
     }
 }
 
-const SCRIPTED: &str = "software:scripted";
+const SCRIPTED: &str = "ledger:scripted";
 
 fn with_scripted(saving: &SavingHarness) -> Arc<ScriptedSigner> {
     let signer = ScriptedSigner::new();
     saving
         .devices
-        .add(SCRIPTED, "Scripted", DeviceKind::Software, signer.clone());
+        .add(SCRIPTED, "Scripted", DeviceKind::Ledger, signer.clone());
     signer
 }
 
@@ -3904,7 +3912,7 @@ async fn jade_is_not_offered_through_a_proxy() {
     };
     assert_eq!(
         kinds(backend.detect_devices().await.unwrap()),
-        [DeviceKind::Software, DeviceKind::Jade]
+        [DeviceKind::Ledger, DeviceKind::Jade, DeviceKind::Software]
     );
     backend
         .set_settings(Settings {
@@ -3915,7 +3923,8 @@ async fn jade_is_not_offered_through_a_proxy() {
         .unwrap();
     assert_eq!(
         kinds(backend.detect_devices().await.unwrap()),
-        [DeviceKind::Software]
+        [DeviceKind::Ledger, DeviceKind::Software],
+        "the software wallet sends nothing over the network"
     );
     assert_eq!(
         backend.setup_saving("jade:port".into()).await,
@@ -4090,8 +4099,13 @@ async fn wait_state(backend: &Real, id: &str, state: OperationState) {
 impl SavingHarness {
     /// Set up and joined. The federation hands out addresses that parse.
     async fn joined(&self) -> Real {
+        self.joined_with(DEVICE).await
+    }
+
+    /// As [`Self::joined`], set up with the device `id`.
+    async fn joined_with(&self, id: &str) -> Real {
         self.harness.first.use_valid_addresses();
-        let backend = self.ready().await;
+        let backend = self.ready_with(id).await;
         backend.join_federation(INVITE.into()).await.unwrap();
         wait_online(&*backend, true).await;
         backend
@@ -4156,7 +4170,7 @@ impl SavingHarness {
     fn plug_in(&self, signer: Arc<dyn Signer>) {
         self.devices.remove(DEVICE);
         self.devices
-            .add(DEVICE, "Test device", DeviceKind::Software, signer);
+            .add(DEVICE, "Test device", DeviceKind::Ledger, signer);
     }
 }
 
@@ -6877,5 +6891,201 @@ async fn a_gap_that_moves_while_signing_stops_the_refill() {
     );
     assert!(saving.chain.broadcasts().is_empty());
     assert!(signed_states(&saving).is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+// ---- The software Saving wallet ----
+
+const SOFTWARE: &str = fedimix_core::SOFTWARE_DEVICE_ID;
+
+fn software_entry() -> fedimix_core::DeviceInfo {
+    fedimix_core::DeviceInfo {
+        id: SOFTWARE.into(),
+        name: "This computer".into(),
+        kind: DeviceKind::Software,
+        connected: true,
+    }
+}
+
+/// Checks each input's P2WPKH signature against the coin it spends.
+fn assert_signed(tx: &Transaction, coins: &[fedimix_core::Coin]) {
+    use bitcoin::secp256k1::{Message, Secp256k1, ecdsa::Signature};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    let secp = Secp256k1::verification_only();
+    let mut cache = SighashCache::new(tx);
+    for (n, input) in tx.input.iter().enumerate() {
+        let coin = coins
+            .iter()
+            .find(|c| c.outpoint == input.previous_output.to_string())
+            .expect("the input is one of ours");
+        let witness: Vec<_> = input.witness.iter().collect();
+        assert_eq!(witness.len(), 2, "a signature and a key");
+        let key = bitcoin::PublicKey::from_slice(witness[1]).unwrap();
+        let (sig, flag) = witness[0].split_at(witness[0].len() - 1);
+        assert_eq!(flag, [EcdsaSighashType::All as u8]);
+        let hash = cache
+            .p2wpkh_signature_hash(
+                n,
+                &script_of(&coin.address),
+                bitcoin::Amount::from_sat(coin.amount.as_sat()),
+                EcdsaSighashType::All,
+            )
+            .unwrap();
+        let sig = Signature::from_der(sig).unwrap();
+        secp.verify_ecdsa(&Message::from(hash), &sig, &key.inner)
+            .expect("a valid signature");
+    }
+}
+
+#[tokio::test]
+async fn software_wallet_sets_up_and_sends() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined_with(SOFTWARE).await;
+    let found = backend.detect_devices().await.unwrap();
+    assert_eq!(found.last(), Some(&software_entry()), "after the devices");
+    let state = backend.saving_state().await.unwrap();
+    assert_eq!(state.device, Some(software_entry()));
+    assert_eq!(saving.devices.connects(), 0, "no hardware was opened");
+
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    let coins = backend.saving_state().await.unwrap().coins;
+    let client = &saving.harness.first;
+    let address = regtest_address("software change");
+    client.set_deposit_address(Some(address.clone()));
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    assert_eq!(preview.federation, Some(client.id()));
+    let ChangeDestination::Spending { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    let (_, state) = saving.send(&backend, preview).await;
+    assert_eq!(state, OperationState::Done);
+    let tx = saving.chain.broadcasts()[0].clone();
+    assert_eq!(paid_to(&tx, &payee()), Some(30_000));
+    assert_eq!(paid_to(&tx, &address), Some(change.as_sat()));
+    assert_signed(&tx, &coins);
+    let rows = saving_rows(&backend).await;
+    let row = rows.iter().find(|r| r.id == tx.compute_txid().to_string());
+    assert_eq!(
+        row.unwrap().kind,
+        HistoryKind::Sent {
+            change: Some(fedimix_core::SentChange {
+                amount: change,
+                to_spending: true
+            })
+        }
+    );
+    assert_eq!(saving.devices.connects(), 0);
+    backend.shutdown().await.unwrap();
+
+    // The words stay in the seed file: no key and no phrase in the database.
+    let words = std::fs::read_to_string(saving.harness.dir.path().join("seed")).unwrap();
+    for name in ["fedimix.db", "fedimix.db-wal"] {
+        let bytes = std::fs::read(saving.harness.dir.path().join(name)).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("prv"), "{name} holds a private key");
+        assert!(!text.contains(words.trim()), "{name} holds the words");
+    }
+}
+
+#[tokio::test]
+async fn software_send_needs_no_awaiting_device() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined_with(SOFTWARE).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.devices.remove(DEVICE);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    assert!(
+        saving.chain.broadcasts().is_empty(),
+        "a preview signs nothing"
+    );
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(
+        states,
+        [
+            OperationState::Signing,
+            OperationState::Broadcasting,
+            OperationState::Done
+        ]
+    );
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn software_wallet_is_restored_by_its_words() {
+    let first = SavingHarness::new();
+    let backend = first.ready_with(SOFTWARE).await;
+    let address = backend.receive(on_chain()).await.unwrap().payload;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    // The manual restore: a new folder holding only the words.
+    let words = std::fs::read_to_string(first.harness.dir.path().join("seed")).unwrap();
+    let second = SavingHarness::new();
+    let seed = second.harness.dir.path().join("seed");
+    std::fs::write(&seed, &words).unwrap();
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let restored = second.ready_with(SOFTWARE).await;
+    assert_eq!(
+        restored.receive(on_chain()).await.unwrap().payload,
+        address,
+        "the same account"
+    );
+    restored.shutdown().await.unwrap();
+    drop(restored);
+
+    // The same stored account: kind, name, fingerprint, xpub and path.
+    let account = |saving: &SavingHarness| {
+        raw_store(&saving.harness)
+            .query_row(
+                "SELECT kind, name, fingerprint, xpub, path FROM saving_device WHERE id = 1",
+                [],
+                |r| {
+                    (0..5)
+                        .map(|n| r.get::<_, String>(n))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                },
+            )
+            .unwrap()
+    };
+    let stored = account(&first);
+    assert_eq!(stored, account(&second));
+    assert_eq!(stored[1], "This computer");
+    assert_eq!(stored[2].len(), 8, "a fingerprint: {stored:?}");
+    assert!(stored[3].starts_with("tpub"), "{stored:?}");
+    assert_eq!(stored[4], "m/84'/1'/0'");
+
+    // After a restart the software wallet is there without a poll.
+    let backend = second.open().await.unwrap();
+    assert_eq!(
+        backend.saving_state().await.unwrap().device,
+        Some(software_entry())
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn software_wallet_works_through_a_proxy() {
+    let saving = SavingHarness::new();
+    let backend = saving.with_server().await;
+    backend
+        .set_settings(Settings {
+            socks5_proxy: Some("127.0.0.1:9050".into()),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    let found = backend.detect_devices().await.unwrap();
+    assert_eq!(found.last(), Some(&software_entry()));
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(SOFTWARE.into()).await.unwrap();
+    wait_chain(&*backend, true).await;
+    assert_eq!(
+        backend.saving_state().await.unwrap().device,
+        Some(software_entry())
+    );
     backend.shutdown().await.unwrap();
 }

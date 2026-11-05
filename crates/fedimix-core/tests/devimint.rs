@@ -1637,9 +1637,9 @@ async fn saving_sees_a_funded_address() {
         let devices = Arc::new(FakeDevices::new());
         let seed: [u8; 32] = rand::random();
         devices.add(
-            "software:test",
+            "ledger:test",
             "Test device",
-            DeviceKind::Software,
+            DeviceKind::Ledger,
             Arc::new(SoftSigner::from_seed(&seed, bitcoin::Network::Regtest)),
         );
         let factory: ChainFactory = Arc::new(connect_chain);
@@ -1654,7 +1654,7 @@ async fn saving_sees_a_funded_address() {
             })
             .await
             .unwrap();
-        backend.setup_saving("software:test".into()).await.unwrap();
+        backend.setup_saving("ledger:test".into()).await.unwrap();
 
         let request = || ReceiveRequest {
             wallet: WalletKind::Saving,
@@ -1708,7 +1708,7 @@ async fn saving_sees_a_funded_address() {
 
 // Sending from Saving, signed by a software device.
 
-const DEVICE: &str = "software:test";
+const DEVICE: &str = "ledger:test";
 
 /// A Saving wallet joined to the federation, in a folder that can be reopened.
 struct SavingWallet {
@@ -1726,7 +1726,7 @@ impl SavingWallet {
         devices.add(
             DEVICE,
             "Test device",
-            DeviceKind::Software,
+            DeviceKind::Ledger,
             Arc::new(SoftSigner::from_seed(&seed, bitcoin::Network::Regtest)),
         );
         let port = Arc::new(FedimintPort::new(dir.path()));
@@ -1751,6 +1751,11 @@ impl SavingWallet {
 
     /// Set up on `server`, first scan done, joined.
     async fn ready(&self, server: ChainBackend) -> Arc<RealBackend> {
+        self.ready_with(server, DEVICE).await
+    }
+
+    /// As [`Self::ready`], set up with the device `id`.
+    async fn ready_with(&self, server: ChainBackend, id: &str) -> Arc<RealBackend> {
         let backend = self.open().await.unwrap();
         backend
             .set_settings(Settings {
@@ -1759,7 +1764,7 @@ impl SavingWallet {
             })
             .await
             .unwrap();
-        backend.setup_saving(DEVICE.into()).await.unwrap();
+        backend.setup_saving(id.into()).await.unwrap();
         backend.join_federation(invite()).await.unwrap();
         wait_online(&backend).await;
         backend
@@ -1912,6 +1917,79 @@ async fn saving_send_change_lands_in_spending() {
     })
     .await;
     assert_eq!(backend.saving_state().await.unwrap().balance, Amount::ZERO);
+    backend.shutdown().await.unwrap();
+}
+
+/// The software wallet, keyed from the backend's own words and not the test
+/// signer, sends with change into the federation: bitcoind takes its
+/// signatures, and the change reaches Spending. No hardware is listed at all.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn software_saving_sends_with_change() {
+    const COIN: u64 = 300_000;
+    const SEND: u64 = 80_000;
+    let wallet = SavingWallet::new();
+    wallet.devices.remove(DEVICE);
+    let backend = wallet
+        .ready_with(electrum(), fedimix_core::SOFTWARE_DEVICE_ID)
+        .await;
+    let device = backend.saving_state().await.unwrap().device.unwrap();
+    assert_eq!(device.kind, DeviceKind::Software);
+    assert!(device.connected);
+    fund_saving(&backend, COIN).await;
+    let before = balance_of(&backend).await;
+
+    let payee = btc("getnewaddress");
+    let preview = backend
+        .prepare_send(from_saving(&payee, SEND))
+        .await
+        .unwrap();
+    let ChangeDestination::Spending { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let mut states = Vec::new();
+    let txid = tokio::time::timeout(PATIENCE, async {
+        loop {
+            match events.next().await {
+                Some(Event::Operation {
+                    id: seen,
+                    state,
+                    history_id,
+                    ..
+                }) if seen == id => {
+                    let done = state.is_final();
+                    states.push(state);
+                    if done {
+                        return history_id;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the events ended"),
+            }
+        }
+    })
+    .await
+    .expect("the send ends");
+    assert_eq!(
+        states,
+        [
+            OperationState::Signing,
+            OperationState::Broadcasting,
+            OperationState::Done
+        ]
+    );
+    let txid = txid.expect("a done send names its transaction");
+    wait_for_transaction(&txid).await;
+    assert_eq!(wallet.devices.connects(), 0, "no hardware was opened");
+
+    let events = backend.subscribe();
+    let deposit = mine_until_received(&backend, &events).await;
+    assert_eq!(deposit.txid.as_ref(), Some(&txid), "the send's own change");
+    let after = wait_balance(&backend, |now| now > before).await;
+    assert!(after.saturating_sub(before) <= change);
+    assert_eq!(received_at(&payee).0, SEND);
     backend.shutdown().await.unwrap();
 }
 
