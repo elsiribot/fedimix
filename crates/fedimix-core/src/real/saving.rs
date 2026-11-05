@@ -195,7 +195,7 @@ impl Core {
             state.in_flight = snapshot.in_flight;
             state.coins = snapshot.coins;
             state.history = snapshot.history;
-            self.add_stalled(&wallet, &labels, &mut state.history)?;
+            self.add_signed_rows(&wallet, &labels, &mut state.history)?;
             state.history.truncate(SNAPSHOT_HISTORY);
         }
         Ok(state)
@@ -210,7 +210,7 @@ impl Core {
         };
         let labels = Labels::load(&self.store())?;
         let mut items = wallet.history(&labels);
-        self.add_stalled(&wallet, &labels, &mut items)?;
+        self.add_signed_rows(&wallet, &labels, &mut items)?;
         if let Some(before) = before {
             let position = items.iter().position(|item| item.id == before);
             let position = position.ok_or_else(|| FedimixError::UnknownItem(before.to_string()))?;
@@ -454,6 +454,7 @@ pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>)
                     // After a sync that worked, as it reads the wallet's view.
                     // This client is the old route once the settings change.
                     let tended = tokio::select! {
+                        biased;
                         () = stopping(&mut gate) => return Ok(()),
                         _ = target.changed() => continue 'connect,
                         tended = core.tend_signed(&wallet, &*chain) => tended,

@@ -195,6 +195,11 @@ pub enum HistoryStatus {
     /// A Saving send no server holds now, which may still confirm: a miner can
     /// have it. Never stored; read from the signed transaction.
     Stalled,
+    /// A Saving send that cannot confirm: another one spending the same coins
+    /// did. `reason` says which, as a sentence.
+    Lost {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

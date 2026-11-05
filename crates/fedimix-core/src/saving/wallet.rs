@@ -663,10 +663,10 @@ impl SavingWallet {
         }
     }
 
-    /// How deep the deepest confirmed transaction lies that spends a coin of
-    /// `tx` and is not `tx`: the only proof that `tx` can never confirm. `Absent`
+    /// The deepest confirmed transaction that spends a coin of `tx` and is not
+    /// `tx`, with its depth: the only proof that `tx` can never confirm. `Absent`
     /// says no such thing, as a transaction merely forgotten is absent too.
-    pub(crate) fn conflict_depth(&self, tx: &Transaction) -> Option<u32> {
+    pub(crate) fn conflict(&self, tx: &Transaction) -> Option<(Txid, u32)> {
         let inputs: HashSet<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
         let txid = tx.compute_txid();
         let inner = self.lock();
@@ -680,14 +680,36 @@ impl SavingWallet {
                 spent.iter().any(|i| inputs.contains(&i.previous_output))
             })
             .filter(|other| other.chain_position.is_confirmed())
-            .filter_map(|other| other.chain_position.confirmation_height_upper_bound())
-            .map(|height| tip.saturating_sub(height) + 1)
-            .max()
+            .filter_map(|other| {
+                let height = other.chain_position.confirmation_height_upper_bound()?;
+                Some((other.tx_node.txid, tip.saturating_sub(height) + 1))
+            })
+            .max_by_key(|(_, depth)| *depth)
     }
 
-    /// The history row of a stalled send, which BDK's view no longer lists.
-    pub(crate) fn stalled_item(&self, tx: &Transaction, at: u64, labels: &Labels) -> HistoryItem {
-        self.lock().item(tx, HistoryStatus::Stalled, at, labels)
+    /// The history row of a stored send that BDK's view no longer lists.
+    pub(crate) fn signed_item(
+        &self,
+        tx: &Transaction,
+        status: HistoryStatus,
+        at: u64,
+        labels: &Labels,
+    ) -> HistoryItem {
+        self.lock().item(tx, status, at, labels)
+    }
+
+    /// Where a send went: its first output that is neither this wallet's nor
+    /// `change` (an address).
+    pub(crate) fn recipient(&self, tx: &Transaction, change: Option<&str>) -> Option<String> {
+        let inner = self.lock();
+        tx.output
+            .iter()
+            .filter(|output| !inner.wallet.is_mine(output.script_pubkey.clone()))
+            .filter_map(|output| {
+                Address::from_script(&output.script_pubkey, btc_network(self.network)).ok()
+            })
+            .map(|address| address.to_string())
+            .find(|address| Some(address.as_str()) != change)
     }
 
     #[cfg(test)]

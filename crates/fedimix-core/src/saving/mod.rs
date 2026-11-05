@@ -14,7 +14,7 @@ mod signer;
 mod soft_signer;
 mod wallet;
 
-pub use chain::{ChainClient, connect_chain, is_refusal, require_server};
+pub use chain::{ChainClient, connect_chain, is_invalid, is_refusal, require_server};
 pub use devices::HwiPort;
 #[cfg(feature = "testing")]
 pub use fake_chain::{BroadcastGoes, FakeChain};

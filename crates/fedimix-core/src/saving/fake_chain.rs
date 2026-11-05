@@ -20,8 +20,10 @@ pub enum BroadcastGoes {
     Offline,
     /// Reached the server, and the connection dropped before the answer.
     AnswerLost,
-    /// The server judged the transaction and said no.
+    /// The server judged the transaction invalid and said no.
     Refused,
+    /// The server's policy said no: its fee floor.
+    LowFee,
     /// The server answered with something that judges nothing.
     Unclear,
 }
@@ -36,6 +38,8 @@ struct State {
     known: HashSet<Txid>,
     broadcasts: Vec<Transaction>,
     broadcast_script: VecDeque<BroadcastGoes>,
+    /// Every transaction offered to `broadcast`, whatever came of it.
+    offered: Vec<Txid>,
     /// Transactions the server no longer has: a sync that was told to expect
     /// one reports it evicted, as bdk_esplora and bdk_electrum do.
     missing: HashSet<Txid>,
@@ -130,6 +134,11 @@ impl FakeChain {
         state.missing.insert(txid);
     }
 
+    /// How often `txid` was offered to `broadcast`, accepted or not.
+    pub fn offers_of(&self, txid: Txid) -> usize {
+        self.state().offered.iter().filter(|t| **t == txid).count()
+    }
+
     /// The transactions the last sync's request expected the server to list.
     pub fn expected(&self) -> Vec<Txid> {
         self.state().expected.clone()
@@ -193,6 +202,7 @@ impl ChainClient for FakeChain {
             .await;
         let mut state = self.state();
         let txid = tx.compute_txid();
+        state.offered.push(txid);
         let goes = state.broadcast_script.pop_front();
         if goes == Some(BroadcastGoes::Offline) {
             return Err(FedimixError::Offline);
@@ -201,6 +211,9 @@ impl ChainClient for FakeChain {
             return Err(FedimixError::TxRejected(
                 "bad-txns-inputs-missingorspent".into(),
             ));
+        }
+        if goes == Some(BroadcastGoes::LowFee) {
+            return Err(FedimixError::TxRejected("mempool min fee not met".into()));
         }
         if goes == Some(BroadcastGoes::Unclear) {
             return Err(refused("server busy"));

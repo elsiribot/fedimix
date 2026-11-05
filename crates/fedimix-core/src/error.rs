@@ -46,7 +46,7 @@ pub enum FedimixError {
     TxRejected(String),
     /// A server refused a send that an earlier attempt may have delivered.
     #[error(
-        "The server refused this send, but an earlier try may have reached the network, so it could still confirm. Your next send spends the same coins, so only one of them can."
+        "No server takes this send now, but it may have reached the network, so it could still confirm, and Fedimix keeps offering it until it does or a later send replaces it. Do not pay it again from Spending: your next Saving send spends the same coins, so only one of the two can confirm."
     )]
     SendInDoubt,
     #[error("internal error: {0}")]

@@ -178,7 +178,10 @@ pub(super) fn refused(reason: &str) -> FedimixError {
 /// The words of a node judging a transaction, by consensus or by policy.
 /// Anything else from a server (busy, a daemon timeout, a proxy's error page)
 /// says nothing about the transaction, however final it sounds.
-const JUDGEMENTS: [&str; 15] = [
+const JUDGEMENTS: [&str; 18] = [
+    "max-fee-exceeded",
+    "scriptpubkey",
+    "tx-size",
     "bad-txns",
     "bad-witness",
     "missing-inputs",
@@ -195,6 +198,25 @@ const JUDGEMENTS: [&str; 15] = [
     "too-long-mempool-chain",
     "dust",
 ];
+
+/// Judgements that a transaction can never be valid as it stands, as opposed to
+/// one node's policy (its fee floor, a full mempool), which another may not share.
+const INVALID: [&str; 5] = [
+    "bad-txns",
+    "bad-witness",
+    "script-verify",
+    "missing-inputs",
+    "missingorspent",
+];
+
+/// Whether a node judged the transaction invalid, not merely unwelcome.
+pub fn is_invalid(error: &FedimixError) -> bool {
+    let FedimixError::TxRejected(reason) = error else {
+        return false;
+    };
+    let reason = reason.to_lowercase();
+    INVALID.iter().any(|word| reason.contains(word))
+}
 
 /// Whether a server judged the transaction and said no. Every other failure
 /// leaves open whether a broadcast got through.
@@ -357,6 +379,10 @@ impl ChainClient for EsploraChain {
             Ok(()) => Ok(()),
             // Only a 400 carries a node's answer; others come from anything
             // standing in the way, such as a proxy or a wrong address.
+            Err(esplora_client::Error::HttpResponse {
+                status: 408 | 429 | 500..=599,
+                ..
+            }) => already_known(self, tx, FedimixError::Offline).await,
             Err(esplora_client::Error::HttpResponse { status, .. }) if status != 400 => {
                 let unknown = FedimixError::Internal(format!(
                     "The chain server answered with status {status}."
@@ -754,6 +780,9 @@ mod tests {
             assert!(!is_refusal(&reply.unwrap_err()));
         }
         assert!(!is_refusal(&FedimixError::Offline));
+        assert!(is_invalid(&judged));
+        let fee = FedimixError::TxRejected("mempool min fee not met".into());
+        assert!(is_refusal(&fee) && !is_invalid(&fee));
         assert_eq!(
             already_known(&chain, &tx, FedimixError::Offline).await,
             Err(FedimixError::Offline)

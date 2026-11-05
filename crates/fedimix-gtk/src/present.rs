@@ -331,6 +331,7 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         HistoryStatus::Failed => "failed".to_string(),
         HistoryStatus::Refunded => "refunded".to_string(),
         HistoryStatus::Stalled => "not confirmed, may still go through".to_string(),
+        HistoryStatus::Lost { .. } => "not sent".to_string(),
         HistoryStatus::Expired => "expired".to_string(),
     };
     HistoryRowView {
