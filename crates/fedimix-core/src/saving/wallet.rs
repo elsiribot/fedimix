@@ -1346,11 +1346,14 @@ mod tests {
         let w = Arc::new(new_wallet(&dir));
         let fetched = w.fetch(&FakeChain::new()).await.unwrap();
         let (locked, is_locked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let holder = Arc::clone(&w);
+        // The write lasts until the ticks are counted, not for a time that a
+        // loaded machine can outrun before the test thread gets to run.
         let held = std::thread::spawn(move || {
             let _guard = holder.lock();
             locked.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            released.recv().unwrap();
         });
         is_locked.recv().unwrap();
         let ticks = async {
@@ -1369,6 +1372,7 @@ mod tests {
             _ = &mut apply => panic!("applied before the lock was free"),
             ticks = ticks => assert_eq!(ticks, 5),
         }
+        release.send(()).unwrap();
         apply.await.unwrap();
         held.join().unwrap();
     }
