@@ -30,7 +30,7 @@ use tokio::sync::watch;
 const INVITE: &str = "fed1one";
 const SECOND_INVITE: &str = "fed1two";
 const RESTORING: &str = "Fedimix is still restoring your wallet. Try again when it has finished.";
-const SET_UP_FIRST: &str = "Set up Saving with a hardware wallet first.";
+const SET_UP_FIRST: &str = "Set up Saving first.";
 const PROXY_SENTENCE: &str =
     "Fedimix cannot reach federations through a proxy yet. Clear the proxy in Settings to connect.";
 /// Longer than anything here takes unless it is broken.
@@ -510,7 +510,7 @@ async fn saving_methods_report_not_set_up() {
     );
     assert_eq!(backend.exit_now("p".into()).await.map(|_| ()), not_set_up);
     // No device, but the software wallet is always there.
-    let found = backend.detect_devices().await.unwrap();
+    let found = backend.detect_devices().await.unwrap().devices;
     let kinds: Vec<_> = found.iter().map(|d| d.kind).collect();
     assert_eq!(kinds, [DeviceKind::Software]);
     assert!(backend.suggested_federations().await.unwrap().is_empty());
@@ -3143,7 +3143,7 @@ async fn a_settled_send_keeps_the_amount_of_its_row() {
 const CHAIN_URL: &str = "http://chain.test";
 const DEVICE: &str = "ledger:one";
 const SEED: [u8; 32] = [7; 32];
-const SCANNING: &str = "Fedimix is still scanning your device's history.";
+const SCANNING: &str = "Fedimix is still scanning Saving's history.";
 const NO_SERVER: &str = "Enter a chain server in Settings.";
 const JADE_PROXY: &str =
     "Jade needs Blockstream's PIN server, which cannot use your proxy. Clear the proxy to use it.";
@@ -3387,9 +3387,7 @@ async fn setup_twice_is_refused() {
     let backend = saving.ready().await;
     assert_eq!(
         backend.setup_saving(DEVICE.into()).await,
-        Err(FedimixError::NotSetUp(
-            "Saving is already set up with a hardware wallet.".into()
-        ))
+        Err(FedimixError::NotSetUp("Saving is already set up.".into()))
     );
     // The refusal needed no device.
     assert_eq!(saving.devices.connects(), 1);
@@ -3409,7 +3407,7 @@ async fn a_device_on_the_wrong_kind_of_network_gets_a_sentence() {
     assert_eq!(
         backend.setup_saving("ledger:main".into()).await,
         Err(FedimixError::NotSetUp(
-            "The hardware wallet account is for the main network, but Fedimix is running on a test network."
+            "The Saving account is for the main network, but Fedimix is running on a test network."
                 .into()
         ))
     );
@@ -3911,7 +3909,7 @@ async fn jade_is_not_offered_through_a_proxy() {
         found.into_iter().map(|d| d.kind).collect::<Vec<_>>()
     };
     assert_eq!(
-        kinds(backend.detect_devices().await.unwrap()),
+        kinds(backend.detect_devices().await.unwrap().devices),
         [DeviceKind::Ledger, DeviceKind::Jade, DeviceKind::Software]
     );
     backend
@@ -3922,7 +3920,7 @@ async fn jade_is_not_offered_through_a_proxy() {
         .await
         .unwrap();
     assert_eq!(
-        kinds(backend.detect_devices().await.unwrap()),
+        kinds(backend.detect_devices().await.unwrap().devices),
         [DeviceKind::Ledger, DeviceKind::Software],
         "the software wallet sends nothing over the network"
     );
@@ -6941,7 +6939,7 @@ fn assert_signed(tx: &Transaction, coins: &[fedimix_core::Coin]) {
 async fn software_wallet_sets_up_and_sends() {
     let saving = SavingHarness::new();
     let backend = saving.joined_with(SOFTWARE).await;
-    let found = backend.detect_devices().await.unwrap();
+    let found = backend.detect_devices().await.unwrap().devices;
     assert_eq!(found.last(), Some(&software_entry()), "after the devices");
     let state = backend.saving_state().await.unwrap();
     assert_eq!(state.device, Some(software_entry()));
@@ -7078,7 +7076,7 @@ async fn software_wallet_works_through_a_proxy() {
         })
         .await
         .unwrap();
-    let found = backend.detect_devices().await.unwrap();
+    let found = backend.detect_devices().await.unwrap().devices;
     assert_eq!(found.last(), Some(&software_entry()));
     saving.chain.push_full_scan(first_scan(1));
     backend.setup_saving(SOFTWARE.into()).await.unwrap();
@@ -7087,5 +7085,86 @@ async fn software_wallet_works_through_a_proxy() {
         backend.saving_state().await.unwrap().device,
         Some(software_entry())
     );
+    backend.shutdown().await.unwrap();
+}
+
+const SCAN_FAILED: &str = "Fedimix could not look for USB devices.";
+
+#[tokio::test]
+async fn a_failed_scan_is_shown_beside_the_software_wallet() {
+    let saving = SavingHarness::new();
+    let backend = saving.with_server().await;
+    saving
+        .devices
+        .fail_listing(Some(FedimixError::Internal(SCAN_FAILED.into())));
+    assert_eq!(
+        backend.detect_devices().await.unwrap(),
+        fedimix_core::DeviceList {
+            devices: vec![software_entry()],
+            problem: Some(SCAN_FAILED.into()),
+        }
+    );
+    saving.devices.fail_listing(None);
+    let listing = backend.detect_devices().await.unwrap();
+    assert_eq!(listing.problem, None);
+    assert_eq!(listing.devices.len(), 2);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_scan_fails_a_hardware_send_at_once() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    saving
+        .devices
+        .fail_listing(Some(FedimixError::Internal(SCAN_FAILED.into())));
+    let events = backend.subscribe();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    let (states, _) = run_of(&events, &id).await;
+    assert_eq!(
+        states,
+        [
+            OperationState::AwaitingDevice,
+            OperationState::Failed {
+                error: FedimixError::Internal(SCAN_FAILED.into())
+            }
+        ]
+    );
+    assert!(saving.chain.broadcasts().is_empty());
+    assert!(coin_at(&backend, &coin).await.is_some());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn software_wallet_refills() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined_with(SOFTWARE).await;
+    backend
+        .set_settings(Settings {
+            spending_target: sat(25_000),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    saving.fund(&backend, 50_000, 0).await;
+    let coins = backend.saving_state().await.unwrap().coins;
+    let preview = backend.prepare_refill().await.unwrap();
+    assert_eq!(preview.device_name, "This computer");
+    let events = backend.subscribe();
+    let id = backend.confirm_refill(preview.id).await.unwrap();
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Refill).await;
+    assert_eq!(
+        states,
+        [
+            OperationState::Signing,
+            OperationState::Broadcasting,
+            OperationState::Done
+        ]
+    );
+    let tx = saving.chain.broadcasts().last().unwrap().clone();
+    assert_eq!(tx.output.len(), 1, "no change");
+    assert_signed(&tx, &coins);
     backend.shutdown().await.unwrap();
 }

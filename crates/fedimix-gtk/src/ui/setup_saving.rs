@@ -89,7 +89,9 @@ fn scan(ctx: &Rc<AppContext>, view: &View) {
     let core = ctx.bridge.core();
     let shown = ctx.clone();
     let view = view.clone();
-    ctx.run(async move { core.detect_devices().await }, move |devices| {
+    // The listing's `problem` is Task 8's to show.
+    ctx.run(async move { core.detect_devices().await }, move |listing| {
+        let devices = listing.devices;
         let (Some(list), Some(pages)) = (view.list.upgrade(), view.pages.upgrade()) else {
             return;
         };

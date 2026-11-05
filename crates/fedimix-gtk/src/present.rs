@@ -1849,7 +1849,7 @@ mod tests {
             .invite
             .clone();
         core.join_federation(invite).await.unwrap();
-        let device = core.detect_devices().await.unwrap().remove(0);
+        let device = core.detect_devices().await.unwrap().devices.remove(0);
         core.setup_saving(device.id).await.unwrap();
         let sp = core.spending_state().await.unwrap();
         assert_eq!(saving_banner(&sp, true), None);

@@ -166,7 +166,7 @@ struct Core {
     config: CoreConfig,
     port: Arc<dyn FederationPort>,
     chain_factory: ChainFactory,
-    devices: Arc<dyn DevicePort>,
+    devices: Arc<WithSoftware>,
     seed: Arc<Seed>,
     /// `false` when the seed is older than the store: the store was lost, so
     /// this seed may have been used at a federation the store does not list.
@@ -502,7 +502,7 @@ impl RealBackend {
         let seed = Arc::new(Seed::load_or_create(&dir, &lock)?);
         // The software wallet signs from the same words, so it is made here.
         let software = SeedSigner::new(Arc::clone(&seed), config.network);
-        let devices: Arc<dyn DevicePort> = Arc::new(WithSoftware::new(devices, Arc::new(software)));
+        let devices = Arc::new(WithSoftware::new(devices, Arc::new(software)));
         let store = Store::open(&db)?;
         store.bind_network(config.network)?;
         let seed_born_with_store = store.seed_born_with_store(seed_is_new)?;
@@ -651,7 +651,7 @@ impl Backend for RealBackend {
         Ok(())
     }
 
-    async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
+    async fn detect_devices(&self) -> Result<DeviceList> {
         self.core.detect_devices().await
     }
 

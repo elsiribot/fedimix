@@ -287,20 +287,15 @@ impl DevicePort for HwiPort {
 
 const OTHER_WORDS: &str = "The recovery words in this folder are not the ones Saving was set up with, so they cannot sign for it. Restore the seed file from your backup.";
 
-/// A [`DevicePort`] that offers the software wallet after the hardware ones,
-/// always: it needs nothing plugged in.
+/// The devices `RealBackend` offers: whatever its hardware [`DevicePort`]
+/// finds, then always the software wallet, as it needs nothing plugged in.
 pub struct WithSoftware {
     hardware: Arc<dyn DevicePort>,
     software: Arc<SeedSigner>,
 }
 
-impl WithSoftware {
-    pub fn new(hardware: Arc<dyn DevicePort>, software: Arc<SeedSigner>) -> Self {
-        WithSoftware { hardware, software }
-    }
-}
-
-fn software_entry() -> DeviceInfo {
+/// How the software wallet is listed.
+pub fn software_entry() -> DeviceInfo {
     DeviceInfo {
         id: SOFTWARE_DEVICE_ID.to_string(),
         name: SOFTWARE_DEVICE_NAME.to_string(),
@@ -309,23 +304,37 @@ fn software_entry() -> DeviceInfo {
     }
 }
 
-#[async_trait]
-impl DevicePort for WithSoftware {
-    /// A hardware listing that failed is logged, not returned: the software
-    /// wallet can still be used, and hiding it would leave the person nothing.
-    async fn list(&self) -> Result<Vec<DeviceInfo>> {
-        let mut devices = self.hardware.list().await.unwrap_or_else(|e| {
-            eprintln!("fedimix: looking for hardware wallets: {e}");
-            Vec::new()
-        });
+impl WithSoftware {
+    pub fn new(hardware: Arc<dyn DevicePort>, software: Arc<SeedSigner>) -> Self {
+        WithSoftware { hardware, software }
+    }
+
+    /// The hardware wallets only, with the hardware port's own error when its
+    /// scan failed and found nothing.
+    pub async fn hardware(&self) -> Result<Vec<DeviceInfo>> {
+        let mut devices = self.hardware.list().await?;
         devices.retain(|device| device.id != SOFTWARE_DEVICE_ID);
-        devices.push(software_entry());
         Ok(devices)
     }
 
-    /// The software wallet is checked as a device is at connect: the account
-    /// must be a software one with this fingerprint.
-    async fn connect(&self, id: &str, account: Option<&DeviceAccount>) -> Result<Arc<dyn Signer>> {
+    /// The hardware wallets, then the software wallet. A failed hardware scan
+    /// does not hide the software wallet: its error comes back beside it.
+    pub async fn list(&self) -> (Vec<DeviceInfo>, Option<FedimixError>) {
+        let (mut devices, problem) = match self.hardware().await {
+            Ok(devices) => (devices, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        devices.push(software_entry());
+        (devices, problem)
+    }
+
+    /// Opens `id`. The software wallet is checked as a device is: with an
+    /// account, it must be a software one with this fingerprint.
+    pub async fn connect(
+        &self,
+        id: &str,
+        account: Option<&DeviceAccount>,
+    ) -> Result<Arc<dyn Signer>> {
         if id != SOFTWARE_DEVICE_ID {
             return self.hardware.connect(id, account).await;
         }
@@ -865,7 +874,8 @@ mod tests {
             FakeScanner::ok(DeviceKind::Ledger, &["/dev/hidraw1"]),
             FakeScanner::ok(DeviceKind::Jade, &["/dev/ttyUSB0"]),
         ]);
-        let list = port.list().await.unwrap();
+        let (list, problem) = port.list().await;
+        assert_eq!(problem, None);
         let ids: Vec<_> = list.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -873,8 +883,8 @@ mod tests {
         );
         assert_eq!(list[2], the_software_entry());
         assert_eq!(
-            with_software(vec![]).list().await.unwrap(),
-            [the_software_entry()]
+            with_software(vec![]).list().await,
+            (vec![the_software_entry()], None)
         );
     }
 
@@ -884,7 +894,18 @@ mod tests {
             FakeScanner::failing(DeviceKind::Ledger),
             FakeScanner::failing(DeviceKind::BitBox),
         ]);
-        assert_eq!(port.list().await.unwrap(), [the_software_entry()]);
+        // The scan's own sentence comes back beside the software wallet.
+        assert_eq!(
+            port.list().await,
+            (
+                vec![the_software_entry()],
+                Some(FedimixError::Internal("Could not look.".into()))
+            )
+        );
+        assert_eq!(
+            port.hardware().await,
+            Err(FedimixError::Internal("Could not look.".into()))
+        );
     }
 
     #[tokio::test]

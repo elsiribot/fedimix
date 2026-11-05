@@ -201,7 +201,7 @@ The key comes from the same BIP39 words as Spending (BIP39 seed, empty passphras
 
 Real mode: Saving tab live, Settings' Hardware wallet and chain server groups visible, Exit and Cover groups stay hidden (`features.scheduler`, `features.cover` stay false). Saving Receive states the address cannot be shown on a device. Setup lists "This computer" (software wallet) after hardware devices, with the sentence "Keys stay on this computer. A hardware wallet is safer for large amounts." The Saving empty state reads "Connect a hardware wallet or use this computer". A software account skips "Connect your <device>". Send and Refill confirm labels name the device; a missing device shows "Connect your <device>" (spec section 4). The `in_flight` line stays hidden until Phase 4.
 
-`test-real-ui.sh` builds with `--features fedimix-gtk/testing`, which adds `--test-signer <xprv-file>` and a Software device. The flag does not exist in a normal build.
+`test-real-ui.sh` builds with `--features fedimix-gtk/testing`, which adds `--test-signer <xprv-file>` and a device listed as a hardware kind (Ledger), as the core tests do: a `Software` device would skip AwaitingDevice and be taken for "This computer". The flag does not exist in a normal build.
 
 - [ ] **Step 1: Failing tests:** `cli::test_signer_needs_the_feature`, `present::device_cannot_show_address`, `present::refill_offered_only_with_saving_below_target`.
 - [ ] **Step 2: Run; expect FAIL.** Implement.

@@ -46,7 +46,7 @@ impl Fedimix {
     pub async fn set_active_federation(&self, id: String) -> Result<()> {
         self.backend.set_active_federation(id).await
     }
-    pub async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
+    pub async fn detect_devices(&self) -> Result<DeviceList> {
         self.backend.detect_devices().await
     }
     pub async fn setup_saving(&self, device_id: String) -> Result<()> {

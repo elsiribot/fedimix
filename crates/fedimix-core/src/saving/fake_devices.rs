@@ -13,6 +13,8 @@ struct State {
     devices: Vec<(DeviceInfo, Arc<dyn Signer>)>,
     connects: usize,
     lists: usize,
+    /// What `list` fails with instead, while set.
+    list_error: Option<FedimixError>,
 }
 
 /// Lists what was added. `connect` hands back the signer added with that id.
@@ -46,6 +48,12 @@ impl FakeDevices {
         self.state().devices.retain(|(info, _)| info.id != id);
     }
 
+    /// Makes every `list` fail with `error`, as a scan that cannot look does;
+    /// `None` ends it.
+    pub fn fail_listing(&self, error: Option<FedimixError>) {
+        self.state().list_error = error;
+    }
+
     /// How many `connect` calls were made.
     pub fn connects(&self) -> usize {
         self.state().connects
@@ -62,6 +70,9 @@ impl DevicePort for FakeDevices {
     async fn list(&self) -> Result<Vec<DeviceInfo>> {
         let mut state = self.state();
         state.lists += 1;
+        if let Some(error) = state.list_error.clone() {
+            return Err(error);
+        }
         Ok(state.devices.iter().map(|(info, _)| info.clone()).collect())
     }
 

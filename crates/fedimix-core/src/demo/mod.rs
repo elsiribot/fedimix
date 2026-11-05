@@ -928,8 +928,11 @@ impl Backend for DemoBackend {
         Ok(())
     }
 
-    async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
-        Ok(self.state.lock().await.detected.clone())
+    async fn detect_devices(&self) -> Result<DeviceList> {
+        Ok(DeviceList {
+            devices: self.state.lock().await.detected.clone(),
+            problem: None,
+        })
     }
 
     async fn setup_saving(&self, device_id: String) -> Result<()> {
@@ -1841,7 +1844,7 @@ mod tests {
         b.join_federation("fed1abc".into()).await.unwrap();
         let sp = b.spending_state().await.unwrap();
         assert!(sp.federation.is_some());
-        let dev = b.detect_devices().await.unwrap().remove(0);
+        let dev = b.detect_devices().await.unwrap().devices.remove(0);
         assert!(matches!(
             b.setup_saving("nope".into()).await,
             Err(FedimixError::UnknownItem(_))

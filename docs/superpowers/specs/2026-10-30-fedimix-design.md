@@ -176,4 +176,4 @@ Esplora or Electrum, configurable. Default: a public Esplora server. Optional SO
 - Android/iOS apps (core API is designed for them).
 - Automatic spreading of one deposit across multiple federations.
 - Built-in Tor (use a SOCKS5 proxy).
-- Software signer for Saving outside tests.
+- ~~Software signer for Saving outside tests.~~ Superseded by the 2026-11-05 amendment under Saving: Saving may be a software wallet on this computer, keyed from the recovery words. The test signer still never ships.

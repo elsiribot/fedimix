@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Proves the software signer is not in a normal build of the app: the
-# `testing` feature of fedimix-core, which alone compiles `SoftSigner`, must be
-# off in fedimix-gtk's normal and build dependency graph. It fails when it
-# cannot tell: if cargo fails, or the graph does not show fedimix-core at all,
-# or a graph that is known to enable `testing` (fedimix-core's own tests) does
-# not show it.
+# Proves the `testing` signer is not in a normal build of the app: the
+# `testing` feature of fedimix-core, which alone compiles `SoftSigner` with its
+# reject hooks and the fakes, must be off in fedimix-gtk's normal and build
+# dependency graph. `SeedSigner`, the software Saving wallet keyed from the
+# recovery words, ships in every build on purpose and is not what this checks.
+# It fails when it cannot tell: if cargo fails, or the graph does not show
+# fedimix-core at all, or a graph that is known to enable `testing`
+# (fedimix-core's own tests) does not show it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

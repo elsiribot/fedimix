@@ -135,6 +135,15 @@ pub const SOFTWARE_DEVICE_ID: &str = "software";
 /// The name the software wallet is listed under.
 pub const SOFTWARE_DEVICE_NAME: &str = "This computer";
 
+/// What `detect_devices` found: the hardware wallets, then always the software
+/// wallet. `problem` says why no hardware wallet could be looked for, when the
+/// scan failed and found none, so the person knows why theirs is missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceList {
+    pub devices: Vec<DeviceInfo>,
+    pub problem: Option<String>,
+}
+
 /// A hardware wallet, or the software wallet on this computer, which is always
 /// `connected`. The device Saving was set up with stays in
 /// `SavingState::device` while unplugged, as `Some` with `connected: false`;

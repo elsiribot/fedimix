@@ -18,6 +18,7 @@ use crate::error::{FedimixError, Result};
 use crate::event::Event;
 use crate::saving::{
     ALREADY_SET_UP, ChainClient, DeviceAccount, Labels, SavingWallet, Signer, require_server,
+    software_entry,
 };
 
 /// How often a sync runs with nothing going on.
@@ -30,8 +31,8 @@ const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// How often a device is looked for while a review is open.
 pub(super) const DEVICE_POLL: Duration = Duration::from_secs(5);
 
-const SET_UP_FIRST: &str = "Set up Saving with a hardware wallet first.";
-const SCANNING: &str = "Fedimix is still scanning your device's history.";
+const SET_UP_FIRST: &str = "Set up Saving first.";
+const SCANNING: &str = "Fedimix is still scanning Saving's history.";
 const SETUP_STOPPED: &str = "Setting up Saving stopped unexpectedly. Try again.";
 const SETTINGS_MOVED: &str = "The network settings changed during setup. Set up Saving again.";
 const SYNC_PANICKED: &str =
@@ -259,16 +260,25 @@ impl Core {
         Ok(())
     }
 
-    /// The devices that can be used now. With a proxy that leaves Jade out: its
-    /// PIN step talks to Blockstream outside any proxy. Doubles as the poll
-    /// behind `SavingState::device`.
-    pub(super) async fn detect_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let mut found = self.devices.list().await?;
+    /// The devices that can be used now, and why no hardware wallet could be
+    /// looked for, if so. With a proxy that leaves Jade out: its PIN step talks
+    /// to Blockstream outside any proxy. Doubles as the poll behind
+    /// `SavingState::device`.
+    pub(super) async fn poll_devices(&self) -> (Vec<DeviceInfo>, Option<FedimixError>) {
+        let (mut found, problem) = self.devices.list().await;
         if self.chain.borrow().proxy.is_some() {
             found.retain(|device| device.kind != DeviceKind::Jade);
         }
         self.note_devices(&found);
-        Ok(found)
+        (found, problem)
+    }
+
+    pub(super) async fn detect_devices(&self) -> Result<DeviceList> {
+        let (devices, problem) = self.poll_devices().await;
+        Ok(DeviceList {
+            devices,
+            problem: problem.as_ref().and_then(problem_of),
+        })
     }
 
     /// A listing does not open a device, so a device of the kind is taken to be
@@ -298,7 +308,12 @@ impl Core {
         id: &str,
         account: Option<&DeviceAccount>,
     ) -> Result<(DeviceInfo, Arc<dyn Signer>)> {
-        let listed = self.devices.list().await?;
+        // Always there, and needs no scan of USB.
+        if id == SOFTWARE_DEVICE_ID {
+            let signer = self.devices.connect(id, account).await?;
+            return Ok((software_entry(), signer));
+        }
+        let listed = self.devices.hardware().await?;
         let device = listed.into_iter().find(|device| device.id == id);
         let device = device
             .ok_or_else(|| FedimixError::DeviceNotConnected("hardware wallet".to_string()))?;
@@ -502,8 +517,8 @@ async fn poll_during_reviews(core: Arc<Core>) {
         }
         tokio::select! {
             () = stopping(&mut gate) => return,
-            polled = core.detect_devices() => {
-                if let Err(e) = polled {
+            (_, problem) = core.poll_devices() => {
+                if let Some(e) = problem {
                     eprintln!("fedimix: looking for the hardware wallet: {e}");
                 }
             }

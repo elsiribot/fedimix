@@ -16,7 +16,7 @@ pub trait Backend: Send + Sync + 'static {
     async fn join_federation(&self, invite: String) -> Result<FederationInfo>;
     async fn federations(&self) -> Result<Vec<FederationInfo>>;
     async fn set_active_federation(&self, id: String) -> Result<()>;
-    async fn detect_devices(&self) -> Result<Vec<DeviceInfo>>;
+    async fn detect_devices(&self) -> Result<DeviceList>;
     async fn setup_saving(&self, device_id: String) -> Result<()>;
     async fn receive(&self, request: ReceiveRequest) -> Result<ReceiveInfo>;
     async fn prepare_send(&self, request: SendRequest) -> Result<SendPreview>;

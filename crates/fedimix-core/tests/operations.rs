@@ -388,7 +388,7 @@ async fn device_rejection_fails_the_operation_and_moves_nothing() {
 #[tokio::test]
 async fn device_rejection_fails_setup_too() {
     let (core, _) = fast(DemoScenario::DeviceRejects);
-    let device = core.detect_devices().await.unwrap().remove(0);
+    let device = core.detect_devices().await.unwrap().devices.remove(0);
     assert_eq!(
         core.setup_saving(device.id).await,
         Err(FedimixError::DeviceRejected)

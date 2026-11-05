@@ -92,8 +92,10 @@ when you confirm a send or a refill, and it talks to no server, so a proxy
 does not affect it.
 
 A hardware wallet is safer for large amounts: with the software wallet, anyone
-who can read the `seed` file can spend Saving too, not just Spending. Moving to
-a hardware wallet later means a new Saving wallet and a send to it.
+who can read the `seed` file can spend Saving too, not just Spending. Choose
+with care: Saving is set up once per data folder, and Fedimix cannot yet switch
+it to a hardware wallet. To move later, send Saving's coins from Saving to an
+address of the hardware wallet.
 
 ## Not yet
 
@@ -103,6 +105,7 @@ a hardware wallet later means a new Saving wallet and a send to it.
 - A proxy for federation traffic: fedimint has no SOCKS5 support, so setting a
   proxy keeps federations offline instead of connecting directly.
 - Restoring from the recovery words inside the app; see the manual steps above.
+- Switching Saving from the software wallet to a hardware wallet.
 
 ## Demo mode
 

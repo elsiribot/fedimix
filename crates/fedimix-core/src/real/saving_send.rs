@@ -92,7 +92,7 @@ const NO_ESTIMATE: &str =
 const NO_FEDERATION: &str = "No federation is active, so the change stays in Saving.";
 const BAD_DEPOSIT_ADDRESS: &str = "The federation gave a deposit address Fedimix cannot use.";
 const TAMPERED: &str = "Your device handed back a different transaction from the one you reviewed, so Fedimix did not send it.";
-pub(super) const NO_ACCOUNT: &str = "Set up Saving with a hardware wallet first.";
+pub(super) const NO_ACCOUNT: &str = "Set up Saving first.";
 const UNREADABLE_TX: &str = "A stored Saving transaction cannot be read.";
 
 /// The federation a preview pays its change, or a refill, to.
@@ -861,12 +861,23 @@ impl Core {
         account: &DeviceAccount,
         expires_at: Timestamp,
     ) -> Result<Arc<dyn Signer>> {
+        if account.kind == DeviceKind::Software {
+            return self
+                .devices
+                .connect(SOFTWARE_DEVICE_ID, Some(account))
+                .await;
+        }
         self.refuse_jade_behind_proxy(Some(account))?;
         loop {
             if expires_at <= (self.clock)() {
                 return Err(FedimixError::PreviewExpired);
             }
-            let found = self.detect_devices().await?;
+            // A scan that cannot look fails at once, with its sentence: the
+            // device may be the very one it could not look for.
+            let (found, problem) = self.poll_devices().await;
+            if let Some(e) = problem {
+                return Err(e);
+            }
             if let Some(device) = found.iter().find(|device| device.kind == account.kind) {
                 match self.open_device(&device.id, Some(account)).await {
                     Ok((_, signer)) => return Ok(signer),

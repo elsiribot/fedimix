@@ -43,7 +43,7 @@ use crate::store::{Store, db_err};
 /// address per receive, so a restored wallet may have long runs of unused ones.
 const FULL_SCAN_STOP_GAP: usize = 100;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const ALREADY_SET_UP: &str = "Saving is already set up with a hardware wallet.";
+pub(crate) const ALREADY_SET_UP: &str = "Saving is already set up.";
 
 /// The hardware wallet's account: public data only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,7 +305,7 @@ fn btc_network(network: Network) -> bitcoin::Network {
 
 fn bad_account(what: &str) -> FedimixError {
     FedimixError::NotSetUp(format!(
-        "The hardware wallet gave {what} that Fedimix cannot read. Reconnect it and set up Saving again."
+        "Fedimix could not read {what} from the wallet you chose. Set up Saving again."
     ))
 }
 
@@ -326,7 +326,7 @@ fn descriptors(account: &DeviceAccount, network: Network) -> Result<(String, Str
             ("the main network", "a test network")
         };
         return Err(FedimixError::NotSetUp(format!(
-            "The hardware wallet account is for {has}, but Fedimix is running on {wants}."
+            "The Saving account is for {has}, but Fedimix is running on {wants}."
         )));
     }
     let origin = format!("[{fingerprint}/{path}]{xpub}");
@@ -398,7 +398,7 @@ impl SavingWallet {
             Err(LoadWithPersistError::Persist(e)) => return Err(db_err(e)),
             Err(LoadWithPersistError::InvalidChangeSet(e)) => {
                 return Err(FedimixError::Internal(format!(
-                    "The Saving wallet in this data folder does not match the hardware wallet: {e}."
+                    "The Saving wallet in this data folder does not match the account it was set up with: {e}."
                 )));
             }
         };
