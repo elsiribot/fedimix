@@ -1,0 +1,37 @@
+# scripts/demo-live.sh, headless before the window opens: join the regtest
+# federation, take 0.002 BTC over Lightning, point Saving at the local Esplora,
+# set Saving up on this computer and receive 0.01 BTC to it.
+expect-slow Join a federation
+type-env "Paste an invite code" FM_INVITE_CODE
+click Join
+expect-slow Devimint Federation
+action app.settings
+expect Server URL
+type-env "Server URL" FEDIMIX_CHAIN_URL
+apply Server URL
+wait 800
+click Back
+click Spending
+click Receive
+expect Create invoice
+type "Amount (BTC)" 0.002
+type "Description (optional)" demo float
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice.txt
+# The script pays it.
+shot invoice
+close-dialog
+expect-slow 0.0019 BTC
+click Saving
+click Set up
+expect This computer
+click Set up
+expect-slow Saving is set up
+click Receive
+expect-within 180 bcrt1
+save-text bcrt1 saving-address.txt
+# The script pays 0.01 BTC to it and mines.
+shot saving-address
+close-dialog
+expect-within 180 0.0100 BTC

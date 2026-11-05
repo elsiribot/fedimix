@@ -1,0 +1,15 @@
+# scripts/record-demo.sh, after the story, on the same wallet in the dark theme.
+expect-slow Saving
+click Spending
+expect-slow Devimint Federation
+expect for spending
+wait 1500
+shot dark-spending
+click Saving
+expect This computer
+wait 1500
+shot dark-saving
+action app.settings
+expect Recovery words
+wait 1500
+shot dark-settings

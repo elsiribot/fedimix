@@ -1,0 +1,168 @@
+# scripts/record-demo.sh: the Phase 3 story on regtest, paced for a viewer.
+# `shot NN-name` is a screenshot; `shot _rec` and `shot _cut` start and stop a
+# recording segment, so waits on blocks and the federation are left out of
+# the video. The script answers `shot 06-invoice` by paying it and
+# `shot 11-saving-address`/`shot 17-saving-address-2` by paying Saving.
+
+# 1. First launch: a new wallet, its recovery phrase, the regtest chain server.
+expect-slow Join a federation
+shot _rec
+wait 4000
+shot 01-first-launch
+wait 2000
+action app.settings
+expect Recovery words
+wait 2500
+click Recovery words
+expect-numbered 12
+wait 6000
+shot 02-recovery-phrase
+click Back
+expect Server URL
+type-env "Server URL" FEDIMIX_CHAIN_URL
+apply Server URL
+wait 3500
+shot 03-settings-regtest-chain
+click Back
+
+# 2. Join the federation from its invite code.
+expect Paste an invite code
+type-env "Paste an invite code" FM_INVITE_CODE
+wait 3000
+shot 04-join-invite
+click Join
+shot _cut
+expect-slow Devimint Federation
+expect No activity yet
+shot _rec
+wait 4000
+shot 05-joined
+
+# 3. Receive over Lightning.
+click Receive
+expect Create invoice
+type "Amount (BTC)" 0.002
+type "Description (optional)" hackathon coffee
+wait 2000
+click Create invoice
+expect-slow lnbcrt
+save-text lnbcrt invoice.txt
+wait 3500
+shot 06-invoice
+shot _cut
+close-dialog
+expect-slow 0.0019 BTC
+shot _rec
+wait 4500
+shot 07-lightning-received
+
+# 4. Saving on "This computer".
+click Saving
+expect Connect a hardware wallet or use this computer
+wait 3500
+shot 08-saving-empty
+click Set up
+expect This computer
+expect Keys stay on this computer. A hardware wallet is safer for large amounts.
+wait 4500
+shot 09-saving-choice
+click Set up
+expect-slow Saving is set up
+wait 3000
+shot 10-saving-set-up
+
+# 5. Receive to Saving.
+click Receive
+shot _cut
+expect-within 180 bcrt1
+expect Coins received this way are marked unmixed
+shot _rec
+save-text bcrt1 saving-address.txt
+wait 4000
+shot 11-saving-address
+shot _cut
+close-dialog
+expect-within 180 0.0100 BTC
+expect Received
+shot _rec
+wait 4000
+shot 12-saving-funded
+
+# 6. Send from Saving with change: the change goes to Spending.
+click Send
+type-env "Bitcoin address" FEDIMIX_SAVING_DEST
+type "Amount (BTC)" 0.002
+wait 3000
+shot 13-saving-send
+click Review
+expect-slow Confirm on This computer
+expect Network fee
+click 0.00200000 BTC
+expect Change → Spending
+wait 6000
+shot 14-send-review-change
+click Confirm on This computer
+expect-slow Payment sent
+expect change → Spending
+wait 4000
+shot 15-send-sent
+click Spending
+wait 2000
+shot _cut
+expect-within 400 Txid
+expect Deposit
+shot _rec
+wait 4500
+shot 16-change-in-spending
+
+# 7. A refill: Saving gets coins again, the target goes up, one refill.
+click Saving
+click Receive
+shot _cut
+expect-within 180 bcrt1
+save-text bcrt1 saving-address-2.txt
+shot 17-saving-address-2
+close-dialog
+expect-within 180 0.0050 BTC
+action app.settings
+expect Target (BTC)
+type "Target (BTC)" 0.011
+wait 800
+click Back
+click Spending
+expect of 0.011 target
+expect Refill from Saving
+shot _rec
+wait 4500
+shot 18-below-target
+click Refill from Saving
+expect-slow Refill Spending
+expect Confirm on This computer
+expect from Saving · fee
+wait 5000
+shot 19-refill-review
+click Confirm on This computer
+expect Refill started
+expect-slow Refill sent
+wait 3000
+shot 20-refill-sent
+click Saving
+expect Refill → Spending
+wait 4000
+shot 21-refill-in-saving
+shot _cut
+
+# 8. History, once Spending has credited the refill. (Saving's refill row
+# still says pending at this point; see REPORT.md.)
+click Spending
+expect-within 400 for spending
+expect-not Refill from Saving
+shot _rec
+wait 6000
+shot 22-spending-history
+click Saving
+expect Refill → Spending
+wait 6000
+shot 23-saving-history
+wait 2000
+shot _cut

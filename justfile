@@ -32,6 +32,15 @@ clippy:
 fmt:
     cargo fmt --all
 
+# Live demo on a local regtest devimint: pre-funded wallet in a real window; Ctrl-C stops it.
+# Helpers while it runs: just demo-live pay <invoice> | send <address> [BTC] | mine [N] | open | info
+demo-live *args:
+    scripts/demo-live.sh {{args}}
+
+# Record the Phase 3 story headlessly on regtest to ~/fedimix-demo/phase3 (video and screenshots)
+record-demo:
+    scripts/record-demo.sh
+
 # Build the release package and run the flake checks (clippy, fmt, tests)
 build-nix:
     nix build
