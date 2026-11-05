@@ -19,15 +19,17 @@ use std::sync::Arc;
 use bitcoin::OutPoint;
 
 use super::Core;
-use super::saving_send::{FROZEN_STALLED, HeldSaving, NO_ACCOUNT, SETTLED_DEPTH, margin_of};
+use super::saving_send::{FROZEN_STALLED, HeldSaving, NO_ACCOUNT, SETTLED_DEPTH, margin_of, tx_of};
 use super::send::{PREVIEW_TTL, fresh_id};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
 use crate::saving::{Labels, RefillPlan, SavingWallet};
-use crate::store::SignedState;
+use crate::store::{SignedState, SignedTx};
 
 const AT_TARGET: &str = "Spending is at or above its target, so there is nothing to refill.";
 const NO_FEDERATION: &str = "Join a federation first: a refill pays into it.";
+const NOT_CREDITED: &str =
+    "Your last refill has not reached Spending yet. Refill again once Spending shows it.";
 const ON_ITS_WAY: &str = "Spending reaches its target with the money already on its way to it, so there is nothing to refill.";
 
 impl Core {
@@ -56,33 +58,37 @@ impl Core {
 
     /// What is on its way to `federation` and not in its balance yet, less the
     /// deposit fee each pays: its deposits not settled, and what Saving signed
-    /// to its addresses that it has not seen. Each counts once: a deposit row
-    /// that names a stored transaction stands for it. A v1 deposit confirming
-    /// shows what arrived on chain, before the fee; a v2 one pending, after it.
-    /// A stalled payment is not counted, as it may never arrive.
+    /// to its addresses until Spending credits it, at any depth. Each counts
+    /// once: a deposit row that names a stored transaction stands for it while
+    /// it confirms, and ends it once `Complete`. A v1 deposit confirming shows
+    /// what arrived on chain, before the fee; a v2 one pending, after it. A
+    /// stalled payment is not counted, as it may never arrive; a deposit the
+    /// federation never credits counts for good.
     fn on_its_way(&self, federation: &str, deposit_fee: Amount) -> Result<Amount> {
         let deposits = self.store().deposit_rows(federation)?;
         let mut total = Amount::ZERO;
-        let mut seen = HashSet::new();
+        let mut stands_for = HashSet::new();
         for row in &deposits {
-            seen.extend(row.txid.clone());
             let arrives = match row.status {
                 HistoryStatus::Pending => row.amount,
                 HistoryStatus::Confirming { .. } => row.amount.saturating_sub(deposit_fee),
+                HistoryStatus::Complete => Amount::ZERO,
                 _ => continue,
             };
+            stands_for.extend(row.txid.clone());
             total = total.checked_add(arrives).unwrap_or(total);
         }
-        for (row, tx, superseded) in self.open_ledger()? {
-            // A row from before schema 9 names no federation, and counts here.
-            let elsewhere = row
-                .federation_id
-                .as_deref()
-                .is_some_and(|id| id != federation);
+        let open = self.open_ledger()?.into_iter();
+        let deep = self.store().confirmed_paying_federations()?;
+        let deep = deep
+            .into_iter()
+            .map(|row| tx_of(&row).map(|tx| (row, tx, false)))
+            .collect::<Result<Vec<_>>>()?;
+        for (row, tx, superseded) in open.chain(deep) {
             if superseded
-                || elsewhere
+                || !pays(&row, federation)
                 || row.state == SignedState::Stalled
-                || seen.contains(&row.txid)
+                || stands_for.contains(&row.txid)
             {
                 continue;
             }
@@ -99,6 +105,19 @@ impl Core {
             }
         }
         Ok(total)
+    }
+
+    /// Whether Spending credited the stored transaction `row`: a deposit row
+    /// of its federation names it and is `Complete`.
+    fn credited(&self, row: &SignedTx) -> Result<bool> {
+        let active = self.store().active_federation()?;
+        let Some(federation) = row.federation_id.clone().or(active) else {
+            return Ok(false);
+        };
+        let deposits = self.store().deposit_rows(&federation)?;
+        Ok(deposits.iter().any(|deposit| {
+            deposit.status == HistoryStatus::Complete && deposit.txid.as_ref() == Some(&row.txid)
+        }))
     }
 
     /// What a refill must deliver now: the gap left after what is on its way,
@@ -123,6 +142,8 @@ impl Core {
             .rev()
             .find(|(row, _, _)| row.kind == OperationKind::Refill);
         if let Some((row, _, superseded)) = refill {
+            // 6 deep is not enough on its own: the refill also blocks until
+            // Spending credits it, below.
             let sentence = if *superseded {
                 format!(
                     "A send from Saving replaced your last refill. Refill again once that send is {SETTLED_DEPTH} blocks deep."
@@ -137,6 +158,12 @@ impl Core {
                 )
             };
             return Err(FedimixError::NotSetUp(sentence));
+        }
+        let deep = self.store().confirmed_paying_federations()?;
+        for row in deep.iter().filter(|row| row.kind == OperationKind::Refill) {
+            if !self.credited(row)? {
+                return Err(FedimixError::NotSetUp(NOT_CREDITED.into()));
+            }
         }
         // One a newer send replaced is covered by that send's coins: the user
         // chose to replace it, and only one of the two can confirm.
@@ -181,13 +208,14 @@ impl Core {
         // Refused before a deposit address is used up, also when what is on
         // its way already fills Spending.
         self.ensure_open()?;
-        let early_fee = self.connected(&active)?.min_deposit().await?;
-        self.refill_needs(&active, early_fee)?;
+        let deposit_fee = self.connected(&active)?.min_deposit().await?;
+        self.refill_needs(&active, deposit_fee)?;
         let fee_rate = self.saving_fee_rate(None).await?;
         let must_spend = self.stalled_inputs(&wallet)?;
         let spends: HashSet<OutPoint> = must_spend.iter().copied().collect();
-        // The minimum deposit is also the deposit fee.
-        let (federation, deposit_fee) = self
+        // The minimum deposit is also the deposit fee. It is the one read
+        // above, so the refusal and the preview agree; v2's moves.
+        let (federation, _) = self
             .change_federation(&spends)
             .await?
             .ok_or_else(|| FedimixError::NotSetUp(NO_FEDERATION.into()))?;
@@ -259,4 +287,12 @@ impl Core {
             .ok_or_else(|| FedimixError::UnknownItem(preview_id.to_string()))?;
         self.confirm_saving(held)
     }
+}
+
+/// Whether `row` pays `federation`. A row from before schema 9 names none,
+/// and counts against the active one.
+fn pays(row: &SignedTx, federation: &str) -> bool {
+    row.federation_id
+        .as_deref()
+        .is_none_or(|id| id == federation)
 }

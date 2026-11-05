@@ -1212,6 +1212,15 @@ impl Store {
         )
     }
 
+    /// The transactions 6 deep that pay a federation: their money is on its
+    /// way until the federation credits it.
+    pub(crate) fn confirmed_paying_federations(&self) -> Result<Vec<SignedTx>> {
+        self.signed_where(
+            "state = ?1 AND change_address IS NOT NULL",
+            &[SignedState::Confirmed.as_str()],
+        )
+    }
+
     /// The transactions that pay `address`, but for those dropped.
     pub(crate) fn signed_paying(&self, address: &str) -> Result<Vec<SignedTx>> {
         self.signed_where(

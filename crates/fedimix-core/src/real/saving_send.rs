@@ -186,7 +186,7 @@ fn replaces(newer: &SignedTx, older: &SignedTx) -> bool {
     newer.kind == OperationKind::Send || older.kind == OperationKind::Refill
 }
 
-fn tx_of(row: &SignedTx) -> Result<Transaction> {
+pub(super) fn tx_of(row: &SignedTx) -> Result<Transaction> {
     deserialize_hex(&row.tx_hex).map_err(|_| internal(UNREADABLE_TX))
 }
 
@@ -890,6 +890,11 @@ impl Core {
         tokio::task::spawn_blocking(move || saving.save())
             .await
             .map_err(|_| internal(UNREADABLE_TX))??;
+        // What a refill must deliver can move while the device signs: it must
+        // still be what was reviewed when the row is stored.
+        if held.kind == OperationKind::Refill {
+            self.check_refill(wallet, held)?;
+        }
         // A rebroadcast of what this replaces may have landed while the device
         // signed: then that one holds the coins again, and this must not go.
         let locked = self.locked_outpoints()?;

@@ -134,6 +134,14 @@ impl FakeChain {
         state.missing.insert(txid);
     }
 
+    /// The server has `txid` again, as after another node relayed it: it
+    /// stops reporting it as evicted. Undoes [`Self::lose`].
+    pub fn find(&self, txid: Txid) {
+        let mut state = self.state();
+        state.known.insert(txid);
+        state.missing.remove(&txid);
+    }
+
     /// How often `txid` was offered to `broadcast`, accepted or not.
     pub fn offers_of(&self, txid: Txid) -> usize {
         self.state().offered.iter().filter(|t| **t == txid).count()

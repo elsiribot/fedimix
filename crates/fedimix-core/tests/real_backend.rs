@@ -5902,6 +5902,9 @@ async fn a_stalled_replacement_beside_its_old_send_in_view_holds_saving() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    // Back on the network: no later sync may report it evicted again, which
+    // a slow run reached once a second had passed.
+    saving.chain.find(old.compute_txid());
     saving.chain.push_sync(in_mempool(old.clone(), now + 1, 3));
     saving
         .chain
@@ -6688,5 +6691,191 @@ async fn a_changed_gap_expires_the_refill_preview() {
     );
     assert!(saving.chain.broadcasts().is_empty());
     backend.prepare_refill().await.unwrap();
+    backend.shutdown().await.unwrap();
+}
+
+const NOT_CREDITED: &str =
+    "Your last refill has not reached Spending yet. Refill again once Spending shows it.";
+
+/// Puts `tx` 6 blocks deep and waits for its row to say so.
+async fn six_deep(saving: &SavingHarness, backend: &Real, tx: &Transaction) {
+    saving.chain.push_sync(confirmed(tx.clone(), 9));
+    saving.chain.push_sync(SyncResponse {
+        chain_update: Some(chain_to(14)),
+        ..Default::default()
+    });
+    wait_until("6 blocks deep", || async {
+        sync_saving_now(backend);
+        state_of(saving, tx) == "confirmed"
+    })
+    .await;
+}
+
+/// The federation credits `gross` sat of `txid` to Spending, as each
+/// generation reports it, and the balance shows it.
+async fn credit(
+    saving: &SavingHarness,
+    backend: &Real,
+    v1: bool,
+    watch: &str,
+    txid: &str,
+    gross: Amount,
+) {
+    let client = &saving.harness.first;
+    let fee = sat(DEPOSIT_FEE);
+    let net = gross.checked_sub(fee).unwrap();
+    if v1 {
+        client.push_update(
+            watch,
+            WatchUpdate::Settled {
+                amount: net,
+                fee,
+                txid: Some(txid.to_string()),
+            },
+        );
+    } else {
+        client.push_deposit(DepositEvent {
+            cursor: 2,
+            id: format!("{txid}:0"),
+            amount: net,
+            fee,
+            txid: Some(txid.to_string()),
+            confirmed: true,
+        });
+    }
+    wait_until("the credited row", || async {
+        rows(&**backend).await.iter().any(|r| {
+            r.kind == HistoryKind::Deposit
+                && r.txid.as_deref() == Some(txid)
+                && r.status == HistoryStatus::Complete
+        })
+    })
+    .await;
+    let balance = backend.spending_state().await.unwrap().balance;
+    let balance = balance.checked_add(net).unwrap();
+    client.set_balance(balance);
+    wait_balance(&**backend, balance).await;
+}
+
+/// RR13: a refill 6 deep that the federation has not credited is still on
+/// its way. On v2 the federation sees it only past 6 deep, so no deposit row
+/// names it yet; on v1 a confirming row does.
+async fn a_refill_counts_until_spending_credits_it(v1: bool) {
+    let saving = SavingHarness::new();
+    saving.harness.first.set_deposit_watches(v1);
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    saving.fund(&backend, 80_000, 2).await;
+    let first = saving.refilled(&backend).await;
+    let txid = first.compute_txid().to_string();
+    let gross = sat(first.output[0].value.to_sat());
+    let watch = saving.harness.first.last_deposit().unwrap();
+    if v1 {
+        saving.harness.first.push_update(
+            &watch,
+            WatchUpdate::Confirming {
+                confirmations: 0,
+                required: 11,
+                amount: gross,
+                txid: Some(txid.clone()),
+            },
+        );
+    }
+    six_deep(&saving, &backend, &first).await;
+    assert_eq!(
+        backend.prepare_refill().await.map(|_| ()),
+        Err(FedimixError::NotSetUp(NOT_CREDITED.into()))
+    );
+    credit(&saving, &backend, v1, &watch, &txid, gross).await;
+    // Credited and 6 deep: the block lifts, and the money counts once, in
+    // the balance.
+    backend
+        .set_settings(Settings {
+            spending_target: sat(200_000),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    let arrived = gross.checked_sub(sat(DEPOSIT_FEE)).unwrap();
+    let needs = sat(200_000 + DEPOSIT_FEE).checked_sub(arrived).unwrap();
+    assert_eq!(needs_of(&backend.prepare_refill().await.unwrap()), needs);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_v1_refill_counts_until_spending_credits_it() {
+    a_refill_counts_until_spending_credits_it(true).await;
+}
+
+#[tokio::test]
+async fn a_v2_refill_counts_until_spending_credits_it() {
+    a_refill_counts_until_spending_credits_it(false).await;
+}
+
+/// Change 6 deep and not yet credited is still on its way, and counts once
+/// after it is credited.
+async fn change_counts_until_spending_credits_it(v1: bool) {
+    let saving = SavingHarness::new();
+    saving.harness.first.set_deposit_watches(v1);
+    let backend = saving.refillable(100_000).await;
+    let (change, watch, txid) = change_on_its_way(&saving, &backend).await;
+    let send = saving
+        .chain
+        .broadcasts()
+        .into_iter()
+        .find(|tx| tx.compute_txid().to_string() == txid)
+        .unwrap();
+    six_deep(&saving, &backend, &send).await;
+    assert_eq!(
+        needs_of(&backend.prepare_refill().await.unwrap()),
+        needs_beside(change)
+    );
+    credit(&saving, &backend, v1, &watch, &txid, change).await;
+    assert_eq!(
+        needs_of(&backend.prepare_refill().await.unwrap()),
+        needs_beside(change)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn v1_change_counts_until_spending_credits_it() {
+    change_counts_until_spending_credits_it(true).await;
+}
+
+#[tokio::test]
+async fn v2_change_counts_until_spending_credits_it() {
+    change_counts_until_spending_credits_it(false).await;
+}
+
+/// What a refill must deliver is checked again after the device signs: a
+/// gap that moved while it signed stops the refill before it is stored.
+#[tokio::test]
+async fn a_gap_that_moves_while_signing_stops_the_refill() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let signer = Arc::new(SlowSigner {
+        inner: SoftSigner::from_seed(&SEED, bitcoin::Network::Regtest),
+        held: watch::Sender::new(true),
+    });
+    saving.plug_in(signer.clone());
+    let preview = backend.prepare_refill().await.unwrap();
+    let events = backend.subscribe();
+    let id = backend.confirm_refill(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::Signing).await;
+    saving.harness.first.set_balance(sat(5_000));
+    wait_balance(&*backend, sat(5_000)).await;
+    signer.held.send_replace(false);
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Refill).await;
+    assert_eq!(
+        states.last(),
+        Some(&OperationState::Failed {
+            error: FedimixError::PreviewExpired
+        })
+    );
+    assert!(saving.chain.broadcasts().is_empty());
+    assert!(signed_states(&saving).is_empty());
     backend.shutdown().await.unwrap();
 }
