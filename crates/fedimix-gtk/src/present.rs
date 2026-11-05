@@ -451,9 +451,11 @@ pub fn user_message(e: &fedimix_core::FedimixError) -> String {
         E::UnknownItem(_) => "This item is no longer available".to_string(),
         E::DeviceNotConnected(device) => format!("Connect your {device}"),
         E::Offline => "You are offline. Reconnect and try again".to_string(),
-        E::ProxyUnsupported | E::WrongNetwork { .. } | E::TxRejected(_) | E::SendInDoubt => {
-            e.to_string()
-        }
+        E::ProxyUnsupported
+        | E::WrongNetwork { .. }
+        | E::TxRejected(_)
+        | E::SendInDoubt
+        | E::SendHeld(_) => e.to_string(),
         E::PreviewExpired => "This review expired. Check the details and try again".to_string(),
         E::DeviceRejected => "The device rejected the transaction".to_string(),
         E::Cancelled => "Cancelled".to_string(),

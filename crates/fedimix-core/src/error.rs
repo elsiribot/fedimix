@@ -49,6 +49,12 @@ pub enum FedimixError {
         "No server takes this send now, but it may have reached the network, so it could still confirm, and Fedimix keeps offering it until it does or a later send replaces it. Do not pay it again from Spending: your next Saving send spends the same coins, so only one of the two can confirm."
     )]
     SendInDoubt,
+    /// A server refused a send on its own policy (payload: its reason). Other
+    /// nodes may take it, and Fedimix keeps offering it.
+    #[error(
+        "No server takes this send now ({0}), but Fedimix keeps offering it, so it could still confirm. Do not pay it again from Spending: your next Saving send spends the same coins, so only one of the two can confirm."
+    )]
+    SendHeld(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

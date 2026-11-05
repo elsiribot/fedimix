@@ -82,6 +82,7 @@ const OWN_ADDRESS: &str =
     "This is your federation's deposit address. To move Saving into Spending, use Refill.";
 const REPLACES: &str = "An earlier payment has not confirmed and may still go through. This send spends the same coins, so only one of the two can confirm.";
 const STALLED_COIN_GONE: &str = "A coin of a payment that has not confirmed is missing from the chain server's answer, so the next send cannot be made to conflict with it. Try again after the next sync.";
+const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms before sending from Saving again.";
 const FROZEN_STALLED: &str = "A coin you froze is tied to a payment that has not confirmed. Unfreeze it to send: the next send must spend it, so that only one of the two can confirm.";
 const NO_ESTIMATE: &str =
     "The chain server has no fee estimate right now. Enter a fee rate, or try again later.";
@@ -266,40 +267,40 @@ impl Core {
         Ok(locked)
     }
 
-    /// What the next send must spend, so that it conflicts with every stalled
-    /// send that is the newest of its set. A coin the wallet does not show is
-    /// fine when a stored send of ours spends it in the wallet's view: the two
-    /// already conflict. Otherwise no conflict can be made, which is refused.
+    /// What the next send must spend: every coin of every stalled send not
+    /// final, whatever the wallet's view shows, so that it conflicts with each.
+    /// A coin a newer send holds is covered by that send. One the wallet does
+    /// not show cannot be spent, so no send is made until that settles.
     fn stalled_inputs(&self, wallet: &SavingWallet) -> Result<Vec<OutPoint>> {
         let ledger = self.open_ledger()?;
         let locked = self.locked_outpoints()?;
         let mut inputs = Vec::new();
-        for (row, tx, superseded) in &ledger {
-            if row.state == SignedState::Stalled && !superseded {
+        for (row, tx, _) in &ledger {
+            if row.state == SignedState::Stalled {
                 inputs.extend(tx.input.iter().map(|input| input.previous_output));
             }
         }
         inputs.retain(|outpoint| !locked.contains(outpoint));
         inputs.sort();
         inputs.dedup();
-        let mut usable = Vec::new();
-        for outpoint in inputs {
+        for outpoint in &inputs {
             if wallet.has_coin(&outpoint.to_string()) {
-                usable.push(outpoint);
                 continue;
             }
             let spent_by_ours = ledger.iter().any(|(_, tx, _)| {
-                wallet.tx_position(tx.compute_txid()) != TxPosition::Absent
-                    && tx
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == outpoint)
+                tx.input
+                    .iter()
+                    .any(|input| input.previous_output == *outpoint)
+                    && wallet.tx_position(tx.compute_txid()) != TxPosition::Absent
             });
-            if !spent_by_ours {
-                return Err(FedimixError::NotSetUp(STALLED_COIN_GONE.into()));
-            }
+            let sentence = if spent_by_ours {
+                OLD_BACK
+            } else {
+                STALLED_COIN_GONE
+            };
+            return Err(FedimixError::NotSetUp(sentence.into()));
         }
-        Ok(usable)
+        Ok(inputs)
     }
 
     /// Whether a send spending `spends` must keep off `address`: it is, while
@@ -365,16 +366,22 @@ impl Core {
             let status = HistoryStatus::Lost { reason };
             return Ok(Some(wallet.signed_item(tx, status, row.created_at, labels)));
         }
-        if row.state == SignedState::Stalled && !superseded {
-            let status = HistoryStatus::Stalled;
-            return Ok(Some(wallet.signed_item(tx, status, row.created_at, labels)));
+        if superseded {
+            return Ok(None);
         }
-        Ok(None)
+        let status = match row.state {
+            SignedState::Stalled => HistoryStatus::Stalled,
+            // Went out, and no server has answered about it since.
+            SignedState::Seen => HistoryStatus::Pending,
+            _ => return Ok(None),
+        };
+        Ok(Some(wallet.signed_item(tx, status, row.created_at, labels)))
     }
 
     /// Adds to a list from the wallet the stored sends it no longer shows: the
-    /// newest stalled one of each set, and any that another confirmed instead.
-    /// No row of a send the user saw `Done` vanishes.
+    /// newest of each set while it is open, as pending or stalled, and any that
+    /// another confirmed instead. One the user replaced shows through the
+    /// replacement; one a node judged invalid at once was never `Done`.
     pub(super) fn add_signed_rows(
         &self,
         wallet: &SavingWallet,
@@ -951,8 +958,10 @@ impl Core {
                         .await;
                     return;
                 }
-                // One node's policy: a node that relays more may take it.
-                Err(error) if is_refusal(&error) && !doubt => {
+                // One node's policy: a node that relays more may take it, and
+                // Fedimix keeps offering it, so this is no refusal to report.
+                Err(FedimixError::TxRejected(reason)) if !doubt => {
+                    let error = FedimixError::SendHeld(reason);
                     self.end_signed(row, SignedState::Stalled, OperationState::Failed { error })
                         .await;
                     return;

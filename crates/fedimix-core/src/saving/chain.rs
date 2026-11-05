@@ -199,23 +199,27 @@ const JUDGEMENTS: [&str; 18] = [
     "dust",
 ];
 
-/// Judgements that a transaction can never be valid as it stands, as opposed to
-/// one node's policy (its fee floor, a full mempool), which another may not share.
-const INVALID: [&str; 5] = [
-    "bad-txns",
-    "bad-witness",
-    "script-verify",
-    "missing-inputs",
-    "missingorspent",
-];
-
-/// Whether a node judged the transaction invalid, not merely unwelcome.
+/// Whether a node judged the transaction invalid by consensus, so that no node
+/// will ever take it, as opposed to its policy (fee floor, standardness), its
+/// timing (an immature coinbase) or its view (a block it lacks), which another
+/// node may not share. Only consensus script failures and `bad-txns-` words
+/// that are not policy count.
 pub fn is_invalid(error: &FedimixError) -> bool {
     let FedimixError::TxRejected(reason) = error else {
         return false;
     };
     let reason = reason.to_lowercase();
-    INVALID.iter().any(|word| reason.contains(word))
+    let script =
+        reason.contains("mandatory-script-verify-flag-failed") && !reason.contains("non-mandatory");
+    let policy_txns = [
+        "nonstandard",
+        "too-many-sigops",
+        "premature",
+        "missingorspent",
+    ];
+    let txns =
+        reason.contains("bad-txns-") && !policy_txns.iter().any(|word| reason.contains(word));
+    script || txns
 }
 
 /// Whether a server judged the transaction and said no. Every other failure
@@ -780,9 +784,10 @@ mod tests {
             assert!(!is_refusal(&reply.unwrap_err()));
         }
         assert!(!is_refusal(&FedimixError::Offline));
-        assert!(is_invalid(&judged));
+        assert!(!is_invalid(&judged), "a lagging node says it too");
         let fee = FedimixError::TxRejected("mempool min fee not met".into());
         assert!(is_refusal(&fee) && !is_invalid(&fee));
+
         assert_eq!(
             already_known(&chain, &tx, FedimixError::Offline).await,
             Err(FedimixError::Offline)
@@ -795,6 +800,32 @@ mod tests {
         );
         assert_eq!(already_known(&chain, &tx, no).await, Ok(()));
         assert!(!is_refusal(&refused("bad-txns-inputs-missingorspent")));
+    }
+
+    /// Only what no node would ever take ends a send: policy and timing stall.
+    #[test]
+    fn only_consensus_failures_are_invalid() {
+        let judged = |reason: &str| is_invalid(&FedimixError::TxRejected(reason.into()));
+        for invalid in [
+            "bad-txns-in-belowout",
+            "bad-txns-inputs-duplicate",
+            "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)",
+        ] {
+            assert!(judged(invalid), "{invalid}");
+        }
+        for policy in [
+            "non-mandatory-script-verify-flag (Witness program hash mismatch)",
+            "mempool-script-verify-flag-failed",
+            "bad-witness-nonstandard",
+            "bad-txns-nonstandard-inputs",
+            "bad-txns-too-many-sigops",
+            "bad-txns-premature-spend-of-coinbase",
+            "bad-txns-inputs-missingorspent",
+            "missing-inputs",
+            "mempool min fee not met",
+        ] {
+            assert!(!judged(policy), "{policy}");
+        }
     }
 
     #[test]

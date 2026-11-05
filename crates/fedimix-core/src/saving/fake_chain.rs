@@ -208,9 +208,7 @@ impl ChainClient for FakeChain {
             return Err(FedimixError::Offline);
         }
         if goes == Some(BroadcastGoes::Refused) {
-            return Err(FedimixError::TxRejected(
-                "bad-txns-inputs-missingorspent".into(),
-            ));
+            return Err(FedimixError::TxRejected("bad-txns-in-belowout".into()));
         }
         if goes == Some(BroadcastGoes::LowFee) {
             return Err(FedimixError::TxRejected("mempool min fee not met".into()));

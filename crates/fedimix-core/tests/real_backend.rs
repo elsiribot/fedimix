@@ -4842,7 +4842,7 @@ async fn a_refusal_ends_the_send_and_frees_what_it_held() {
     assert_eq!(
         state,
         OperationState::Failed {
-            error: FedimixError::TxRejected("bad-txns-inputs-missingorspent".into())
+            error: FedimixError::TxRejected("bad-txns-in-belowout".into())
         }
     );
     assert!(coin_at(&backend, &coin).await.is_some());
@@ -5731,14 +5731,12 @@ async fn a_fee_refusal_holds_the_coin() {
     saving.chain.script_broadcasts([BroadcastGoes::LowFee; 256]);
     let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
     let (_, state) = saving.send(&backend, preview).await;
-    assert!(
-        matches!(
-            state,
-            OperationState::Failed {
-                error: FedimixError::TxRejected(_)
-            }
-        ),
-        "{state:?}"
+    // Never "refused": Fedimix keeps offering it, so the user is told so.
+    assert_eq!(
+        state,
+        OperationState::Failed {
+            error: FedimixError::SendHeld("mempool min fee not met".into())
+        }
     );
     assert_eq!(signed_states(&saving), ["stalled"]);
     let next = backend.prepare_send(saving_sat(1_000)).await.unwrap();
@@ -5799,5 +5797,199 @@ async fn a_restart_mid_replacement_resumes_only_the_replacement() {
     saving.synced(&backend).await;
     assert_eq!(saving.chain.offers_of(old.compute_txid()), old_offers);
     assert_eq!(signed_states(&saving), ["seen", "stalled"]);
+    backend.shutdown().await.unwrap();
+}
+
+// ---- Fix round 3 ----
+
+const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms before sending from Saving again.";
+
+/// The stored state of `tx`.
+fn state_of(saving: &SavingHarness, tx: &Transaction) -> String {
+    raw_store(&saving.harness)
+        .query_row(
+            "SELECT state FROM saving_signed WHERE txid = ?1",
+            [tx.compute_txid().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// The stalled sends now, as transactions.
+fn stalled_txs(saving: &SavingHarness) -> Vec<Transaction> {
+    let conn = raw_store(&saving.harness);
+    let mut stmt = conn
+        .prepare("SELECT tx_hex FROM saving_signed WHERE state = 'stalled'")
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(|hex| bitcoin::consensus::encode::deserialize_hex(&hex.unwrap()).unwrap())
+        .collect()
+}
+
+/// The invariant behind every replacement: a send signed while others are
+/// stalled shares a coin with each, so of two that pay one recipient with no
+/// coin in common, never both can confirm. Checked at every confirm.
+async fn send_checked(
+    saving: &SavingHarness,
+    backend: &Real,
+    preview: SendPreview,
+) -> OperationState {
+    let stalled = stalled_txs(saving);
+    let before = saving.chain.broadcasts().len();
+    let (_, state) = saving.send(backend, preview).await;
+    if state == OperationState::Done && saving.chain.broadcasts().len() > before {
+        let new = saving.chain.broadcasts().last().unwrap().clone();
+        for old in &stalled {
+            assert!(
+                new.input.iter().any(|i| old
+                    .input
+                    .iter()
+                    .any(|o| o.previous_output == i.previous_output)),
+                "a send shares no coin with a stalled one"
+            );
+        }
+    }
+    state
+}
+
+/// N13: the replaced send is back in view and its stalled replacement's coin
+/// is spent there. No next send can conflict with the replacement, so none is
+/// made until one of the two confirms.
+#[tokio::test]
+async fn a_stalled_replacement_beside_its_old_send_in_view_holds_saving() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    let (old, new) = replaced(&saving, &backend, 1_000).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    saving.chain.push_sync(in_mempool(old.clone(), now + 1, 3));
+    saving
+        .chain
+        .script_broadcasts([BroadcastGoes::Refused; 256]);
+    saving.chain.lose(new.compute_txid());
+    wait_until(
+        "the old send in view and the replacement stalled",
+        || async {
+            sync_saving_now(&backend);
+            state_of(&saving, &old) == "seen" && state_of(&saving, &new) == "stalled"
+        },
+    )
+    .await;
+    let reply = backend.prepare_send(saving_sat(1_000)).await;
+    assert_eq!(reply, Err(FedimixError::NotSetUp(OLD_BACK.into())));
+    backend.shutdown().await.unwrap();
+}
+
+/// The invariant over the scenarios of this file: a plain stall, a stall of
+/// several coins, a replacement that stalls in turn, and a Max replacement.
+#[tokio::test]
+async fn every_send_conflicts_with_every_stalled_one() {
+    // A plain stall, then two replacements, the first of which stalls.
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    saving.fund(&backend, 80_000, 2).await;
+    let (_, _) = saving.stalled(&backend).await;
+    for amount in [1_000, 2_000] {
+        let preview = backend.prepare_send(saving_sat(amount)).await.unwrap();
+        saving.synced(&backend).await;
+        saving.chain.clear_broadcast_script();
+        assert_eq!(
+            send_checked(&saving, &backend, preview).await,
+            OperationState::Done
+        );
+        let last = saving.chain.broadcasts().last().unwrap().compute_txid();
+        saving
+            .chain
+            .script_broadcasts([BroadcastGoes::Refused; 256]);
+        saving.chain.lose(last);
+        wait_until("the replacement to stall", || async {
+            sync_saving_now(&backend);
+            stalled_txs(&saving)
+                .iter()
+                .any(|tx| tx.compute_txid() == last)
+        })
+        .await;
+    }
+    // Max replaces them all.
+    let max = backend
+        .prepare_send(saving_send(SendAmount::Max))
+        .await
+        .unwrap();
+    saving.synced(&backend).await;
+    saving.chain.clear_broadcast_script();
+    assert_eq!(
+        send_checked(&saving, &backend, max).await,
+        OperationState::Done
+    );
+    backend.shutdown().await.unwrap();
+
+    // Several coins in one stalled send.
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 20_000, 0).await;
+    saving.fund(&backend, 20_000, 1).await;
+    saving.fund(&backend, 50_000, 2).await;
+    backend
+        .set_coin_frozen(saving_coin(&backend, 50_000).await, true)
+        .await
+        .unwrap();
+    let tx = saving.sent(&backend, 30_000).await;
+    saving
+        .chain
+        .script_broadcasts([BroadcastGoes::Refused; 256]);
+    saving.chain.lose(tx.compute_txid());
+    wait_until("the send to stall", || async {
+        sync_saving_now(&backend);
+        signed_states(&saving) == ["stalled"]
+    })
+    .await;
+    backend
+        .set_coin_frozen(saving_coin(&backend, 50_000).await, false)
+        .await
+        .unwrap();
+    let preview = backend.prepare_send(saving_sat(45_000)).await.unwrap();
+    saving.synced(&backend).await;
+    saving.chain.clear_broadcast_script();
+    assert_eq!(
+        send_checked(&saving, &backend, preview).await,
+        OperationState::Done
+    );
+    backend.shutdown().await.unwrap();
+}
+
+async fn saving_coin(backend: &Real, sat_amount: u64) -> String {
+    let state = backend.saving_state().await.unwrap();
+    let coin = state.coins.iter().find(|c| c.amount == sat(sat_amount));
+    coin.unwrap().outpoint.clone()
+}
+
+/// N16: a send reported `Done` that left the wallet's view while no server
+/// answers keeps its row, as pending.
+#[tokio::test]
+async fn a_seen_send_with_no_answer_keeps_its_row() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    let tx = saving.sent(&backend, 30_000).await;
+    saving
+        .chain
+        .script_broadcasts([BroadcastGoes::Offline; 256]);
+    saving.chain.lose(tx.compute_txid());
+    wait_until("the wallet to let go of it", || async {
+        sync_saving_now(&backend);
+        coin_at(&backend, &coin).await.is_some()
+    })
+    .await;
+    let rows = saving_rows(&backend).await;
+    let row = rows
+        .iter()
+        .find(|r| r.txid == Some(tx.compute_txid().to_string()));
+    assert_eq!(row.expect("the row stays").status, HistoryStatus::Pending);
     backend.shutdown().await.unwrap();
 }

@@ -76,7 +76,10 @@ CREATE TABLE saving_sent (
 ";
 
 /// Signed transactions (schema 6), kept from before their broadcast until the
-/// chain settles them. `change_address` is the federation address a transaction
+/// chain settles them. Their rowid order is load-bearing: of sends that share a
+/// coin the newest written is the one offered and holding the coins. So the
+/// table is never vacuumed and never rebuilt without copying rowid, as either
+/// can renumber a table whose key is not an `INTEGER PRIMARY KEY`. `change_address` is the federation address a transaction
 /// pays, recorded here so that the row and the record are one write.
 const SIGNED_SCHEMA: &str = "
 CREATE TABLE saving_signed (
@@ -1747,6 +1750,33 @@ mod tests {
         store.set_lost_to("saving-1", Some("winner")).unwrap();
         let shown = store.signed_for_history().unwrap();
         assert_eq!(shown[0].lost_to.as_deref(), Some("winner"));
+    }
+
+    /// Which send is newest decides which is offered and which holds coins, so
+    /// it is write order, whatever the clock said.
+    #[test]
+    fn signed_rows_come_in_write_order() {
+        let (_dir, store) = open();
+        for (n, created_at) in [(1, 9), (2, 5), (3, 7)] {
+            store
+                .add_signed(&SignedTx {
+                    id: format!("saving-{n}"),
+                    txid: format!("txid-{n}"),
+                    tx_hex: "00".into(),
+                    state: SignedState::Seen,
+                    change_address: None,
+                    created_at,
+                    lost_to: None,
+                })
+                .unwrap();
+        }
+        let ids: Vec<_> = store
+            .open_signed()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["saving-1", "saving-2", "saving-3"]);
     }
 
     #[test]
