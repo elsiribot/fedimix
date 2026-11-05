@@ -24,5 +24,5 @@ pub use labels::{Label, Labels, SentRecord, Tag};
 pub use signer::{DevicePort, Signer};
 #[cfg(feature = "testing")]
 pub use soft_signer::SoftSigner;
-pub(crate) use wallet::{ALREADY_SET_UP, SendPlan, TxPosition, sort_history};
+pub(crate) use wallet::{ALREADY_SET_UP, RefillPlan, SendPlan, TxPosition, sort_history};
 pub use wallet::{DeviceAccount, SavingWallet, SyncSummary};

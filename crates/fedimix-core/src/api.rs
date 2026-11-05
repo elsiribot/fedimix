@@ -162,12 +162,23 @@ pub struct FederationInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HistoryKind {
-    FromSpending { denomination: Amount },
-    Sent { change: Option<SentChange> },
-    Received { unmixed: bool },
+    FromSpending {
+        denomination: Amount,
+    },
+    Sent {
+        change: Option<SentChange>,
+    },
+    /// Saving paid into Spending: a refill. `amount` is what reached the
+    /// federation's address.
+    Refill,
+    Received {
+        unmixed: bool,
+    },
     Paid,
     ReceivedLightning,
-    ToSaving { denomination: Amount },
+    ToSaving {
+        denomination: Amount,
+    },
     Deposit,
     Cover,
 }

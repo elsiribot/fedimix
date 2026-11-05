@@ -7,6 +7,7 @@
 
 mod events;
 mod receive;
+mod refill;
 mod saving;
 mod saving_send;
 mod send;
@@ -666,11 +667,11 @@ impl Backend for RealBackend {
     }
 
     async fn prepare_refill(&self) -> Result<RefillPreview> {
-        Err(saving_not_set_up())
+        self.core.prepare_refill().await
     }
 
-    async fn confirm_refill(&self, _preview_id: String) -> Result<OperationId> {
-        Err(saving_not_set_up())
+    async fn confirm_refill(&self, preview_id: String) -> Result<OperationId> {
+        self.core.confirm_refill(&preview_id)
     }
 
     async fn prepare_exit(&self, _item_id: String) -> Result<ExitPreview> {
@@ -689,7 +690,7 @@ impl Backend for RealBackend {
     }
 
     /// Spending starts at `Broadcasting`, past the point of cancelling. A Saving
-    /// send can be cancelled until then.
+    /// send or refill can be cancelled until then.
     async fn cancel_operation(&self, id: OperationId) -> Result<()> {
         if self.core.cancel_saving(&id)? || self.core.store().is_send(&id)? {
             Ok(())

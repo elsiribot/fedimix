@@ -8,13 +8,13 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::api::{
-    Amount, ChainBackend, DeviceKind, HistoryItem, HistoryStatus, Network, SentChange, Settings,
-    Timestamp, WalletKind,
+    Amount, ChainBackend, DeviceKind, HistoryItem, HistoryStatus, Network, OperationKind,
+    SentChange, Settings, Timestamp, WalletKind,
 };
 use crate::error::{FedimixError, Result};
 use crate::saving::{DeviceAccount, Label, Labels, SentRecord, Tag};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -96,6 +96,10 @@ CREATE TABLE saving_signed (
 /// row still has something to show once BDK's view no longer lists it.
 const LOST_TO: &str = "ALTER TABLE saving_signed ADD COLUMN lost_to TEXT;";
 
+/// Schema 8: what a stored transaction is, so a refill taken up after a restart
+/// still reports as one and shows as one. Rows from before it are sends.
+const SIGNED_KIND: &str = "ALTER TABLE saving_signed ADD COLUMN kind TEXT NOT NULL DEFAULT 'send';";
+
 /// A write transaction that takes the write lock up front, so it waits for the
 /// busy timeout instead of failing halfway.
 fn begin(conn: &Connection) -> Result<Transaction<'_>> {
@@ -143,6 +147,7 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
         4 => tx.execute_batch(SAVING_SCHEMA).map_err(db_err),
         5 => tx.execute_batch(SIGNED_SCHEMA).map_err(db_err),
         6 => tx.execute_batch(LOST_TO).map_err(db_err),
+        7 => tx.execute_batch(SIGNED_KIND).map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -250,6 +255,24 @@ pub(crate) struct SignedTx {
     pub created_at: Timestamp,
     /// The transaction that spent the same coins and confirmed instead.
     pub lost_to: Option<String>,
+    /// `Send` or `Refill`.
+    pub kind: OperationKind,
+}
+
+fn signed_kind_str(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Refill => "refill",
+        // Only Saving payments are stored here.
+        OperationKind::Send | OperationKind::Exit => "send",
+    }
+}
+
+fn signed_kind_parse(s: &str) -> Result<OperationKind> {
+    match s {
+        "send" => Ok(OperationKind::Send),
+        "refill" => Ok(OperationKind::Refill),
+        other => Err(db_err(format!("unknown signed kind {other:?}"))),
+    }
 }
 
 /// What [`Store::upsert_history`] did. Only the store sees old and new in one
@@ -393,6 +416,7 @@ impl Store {
             tx.execute_batch(SAVING_SCHEMA).map_err(db_err)?;
             tx.execute_batch(SIGNED_SCHEMA).map_err(db_err)?;
             tx.execute_batch(LOST_TO).map_err(db_err)?;
+            tx.execute_batch(SIGNED_KIND).map_err(db_err)?;
             tx.execute(
                 "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
                 [SCHEMA_VERSION],
@@ -978,7 +1002,12 @@ impl Store {
         let mut sent = HashMap::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT txid, change_msat, to_spending FROM saving_sent")
+            .prepare(
+                "SELECT txid, change_msat, to_spending, EXISTS (
+                    SELECT 1 FROM saving_signed
+                    WHERE saving_signed.txid = saving_sent.txid AND kind = 'refill'
+                 ) FROM saving_sent",
+            )
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -986,18 +1015,19 @@ impl Store {
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, bool>(2)?,
+                    r.get::<_, bool>(3)?,
                 ))
             })
             .map_err(db_err)?;
         for row in rows {
-            let (txid, change, to_spending) = row.map_err(db_err)?;
+            let (txid, change, to_spending, refill) = row.map_err(db_err)?;
             let change = change.map(|msat| SentChange {
                 amount: Amount {
                     msat: from_db(msat),
                 },
                 to_spending,
             });
-            sent.insert(txid, SentRecord { change });
+            sent.insert(txid, SentRecord { change, refill });
         }
         Ok(Labels::from_rows(coins, sent))
     }
@@ -1039,15 +1069,16 @@ impl Store {
     pub(crate) fn add_signed(&self, signed: &SignedTx) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO saving_signed (id, txid, tx_hex, state, change_address, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO saving_signed (id, txid, tx_hex, state, change_address, created_at, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     signed.id,
                     signed.txid,
                     signed.tx_hex,
                     signed.state.as_str(),
                     signed.change_address,
-                    to_db(signed.created_at)
+                    to_db(signed.created_at),
+                    signed_kind_str(signed.kind)
                 ],
             )
             .map_err(db_err)?;
@@ -1056,7 +1087,7 @@ impl Store {
 
     fn signed_where(&self, condition: &str, args: &[&str]) -> Result<Vec<SignedTx>> {
         let sql = format!(
-            "SELECT id, txid, tx_hex, state, change_address, created_at, lost_to
+            "SELECT id, txid, tx_hex, state, change_address, created_at, lost_to, kind
              FROM saving_signed WHERE {condition} ORDER BY rowid"
         );
         let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
@@ -1070,12 +1101,13 @@ impl Store {
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
                 ))
             })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, txid, tx_hex, state, change_address, created_at, lost_to) =
+            let (id, txid, tx_hex, state, change_address, created_at, lost_to, kind) =
                 row.map_err(db_err)?;
             out.push(SignedTx {
                 id,
@@ -1085,6 +1117,7 @@ impl Store {
                 change_address,
                 created_at: from_db(created_at),
                 lost_to,
+                kind: signed_kind_parse(&kind)?,
             });
         }
         Ok(out)
@@ -1162,6 +1195,12 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// What the stored transaction `id` is, if there is one.
+    pub(crate) fn signed_kind(&self, id: &str) -> Result<Option<OperationKind>> {
+        let row = self.signed_where("id = ?1", &[id])?.into_iter().next();
+        Ok(row.map(|row| row.kind))
     }
 
     /// Whether `id` is a stored transaction.
@@ -1720,8 +1759,14 @@ mod tests {
             change_address: Some("address".into()),
             created_at: 7,
             lost_to: None,
+            kind: OperationKind::Refill,
         };
         store.add_signed(&signed).unwrap();
+        assert_eq!(
+            store.signed_kind("saving-1").unwrap(),
+            Some(OperationKind::Refill)
+        );
+        assert_eq!(store.signed_kind("saving-2").unwrap(), None);
         assert_eq!(store.open_signed().unwrap(), [signed]);
         store
             .set_signed_state("saving-1", SignedState::Seen)
@@ -1767,6 +1812,7 @@ mod tests {
                     change_address: None,
                     created_at,
                     lost_to: None,
+                    kind: OperationKind::Send,
                 })
                 .unwrap();
         }
@@ -1789,12 +1835,70 @@ mod tests {
                 .conn
                 .execute_batch(
                     "ALTER TABLE saving_signed DROP COLUMN lost_to;
+                     ALTER TABLE saving_signed DROP COLUMN kind;
                      UPDATE schema_version SET version = 6;",
                 )
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.signed_for_history().unwrap(), Vec::new());
+    }
+
+    /// A row from before schema 8 is a send.
+    #[test]
+    fn a_version_7_database_gains_the_kind_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE saving_signed DROP COLUMN kind;
+                     INSERT INTO saving_signed (id, txid, tx_hex, state, created_at)
+                     VALUES ('saving-1', 'txid', '00', 'seen', 1);
+                     UPDATE schema_version SET version = 7;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.signed_kind("saving-1").unwrap(),
+            Some(OperationKind::Send)
+        );
+    }
+
+    /// A sent record knows it is a refill from the signed row of its
+    /// transaction.
+    #[test]
+    fn a_refill_record_reads_as_a_refill() {
+        let (_dir, store) = open();
+        for (n, kind) in [(1, OperationKind::Send), (2, OperationKind::Refill)] {
+            store
+                .put_saving_sent(
+                    &format!("txid-{n}"),
+                    &SentRecord {
+                        change: None,
+                        refill: false,
+                    },
+                )
+                .unwrap();
+            store
+                .add_signed(&SignedTx {
+                    id: format!("saving-{n}"),
+                    txid: format!("txid-{n}"),
+                    tx_hex: "00".into(),
+                    state: SignedState::Signed,
+                    change_address: None,
+                    created_at: 1,
+                    lost_to: None,
+                    kind,
+                })
+                .unwrap();
+        }
+        let labels = store.saving_labels().unwrap();
+        assert!(!labels.sent("txid-1").unwrap().refill);
+        assert!(labels.sent("txid-2").unwrap().refill);
     }
 
     #[test]

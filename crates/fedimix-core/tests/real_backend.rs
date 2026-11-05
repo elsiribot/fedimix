@@ -21,8 +21,8 @@ use fedimix_core::testing::{
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
     Features, FedimixError, HistoryItem, HistoryKind, HistoryStatus, Network, NoteBucket, Notice,
-    OperationKind, OperationState, PrivacyTag, ReceiveMethod, ReceiveRequest, Result,
-    RunningOperation, SendAmount, SendPreview, SendRequest, Settings, WalletKind,
+    OperationKind, OperationState, PrivacyTag, ReceiveMethod, ReceiveRequest, RefillPreview,
+    Result, RunningOperation, SendAmount, SendPreview, SendRequest, Settings, WalletKind,
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -496,10 +496,13 @@ async fn saving_methods_report_not_set_up() {
         backend.set_coin_frozen("o".into(), true).await,
         Err(FedimixError::NotSetUp(SET_UP_FIRST.into()))
     );
-    assert_eq!(backend.prepare_refill().await.map(|_| ()), not_set_up);
+    assert_eq!(
+        backend.prepare_refill().await.map(|_| ()),
+        Err(FedimixError::NotSetUp(SET_UP_FIRST.into()))
+    );
     assert_eq!(
         backend.confirm_refill("p".into()).await.map(|_| ()),
-        not_set_up
+        Err(FedimixError::UnknownItem("p".into()))
     );
     assert_eq!(
         backend.prepare_exit("i".into()).await.map(|_| ()),
@@ -1943,6 +1946,15 @@ async fn funded(harness: &Harness, balance: Amount) -> Arc<fedimix_core::RealBac
 
 /// The states of operation `id` to its final one, and that one's `history_id`.
 async fn run_of(events: &EventStream, id: &str) -> (Vec<OperationState>, Option<String>) {
+    run_of_kind(events, id, OperationKind::Send).await
+}
+
+/// As [`run_of`], for an operation of `wanted` kind.
+async fn run_of_kind(
+    events: &EventStream,
+    id: &str,
+    wanted: OperationKind,
+) -> (Vec<OperationState>, Option<String>) {
     within("the operation's final state", async {
         let mut states = Vec::new();
         loop {
@@ -1958,7 +1970,7 @@ async fn run_of(events: &EventStream, id: &str) -> (Vec<OperationState>, Option<
             if seen != id {
                 continue;
             }
-            assert_eq!(kind, OperationKind::Send);
+            assert_eq!(kind, wanted);
             let done = state.is_final();
             states.push(state);
             if done {
@@ -5837,19 +5849,42 @@ async fn send_checked(
     let stalled = stalled_txs(saving);
     let before = saving.chain.broadcasts().len();
     let (_, state) = saving.send(backend, preview).await;
-    if state == OperationState::Done && saving.chain.broadcasts().len() > before {
+    conflicts_with_each(saving, &stalled, before, &state);
+    state
+}
+
+/// [`send_checked`] for a refill, which is a payment too.
+async fn refill_checked(
+    saving: &SavingHarness,
+    backend: &Real,
+    preview: RefillPreview,
+) -> OperationState {
+    let stalled = stalled_txs(saving);
+    let before = saving.chain.broadcasts().len();
+    let (_, state) = saving.refill(backend, preview).await;
+    conflicts_with_each(saving, &stalled, before, &state);
+    state
+}
+
+/// The newest broadcast, if one was made, shares a coin with each of `stalled`.
+fn conflicts_with_each(
+    saving: &SavingHarness,
+    stalled: &[Transaction],
+    before: usize,
+    state: &OperationState,
+) {
+    if *state == OperationState::Done && saving.chain.broadcasts().len() > before {
         let new = saving.chain.broadcasts().last().unwrap().clone();
-        for old in &stalled {
+        for old in stalled {
             assert!(
                 new.input.iter().any(|i| old
                     .input
                     .iter()
                     .any(|o| o.previous_output == i.previous_output)),
-                "a send shares no coin with a stalled one"
+                "a payment shares no coin with a stalled one"
             );
         }
     }
-    state
 }
 
 /// N13: the replaced send is back in view and its stalled replacement's coin
@@ -5961,6 +5996,42 @@ async fn every_send_conflicts_with_every_stalled_one() {
         OperationState::Done
     );
     backend.shutdown().await.unwrap();
+
+    // A refill replaces a stalled send, and a send replaces the refill once it
+    // stalls in turn.
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(20_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    saving.fund(&backend, 80_000, 2).await;
+    let (_, _) = saving.stalled(&backend).await;
+    let preview = backend.prepare_refill().await.unwrap();
+    saving.synced(&backend).await;
+    saving.chain.clear_broadcast_script();
+    assert_eq!(
+        refill_checked(&saving, &backend, preview).await,
+        OperationState::Done
+    );
+    let refill = saving.chain.broadcasts().last().unwrap().compute_txid();
+    saving
+        .chain
+        .script_broadcasts([BroadcastGoes::Refused; 256]);
+    saving.chain.lose(refill);
+    wait_until("the refill to stall", || async {
+        sync_saving_now(&backend);
+        stalled_txs(&saving)
+            .iter()
+            .any(|tx| tx.compute_txid() == refill)
+    })
+    .await;
+    let preview = backend.prepare_send(saving_sat(1_000)).await.unwrap();
+    saving.synced(&backend).await;
+    saving.chain.clear_broadcast_script();
+    assert_eq!(
+        send_checked(&saving, &backend, preview).await,
+        OperationState::Done
+    );
+    backend.shutdown().await.unwrap();
 }
 
 async fn saving_coin(backend: &Real, sat_amount: u64) -> String {
@@ -5991,5 +6062,348 @@ async fn a_seen_send_with_no_answer_keeps_its_row() {
         .iter()
         .find(|r| r.txid == Some(tx.compute_txid().to_string()));
     assert_eq!(row.expect("the row stays").status, HistoryStatus::Pending);
+    backend.shutdown().await.unwrap();
+}
+
+// Refill (Task 7).
+
+const AT_TARGET: &str = "Spending is at or above its target, so there is nothing to refill.";
+
+impl SavingHarness {
+    /// Joined, with Spending empty and a target of `target` sat.
+    async fn refillable(&self, target: u64) -> Real {
+        let backend = self.joined().await;
+        backend
+            .set_settings(Settings {
+                spending_target: sat(target),
+                ..chain_settings(CHAIN_URL)
+            })
+            .await
+            .unwrap();
+        backend
+    }
+
+    /// Confirms `preview` and waits for its end, every event a refill's.
+    async fn refill(&self, backend: &Real, preview: RefillPreview) -> (String, OperationState) {
+        let events = backend.subscribe();
+        let id = backend.confirm_refill(preview.id).await.unwrap();
+        let (mut states, history_id) = run_of_kind(&events, &id, OperationKind::Refill).await;
+        let last = states.pop().unwrap();
+        if last == OperationState::Done {
+            let txid = self.chain.broadcasts().last().unwrap().compute_txid();
+            assert_eq!(history_id, Some(txid.to_string()));
+        }
+        (id, last)
+    }
+
+    /// A refill that ends well, and its transaction.
+    async fn refilled(&self, backend: &Real) -> Transaction {
+        let preview = backend.prepare_refill().await.unwrap();
+        let (_, state) = self.refill(backend, preview).await;
+        assert_eq!(state, OperationState::Done);
+        self.chain.broadcasts().last().unwrap().clone()
+    }
+}
+
+fn outpoints(preview: &RefillPreview) -> Vec<String> {
+    preview.coins.iter().map(|c| c.outpoint.clone()).collect()
+}
+
+#[tokio::test]
+async fn smallest_first_until_covered() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(25_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let ten = saving.fund(&backend, 10_000, 1).await;
+    let thirty = saving.fund(&backend, 30_000, 2).await;
+    let twenty = saving.fund(&backend, 20_000, 3).await;
+    let preview = backend.prepare_refill().await.unwrap();
+    assert_eq!(outpoints(&preview), [ten.clone(), twenty.clone()]);
+    assert_eq!(preview.amount, sat(30_000));
+    assert_eq!(preview.device_name, "Test device");
+    // 30k of coins cover a gap of 30k only before the fee: one more coin.
+    backend
+        .set_settings(Settings {
+            spending_target: sat(30_000),
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    let preview = backend.prepare_refill().await.unwrap();
+    assert_eq!(outpoints(&preview), [ten, twenty, thirty]);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delivered_is_net_of_fee() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(25_000).await;
+    saving.harness.first.set_balance(sat(5_000));
+    wait_balance(&*backend, sat(5_000)).await;
+    saving.fund(&backend, 50_000, 0).await;
+    let preview = backend.prepare_refill().await.unwrap();
+    assert_eq!(preview.amount, sat(50_000));
+    assert!(preview.fee > Amount::ZERO);
+    let delivered = preview.amount.checked_sub(preview.fee).unwrap();
+    assert_eq!(
+        preview.overshoot,
+        delivered.checked_sub(sat(20_000)).unwrap()
+    );
+    let fee = preview.fee;
+    let tx = saving.refilled(&backend).await;
+    assert_eq!(tx.output.len(), 1);
+    assert_eq!(sat(tx.output[0].value.to_sat()), delivered);
+    assert_eq!(sat(50_000 - tx.output[0].value.to_sat()), fee);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_output_no_change() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    let address = regtest_address("refill");
+    saving
+        .harness
+        .first
+        .set_deposit_address(Some(address.clone()));
+    let spent = saving.fund(&backend, 50_000, 0).await;
+    let kept = saving.fund(&backend, 60_000, 1).await;
+    let preview = backend.prepare_refill().await.unwrap();
+    assert_eq!(outpoints(&preview), [spent]);
+    let delivered = preview.amount.checked_sub(preview.fee).unwrap();
+    let tx = saving.refilled(&backend).await;
+    assert_eq!(tx.output.len(), 1, "no change output");
+    assert_eq!(paid_to(&tx, &address).map(sat), Some(delivered));
+    let state = backend.saving_state().await.unwrap();
+    let coins: Vec<_> = state.coins.iter().map(|c| c.outpoint.clone()).collect();
+    assert_eq!(coins, [kept]);
+    let txid = tx.compute_txid().to_string();
+    let rows = saving_rows(&backend).await;
+    let row = rows
+        .iter()
+        .find(|r| r.txid.as_ref() == Some(&txid))
+        .unwrap();
+    assert_eq!(row.kind, HistoryKind::Refill, "a refill, never change");
+    assert_eq!(row.amount, delivered);
+    assert!(!row.incoming);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn at_or_above_target_is_refused() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(50_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let refused = Err(FedimixError::InvalidAmount(AT_TARGET.into()));
+    for balance in [50_000, 60_000] {
+        saving.harness.first.set_balance(sat(balance));
+        wait_balance(&*backend, sat(balance)).await;
+        assert_eq!(backend.prepare_refill().await.map(|_| ()), refused);
+    }
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn not_enough_coins_is_insufficient() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(100_000).await;
+    saving.fund(&backend, 10_000, 0).await;
+    saving.fund(&backend, 20_000, 1).await;
+    let reply = backend.prepare_refill().await;
+    assert!(
+        matches!(reply, Err(FedimixError::InsufficientFunds { .. })),
+        "{reply:?}"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_and_unconfirmed_are_skipped() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(10_000).await;
+    let big = saving.fund(&backend, 20_000, 0).await;
+    let frozen = saving.fund(&backend, 5_000, 1).await;
+    backend.set_coin_frozen(frozen, true).await.unwrap();
+    let address = backend.receive(on_chain()).await.unwrap().payload;
+    let tx = payment(&address, 8_000, 2);
+    let unconfirmed = format!("{}:0", tx.compute_txid());
+    saving.chain.push_sync(in_mempool(tx, 2_000, 3));
+    sync_saving_now(&backend);
+    wait_until("the unconfirmed coin", || async {
+        coin_at(&backend, &unconfirmed).await.is_some()
+    })
+    .await;
+    let preview = backend.prepare_refill().await.unwrap();
+    assert_eq!(outpoints(&preview), [big]);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn refill_needs_the_federation_online() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_refill().await.unwrap();
+    let connects = saving.devices.connects();
+    saving.harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    assert_eq!(
+        backend.prepare_refill().await.map(|_| ()),
+        Err(FedimixError::Offline)
+    );
+    assert_eq!(
+        backend.confirm_refill(preview.id).await,
+        Err(FedimixError::Offline)
+    );
+    assert_eq!(saving.devices.connects(), connects, "the device stayed out");
+    assert!(saving.chain.broadcasts().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn refill_same_v2_address_is_refused() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    saving.fund(&backend, 80_000, 2).await;
+    let client = &saving.harness.first;
+    client.set_deposit_watches(false);
+    client.set_deposit_address(Some(regtest_address("repeats")));
+    saving.sent(&backend, 30_000).await;
+    let same = Err(FedimixError::NotSetUp(SAME_ADDRESS.into()));
+    assert_eq!(backend.prepare_refill().await.map(|_| ()), same);
+    // The scanner moved on; the refill's own address then holds the next one.
+    client.set_deposit_address(Some(regtest_address("next")));
+    saving.refilled(&backend).await;
+    assert_eq!(backend.prepare_refill().await.map(|_| ()), same);
+    assert_eq!(
+        backend.prepare_send(saving_sat(30_000)).await.map(|_| ()),
+        same
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn device_rejection_changes_nothing() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    let coin = saving.fund(&backend, 100_000, 0).await;
+    saving.plug_in(Arc::new(
+        SoftSigner::from_seed(&SEED, bitcoin::Network::Regtest).rejecting(),
+    ));
+    let preview = backend.prepare_refill().await.unwrap();
+    let (_, state) = saving.refill(&backend, preview).await;
+    assert_eq!(
+        state,
+        OperationState::Failed {
+            error: FedimixError::DeviceRejected
+        }
+    );
+    assert!(saving.chain.broadcasts().is_empty());
+    assert!(backend.operations().await.unwrap().is_empty());
+    assert!(signed_states(&saving).is_empty());
+    assert!(coin_at(&backend, &coin).await.is_some());
+    assert!(saving_rows(&backend).await.iter().all(|r| r.incoming));
+    // Usable again.
+    saving.plug_in(soft_signer(bitcoin::Network::Regtest));
+    saving.refilled(&backend).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// A refill taken up after a restart is still a refill, in `operations` and in
+/// its events.
+#[tokio::test]
+async fn a_resumed_refill_reports_as_a_refill() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_refill().await.unwrap();
+    saving.chain.set_offline(true);
+    let id = backend.confirm_refill(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::Broadcasting).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let backend = saving.open().await.unwrap();
+    let running = backend.operations().await.unwrap();
+    assert_eq!(
+        running,
+        [RunningOperation {
+            id: id.clone(),
+            kind: OperationKind::Refill,
+            state: OperationState::Broadcasting,
+        }]
+    );
+    let events = backend.subscribe();
+    saving.chain.set_offline(false);
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Refill).await;
+    assert_eq!(states.last(), Some(&OperationState::Done));
+    backend.shutdown().await.unwrap();
+}
+
+/// The refill's deposit reaches Spending as a Deposit row of its transaction.
+#[tokio::test]
+async fn a_refill_reaches_spending_as_a_deposit_row() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let client = &saving.harness.first;
+    let tx = saving.refilled(&backend).await;
+    let txid = tx.compute_txid().to_string();
+    let watch = client.last_deposit().unwrap();
+    client.push_update(
+        &watch,
+        WatchUpdate::Settled {
+            amount: sat(tx.output[0].value.to_sat()),
+            fee: sat(100),
+            txid: Some(txid.clone()),
+        },
+    );
+    wait_until("the deposit's row", || async {
+        rows(&*backend)
+            .await
+            .iter()
+            .any(|row| row.kind == HistoryKind::Deposit && row.txid.as_ref() == Some(&txid))
+    })
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refill_waits_for_a_running_send() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    let refill = backend.prepare_refill().await.unwrap();
+    saving.devices.remove(DEVICE);
+    let preview = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    let id = backend.confirm_send(preview.id).await.unwrap();
+    wait_state(&backend, &id, OperationState::AwaitingDevice).await;
+    let busy = Err(FedimixError::NotSetUp(ONE_AT_A_TIME.into()));
+    assert_eq!(backend.prepare_refill().await.map(|_| ()), busy);
+    assert_eq!(backend.confirm_refill(refill.id).await.map(|_| ()), busy);
+    backend.cancel_operation(id).await.unwrap();
+    wait_no_saving_operation(&backend).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// A refill preview is not a send preview, and the other way round.
+#[tokio::test]
+async fn a_refill_preview_confirms_only_as_a_refill() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let refill = backend.prepare_refill().await.unwrap();
+    assert_eq!(
+        backend.confirm_send(refill.id.clone()).await,
+        Err(FedimixError::UnknownItem(refill.id.clone()))
+    );
+    let send = backend.prepare_send(saving_sat(30_000)).await.unwrap();
+    assert_eq!(
+        backend.confirm_refill(send.id.clone()).await,
+        Err(FedimixError::UnknownItem(send.id.clone()))
+    );
     backend.shutdown().await.unwrap();
 }

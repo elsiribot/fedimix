@@ -302,6 +302,7 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
             });
             ("\u{2197}", "Sent", None, nested)
         }
+        HistoryKind::Refill => ("\u{2197}", "Refill \u{2192} Spending", None, None),
         HistoryKind::Received { unmixed } => (
             "\u{2198}",
             "Received",

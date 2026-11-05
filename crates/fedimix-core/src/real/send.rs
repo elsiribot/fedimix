@@ -236,9 +236,8 @@ impl Core {
     /// An `Err` here means no row and no payment. From `Ok` on, the outcome
     /// arrives as [`Event::Operation`].
     pub(super) async fn confirm_send(self: &Arc<Self>, preview_id: &str) -> Result<OperationId> {
-        let saving = self.state().saving_previews.remove(preview_id);
-        if let Some(held) = saving {
-            return self.confirm_saving_send(held);
+        if let Some(held) = self.take_saving_preview(preview_id, OperationKind::Send) {
+            return self.confirm_saving(held);
         }
         let HeldSend {
             federation, quote, ..
@@ -358,9 +357,19 @@ impl Core {
     }
 
     pub(super) fn report(&self, id: &str, state: OperationState, history_id: Option<String>) {
+        self.report_as(id, OperationKind::Send, state, history_id);
+    }
+
+    pub(super) fn report_as(
+        &self,
+        id: &str,
+        kind: OperationKind,
+        state: OperationState,
+        history_id: Option<String>,
+    ) {
         self.events.emit(&Event::Operation {
             id: id.to_string(),
-            kind: OperationKind::Send,
+            kind,
             state,
             history_id,
         });

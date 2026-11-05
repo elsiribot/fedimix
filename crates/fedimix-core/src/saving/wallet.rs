@@ -229,7 +229,8 @@ impl Inner {
             };
         }
         let record = labels.sent(&txid.to_string());
-        let change = record.and_then(|r| r.change.clone());
+        let refill = record.is_some_and(|r| r.refill);
+        let change = record.and_then(|r| r.change.clone()).filter(|_| !refill);
         let outputs: bitcoin::Amount = tx.output.iter().map(|o| o.value).sum();
         // What left for someone else: all outputs, less what came
         // back to this wallet and less change sent to Spending.
@@ -242,7 +243,11 @@ impl Inner {
             .saturating_sub(to_spending);
         HistoryItem {
             id: txid.to_string(),
-            kind: HistoryKind::Sent { change },
+            kind: if refill {
+                HistoryKind::Refill
+            } else {
+                HistoryKind::Sent { change }
+            },
             amount,
             incoming: false,
             status,
@@ -611,6 +616,80 @@ impl SavingWallet {
         Ok(BuiltSend { psbt, fee, change })
     }
 
+    /// Builds a refill: the coins of `plan.must_spend` first, then the usable
+    /// coins from the smallest up, one at a time, until what the one output
+    /// delivers after the fee covers `plan.gap` and exceeds `plan.floor`. BDK's
+    /// coin selection never runs, so nothing here is random, and there is no
+    /// change. Also returns the coins in the order they were taken.
+    pub(crate) fn build_refill(
+        &self,
+        labels: &Labels,
+        plan: &RefillPlan,
+    ) -> Result<(BuiltSend, Vec<OutPoint>)> {
+        let mut usable = self.usable_coins(labels, &plan.locked);
+        usable.sort_by(|a, b| {
+            a.amount
+                .cmp(&b.amount)
+                .then_with(|| a.outpoint.cmp(&b.outpoint))
+        });
+        let mut smallest = usable
+            .iter()
+            .filter_map(|coin| OutPoint::from_str(&coin.outpoint).ok())
+            .filter(|outpoint| !plan.must_spend.contains(outpoint));
+        let mut chosen = plan.must_spend.clone();
+        // The most an attempt delivered, for the refusal.
+        let mut most = Amount::ZERO;
+        loop {
+            if !chosen.is_empty()
+                && let Some(built) = self.drain(&chosen, plan)?
+            {
+                let delivered = built.psbt.unsigned_tx.output.first().map(|o| sat(o.value));
+                let delivered = delivered.unwrap_or(Amount::ZERO);
+                if delivered >= plan.gap && delivered > plan.floor {
+                    return Ok((built, chosen));
+                }
+                most = most.max(delivered);
+            }
+            match smallest.next() {
+                Some(outpoint) => chosen.push(outpoint),
+                None => {
+                    let floor = plan.floor.checked_add(Amount::from_sat(1));
+                    return Err(FedimixError::InsufficientFunds {
+                        available: most,
+                        needed: plan.gap.max(floor.unwrap_or(plan.floor)),
+                    });
+                }
+            }
+        }
+    }
+
+    /// All of `inputs` to `plan.to`, less the fee, in one output. `None` when
+    /// they cannot pay the fee and leave an output worth having.
+    fn drain(&self, inputs: &[OutPoint], plan: &RefillPlan) -> Result<Option<BuiltSend>> {
+        let mut inner = self.lock();
+        let mut builder = inner.wallet.build_tx();
+        builder
+            .fee_rate(plan.fee_rate)
+            .manually_selected_only()
+            .drain_to(plan.to.clone());
+        builder
+            .add_utxos(inputs)
+            .map_err(|_| FedimixError::PreviewExpired)?;
+        let psbt = match builder.finish() {
+            Ok(psbt) => psbt,
+            Err(CreateTxError::CoinSelection(_)) => return Ok(None),
+            Err(e) => return Err(build_error(&e, Amount::ZERO)),
+        };
+        let fee = psbt.fee().map_err(|_| {
+            FedimixError::Internal("Fedimix could not work out this transaction's fee.".into())
+        })?;
+        Ok(Some(BuiltSend {
+            psbt,
+            fee,
+            change: None,
+        }))
+    }
+
     /// The transaction a device signed. Makes no check of what it pays.
     pub(crate) fn finalize(&self, mut psbt: Psbt) -> Result<Transaction> {
         let inner = self.lock();
@@ -746,6 +825,22 @@ pub(crate) struct SendPlan {
     pub must_spend: Vec<OutPoint>,
     /// Spend `must_spend` and nothing else.
     pub only_must_spend: bool,
+}
+
+/// What a refill pays, and how much must arrive.
+#[derive(Debug)]
+pub(crate) struct RefillPlan {
+    /// The federation's deposit address.
+    pub to: ScriptBuf,
+    pub fee_rate: FeeRate,
+    /// Coins signed away by a stored transaction, whatever the chain says now.
+    pub locked: HashSet<OutPoint>,
+    /// Coins it must spend, whatever their size: they go first.
+    pub must_spend: Vec<OutPoint>,
+    /// What must arrive at least.
+    pub gap: Amount,
+    /// What must arrive more than.
+    pub floor: Amount,
 }
 
 /// An unsigned send.
@@ -1350,6 +1445,7 @@ mod tests {
                 &store,
                 &send.compute_txid().to_string(),
                 Some(change.clone()),
+                false,
             )
             .unwrap();
         let history = w.history(&labels);

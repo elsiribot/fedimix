@@ -76,6 +76,9 @@ pub struct Label {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SentRecord {
     pub change: Option<SentChange>,
+    /// A refill: its one output paid Spending, and it is no change. The store
+    /// reads this from the transaction's signed row, which is where it is kept.
+    pub refill: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,14 +137,15 @@ impl Labels {
     }
 
     /// Notes that the transaction `txid` is a send Fedimix built, with where
-    /// its change went, before it can reach anyone.
+    /// its change went, before it can reach anyone. A refill has no change.
     pub(crate) fn record_sent(
         &mut self,
         store: &Store,
         txid: &str,
         change: Option<SentChange>,
+        refill: bool,
     ) -> Result<()> {
-        let record = SentRecord { change };
+        let record = SentRecord { change, refill };
         store.put_saving_sent(txid, &record)?;
         self.sent.insert(txid.to_string(), record);
         Ok(())

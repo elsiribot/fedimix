@@ -5,7 +5,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## What works (commands run in `nix develop`)
 - `just run [--data-dir PATH] [--network bitcoin|signet|regtest]`: the real wallet. `just demo`: the complete UI over the demo backend.
 - `just clippy`, `just fmt`, `just test` (includes `tests/real_backend.rs` over a fake port).
-- `just test-integration`: devimint, both module sets, 34 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
+- `just test-integration`: devimint, both module sets, 35 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
 - `just test-real-ui`: the real binary through Join, Lightning receive and send, restart, lock, wrong network, under headless sway.
 - `just interact-demo`, `just screenshot-all`: scripted demo flows and screenshots at 480 and 360 px.
 - `nix build` / `just build-nix`: wrapped release binary plus flake checks. Release build from clean: 7 min 16 s, 88 MiB, 64 MiB stripped.
@@ -20,7 +20,7 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 - A send against real hardware or a public server; a dropped send is exercised with fakes only. Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-6 done: chain access, the watch-only wallet, devices (`HwiPort`, compile-only; `SoftSigner` under `testing`), `RealBackend` Saving state and sync, and Task 6: `prepare_send`/`confirm_send`/`cancel_operation` for Saving, with change to a federation deposit address, small change kept, and the signed transaction stored before broadcast (`saving_signed`, schema 6), rebroadcast until settled; a send no server takes is held as stalled and the next send spends its coins. The core sends; GTK's Send and Refill arrive in Task 8. Next: Task 7 (refill). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
+Phase 3 (Saving, hardware wallet), Tasks 1-7 done: chain access, the watch-only wallet, devices (`HwiPort`, compile-only; `SoftSigner` under `testing`), `RealBackend` Saving state and sync, Saving send with change to a federation deposit address (signed transaction stored before broadcast, rebroadcast until settled, stalled sends replaced), and Task 7: `prepare_refill`/`confirm_refill`, the smallest coins that cover the gap to the target in one output to the active federation, no change, on the same path as a send (`saving_signed.kind`, schema 8; history `Refill`). GTK's Send and Refill arrive in Task 8. Next: Task 7b (software Saving wallet). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.

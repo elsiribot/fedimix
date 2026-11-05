@@ -1,4 +1,6 @@
-//! Sending from Saving, with change into the federation.
+//! Sending from Saving, with change into the federation. A refill
+//! (`refill.rs`) is a payment of the same kind and takes the same path from its
+//! preview on, so everything here holds of it too.
 //!
 //! A preview holds an unsigned PSBT. Confirming takes the one Saving operation:
 //! `AwaitingDevice`, `Signing`, `Broadcasting`, `Done`. Until the device has
@@ -83,39 +85,43 @@ const OWN_ADDRESS: &str =
 const REPLACES: &str = "An earlier payment has not confirmed and may still go through. This send spends the same coins, so only one of the two can confirm.";
 const STALLED_COIN_GONE: &str = "A coin of a payment that has not confirmed is missing from the chain server's answer, so the next send cannot be made to conflict with it. Try again after the next sync.";
 const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms before sending from Saving again.";
-const FROZEN_STALLED: &str = "A coin you froze is tied to a payment that has not confirmed. Unfreeze it to send: the next send must spend it, so that only one of the two can confirm.";
+pub(super) const FROZEN_STALLED: &str = "A coin you froze is tied to a payment that has not confirmed. Unfreeze it to send: the next send must spend it, so that only one of the two can confirm.";
 const NO_ESTIMATE: &str =
     "The chain server has no fee estimate right now. Enter a fee rate, or try again later.";
 const NO_FEDERATION: &str = "No federation is active, so the change stays in Saving.";
 const BAD_DEPOSIT_ADDRESS: &str = "The federation gave a deposit address Fedimix cannot use.";
 const TAMPERED: &str = "Your device handed back a different transaction from the one you reviewed, so Fedimix did not send it.";
-const NO_ACCOUNT: &str = "Set up Saving with a hardware wallet first.";
+pub(super) const NO_ACCOUNT: &str = "Set up Saving with a hardware wallet first.";
 const UNREADABLE_TX: &str = "A stored Saving transaction cannot be read.";
 
-/// The federation a preview pays its change to.
+/// The federation a preview pays its change, or a refill, to.
 #[derive(Debug)]
-struct ChangeFederation {
-    id: String,
-    address: String,
+pub(super) struct ChangeFederation {
+    pub(super) id: String,
+    pub(super) address: String,
     /// Follows the deposit, on the generation that has watches.
-    watch: Option<String>,
+    pub(super) watch: Option<String>,
 }
 
 /// A Saving preview that can still be confirmed.
 pub(super) struct HeldSaving {
-    psbt: Psbt,
-    fee: Amount,
-    change: ChangeDestination,
-    change_vout: Option<u32>,
+    pub(super) kind: OperationKind,
+    pub(super) psbt: Psbt,
+    pub(super) fee: Amount,
+    pub(super) change: ChangeDestination,
+    pub(super) change_vout: Option<u32>,
     /// `Some` only when the PSBT pays it.
-    federation: Option<ChangeFederation>,
-    generation: u64,
-    expires_at: Timestamp,
+    pub(super) federation: Option<ChangeFederation>,
+    /// A refill's: what its one output delivers to the federation.
+    pub(super) delivered: Option<bitcoin::Amount>,
+    pub(super) generation: u64,
+    pub(super) expires_at: Timestamp,
 }
 
 /// The running Saving operation.
 pub(super) struct SavingOp {
     id: String,
+    kind: OperationKind,
     state: OperationState,
     cancel: Arc<Notify>,
     cancelled: bool,
@@ -177,13 +183,29 @@ fn same_as_reviewed(signed: &Psbt, reviewed: &Psbt, fee: Amount) -> bool {
         && signed.fee().is_ok_and(|paid| from_btc(paid) == fee)
 }
 
+/// A refill pays what its preview showed: one output, to the federation, of
+/// the amount delivered. A send has nothing more to check here.
+fn delivers_as_reviewed(
+    tx: &Transaction,
+    held: &HeldSaving,
+    to: Option<&bitcoin::ScriptBuf>,
+) -> bool {
+    let Some(delivered) = held.delivered else {
+        return true;
+    };
+    match (tx.output.as_slice(), to) {
+        ([output], Some(to)) => output.value == delivered && output.script_pubkey == *to,
+        _ => false,
+    }
+}
+
 impl Core {
     fn chain_client(&self) -> Result<Arc<dyn ChainClient>> {
         let target = self.chain.borrow().clone();
         target.connect(&self.chain_factory)
     }
 
-    async fn saving_fee_rate(&self, requested: Option<u64>) -> Result<FeeRate> {
+    pub(super) async fn saving_fee_rate(&self, requested: Option<u64>) -> Result<FeeRate> {
         if let Some(rate) = requested {
             if rate == 0 {
                 return Err(FedimixError::InvalidAmount(ZERO_FEE_RATE.into()));
@@ -200,7 +222,7 @@ impl Core {
 
     /// Where change can go, with the margin: `None` with no active federation.
     /// Asks for the minimum first, so a failure uses up no address.
-    async fn change_federation(
+    pub(super) async fn change_federation(
         &self,
         spends: &HashSet<OutPoint>,
     ) -> Result<Option<(ChangeFederation, Amount)>> {
@@ -220,7 +242,7 @@ impl Core {
         Ok(Some((ChangeFederation { id, address, watch }, margin)))
     }
 
-    fn checked_script(&self, address: &str) -> Result<bitcoin::ScriptBuf> {
+    pub(super) fn checked_script(&self, address: &str) -> Result<bitcoin::ScriptBuf> {
         let parsed = Address::from_str(address).map_err(|_| internal(BAD_DEPOSIT_ADDRESS))?;
         let network = match self.config.network {
             Network::Bitcoin => bitcoin::Network::Bitcoin,
@@ -257,7 +279,7 @@ impl Core {
 
     /// The coins signed away by a transaction not yet settled, whatever the
     /// wallet's view says about them now.
-    fn locked_outpoints(&self) -> Result<HashSet<OutPoint>> {
+    pub(super) fn locked_outpoints(&self) -> Result<HashSet<OutPoint>> {
         let mut locked = HashSet::new();
         for (row, tx, superseded) in self.open_ledger()? {
             if !superseded && row.state != SignedState::Stalled {
@@ -271,7 +293,7 @@ impl Core {
     /// final, whatever the wallet's view shows, so that it conflicts with each.
     /// A coin a newer send holds is covered by that send. One the wallet does
     /// not show cannot be spent, so no send is made until that settles.
-    fn stalled_inputs(&self, wallet: &SavingWallet) -> Result<Vec<OutPoint>> {
+    pub(super) fn stalled_inputs(&self, wallet: &SavingWallet) -> Result<Vec<OutPoint>> {
         let ledger = self.open_ledger()?;
         let locked = self.locked_outpoints()?;
         let mut inputs = Vec::new();
@@ -333,6 +355,12 @@ impl Core {
                 .to_string();
         };
         let item = wallet.signed_item(tx, HistoryStatus::Complete, row.created_at, labels);
+        if row.kind == OperationKind::Refill {
+            return format!(
+                "Not sent: your earlier refill of {} confirmed instead, as both spent the same coins.",
+                item.amount
+            );
+        }
         let to = wallet.recipient(tx, row.change_address.as_deref());
         let to = to.unwrap_or_else(|| "an address of yours".to_string());
         format!(
@@ -404,7 +432,7 @@ impl Core {
     }
 
     /// A Jade's PIN step cannot use the proxy: better said at the review.
-    fn refuse_jade_behind_proxy(&self, account: Option<&DeviceAccount>) -> Result<()> {
+    pub(super) fn refuse_jade_behind_proxy(&self, account: Option<&DeviceAccount>) -> Result<()> {
         let jade = account.is_some_and(|account| account.kind == DeviceKind::Jade);
         if jade && self.chain.borrow().proxy.is_some() {
             return Err(FedimixError::NotSetUp(JADE_PROXY.into()));
@@ -412,7 +440,7 @@ impl Core {
         Ok(())
     }
 
-    fn refuse_if_busy(&self) -> Result<()> {
+    pub(super) fn refuse_if_busy(&self) -> Result<()> {
         let signed = self.store().open_signed()?;
         let unsent = signed.iter().any(|row| row.state == SignedState::Signed);
         if unsent || self.saving().op.is_some() {
@@ -564,11 +592,13 @@ impl Core {
             expires_at: (self.clock)() + PREVIEW_TTL,
         };
         let held = HeldSaving {
+            kind: OperationKind::Send,
             psbt: built.psbt,
             fee: preview.fee,
             change: preview.change.clone(),
             change_vout: built.change.map(|(vout, _)| vout),
             federation,
+            delivered: None,
             generation: self.saving().generation,
             expires_at: preview.expires_at,
         };
@@ -579,7 +609,18 @@ impl Core {
         Ok(preview)
     }
 
-    /// Whether a Send review is open now.
+    /// Takes the preview `id` out, if it is one of `kind`: a refill's preview
+    /// cannot be confirmed as a send, nor the other way round.
+    pub(super) fn take_saving_preview(&self, id: &str, kind: OperationKind) -> Option<HeldSaving> {
+        let mut state = self.state();
+        let fits = state
+            .saving_previews
+            .get(id)
+            .is_some_and(|held| held.kind == kind);
+        fits.then(|| state.saving_previews.remove(id)).flatten()
+    }
+
+    /// Whether a Send or Refill review is open now.
     pub(super) fn review_open(&self) -> bool {
         let now = (self.clock)();
         let state = self.state();
@@ -635,7 +676,12 @@ impl Core {
     }
 
     /// Takes the one operation, if this preview is not older than the last.
-    fn claim_operation(&self, id: &str, generation: u64) -> Result<Arc<Notify>> {
+    fn claim_operation(
+        &self,
+        id: &str,
+        kind: OperationKind,
+        generation: u64,
+    ) -> Result<Arc<Notify>> {
         let cancel = Arc::new(Notify::new());
         let mut live = self.saving();
         if live.op.is_some() {
@@ -648,6 +694,7 @@ impl Core {
         live.last_op = Some(id.to_string());
         live.op = Some(SavingOp {
             id: id.to_string(),
+            kind,
             state: OperationState::AwaitingDevice,
             cancel: Arc::clone(&cancel),
             cancelled: false,
@@ -657,7 +704,7 @@ impl Core {
 
     /// An `Err` here means nothing happened. From `Ok` on, the outcome arrives
     /// as [`Event::Operation`].
-    pub(super) fn confirm_saving_send(self: &Arc<Self>, held: HeldSaving) -> Result<OperationId> {
+    pub(super) fn confirm_saving(self: &Arc<Self>, held: HeldSaving) -> Result<OperationId> {
         self.refuse_if_busy()?;
         self.ensure_running()?;
         let wallet = self.saving_wallet()?;
@@ -665,14 +712,14 @@ impl Core {
         let id = fresh_id("saving");
         // Books nothing: it keeps `shutdown` waiting for the task's writes.
         let reservation = self.reserve("", &id, Amount::ZERO, Amount::ZERO)?;
-        let cancel = self.claim_operation(&id, held.generation)?;
+        let cancel = self.claim_operation(&id, held.kind, held.generation)?;
         let guard = OpGuard {
             core: Arc::clone(self),
             id: id.clone(),
         };
         // After the reservation: `shutdown` closes the gate, then waits for those.
         self.ensure_running()?;
-        self.report(&id, OperationState::AwaitingDevice, None);
+        self.report_saving(&id, OperationState::AwaitingDevice, None);
         // A task of its own: a caller that goes away must not cut a send off.
         let core = Arc::clone(self);
         let task_id = id.clone();
@@ -687,7 +734,24 @@ impl Core {
         if let Some(op) = self.saving().op.as_mut().filter(|op| op.id == id) {
             op.state = state.clone();
         }
-        self.report(id, state, None);
+        self.report_saving(id, state, None);
+    }
+
+    /// What the Saving operation `id` is: the running one's kind, else its
+    /// stored row's, which a restart keeps.
+    fn saving_kind(&self, id: &str, running: Option<OperationKind>) -> OperationKind {
+        running
+            .or_else(|| {
+                let live = self.saving();
+                live.op.as_ref().filter(|op| op.id == id).map(|op| op.kind)
+            })
+            .or_else(|| self.store().signed_kind(id).ok().flatten())
+            .unwrap_or(OperationKind::Send)
+    }
+
+    fn report_saving(&self, id: &str, state: OperationState, history_id: Option<String>) {
+        let kind = self.saving_kind(id, None);
+        self.report_as(id, kind, state, history_id);
     }
 
     /// Ends the wait at the device. `false` for an id that is no Saving send.
@@ -728,7 +792,7 @@ impl Core {
             .iter()
             .map(|op| RunningOperation {
                 id: op.id.clone(),
-                kind: OperationKind::Send,
+                kind: op.kind,
                 state: op.state.clone(),
             })
             .collect();
@@ -736,7 +800,7 @@ impl Core {
             if row.state == SignedState::Signed && running.iter().all(|op| op.id != row.id) {
                 running.push(RunningOperation {
                     id: row.id,
-                    kind: OperationKind::Send,
+                    kind: row.kind,
                     state: OperationState::Broadcasting,
                 });
             }
@@ -822,7 +886,8 @@ impl Core {
                 let outpoint = format!("{txid}:{vout}");
                 labels.set_tag(&store, &outpoint, crate::saving::Tag::SmallChange, None)?;
             }
-            labels.record_sent(&store, &txid, change)?;
+            let refill = held.kind == OperationKind::Refill;
+            labels.record_sent(&store, &txid, change, refill)?;
         }
         let federation = held.federation.as_ref();
         if let Some(ChangeFederation {
@@ -841,6 +906,7 @@ impl Core {
             change_address: federation.map(|federation| federation.address.clone()),
             created_at: (self.clock)(),
             lost_to: None,
+            kind: held.kind,
         };
         self.store().add_signed(&row)?;
         Ok(row)
@@ -862,6 +928,10 @@ impl Core {
             () = cancel.notified() => Err(FedimixError::Cancelled),
             () = stopping(&mut gate) => Err(FedimixError::Cancelled),
         };
+        let to = held
+            .federation
+            .as_ref()
+            .and_then(|federation| self.checked_script(&federation.address).ok());
         let stored = match signed {
             Ok(psbt) if !same_as_reviewed(&psbt, &held.psbt, held.fee) => Err(internal(TAMPERED)),
             Ok(_) if self.check_active(&held).is_err() => Err(FedimixError::PreviewExpired),
@@ -869,6 +939,7 @@ impl Core {
                 Ok(tx) if tx.compute_txid() != held.psbt.unsigned_tx.compute_txid() => {
                     Err(internal(TAMPERED))
                 }
+                Ok(tx) if !delivers_as_reviewed(&tx, &held, to.as_ref()) => Err(internal(TAMPERED)),
                 Ok(_) if !self.enter_broadcasting(&id) => Err(FedimixError::Cancelled),
                 Ok(tx) => self
                     .store_signed(&id, &tx, &held, &wallet)
@@ -889,20 +960,23 @@ impl Core {
                 return;
             }
         };
-        self.report(&id, OperationState::Broadcasting, None);
+        self.report_saving(&id, OperationState::Broadcasting, None);
         self.settle(&wallet, &row, &tx, false).await;
     }
 
     /// Clears the operation before telling anyone, so that whoever hears of its
     /// end finds Saving free.
     fn finish_op(&self, id: &str, state: OperationState, history_id: Option<String>) {
-        {
+        let running = {
             let mut live = self.saving();
-            if live.op.as_ref().is_some_and(|op| op.id == id) {
+            let running = live.op.as_ref().filter(|op| op.id == id).map(|op| op.kind);
+            if running.is_some() {
                 live.op = None;
             }
-        }
-        self.report(id, state, history_id);
+            running
+        };
+        let kind = self.saving_kind(id, running);
+        self.report_as(id, kind, state, history_id);
     }
 
     /// One attempt to have a server hold `tx`. When an earlier attempt may have

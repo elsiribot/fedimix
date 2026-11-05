@@ -254,6 +254,19 @@ async fn wait_for_transaction(txid: &str) {
     .expect("the transaction must reach bitcoind");
 }
 
+/// As [`wait_for_transaction`], for one that touches no bitcoind wallet, such
+/// as a refill, which pays only the federation: in the mempool or a block.
+async fn wait_for_mempool(txid: &str) {
+    let lookup = format!("$FM_BTC_CLIENT getrawtransaction {txid}");
+    tokio::time::timeout(PATIENCE, async {
+        while sh(&lookup).is_err() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("the transaction must reach bitcoind");
+}
+
 /// Quotes `invoice` and pays it.
 async fn pay(client: &dyn FederationClient, invoice: &str, amount: Amount) -> String {
     let quote = client.lightning_quote(invoice).await.unwrap();
@@ -1824,6 +1837,16 @@ fn from_saving(address: &str, sat: u64) -> SendRequest {
     }
 }
 
+/// Saving's row of `txid`. Not by position: a block's time may run ahead of the
+/// moment a pending send was first seen, which orders the history.
+async fn row_of_tx(backend: &RealBackend, txid: &str) -> HistoryItem {
+    let history = backend.saving_state().await.unwrap().history;
+    let row = history
+        .into_iter()
+        .find(|r| r.txid.as_deref() == Some(txid));
+    row.expect("Saving shows the transaction")
+}
+
 /// Confirms `preview` and waits for its end.
 async fn sent(backend: &RealBackend, preview: SendPreview) -> String {
     let events = backend.subscribe();
@@ -1861,8 +1884,7 @@ async fn saving_send_change_lands_in_spending() {
     );
     let txid = sent(&backend, preview).await;
     wait_for_transaction(&txid).await;
-    let row = &backend.saving_state().await.unwrap().history[0];
-    assert_eq!(row.txid.as_ref(), Some(&txid));
+    let row = row_of_tx(&backend, &txid).await;
     assert!(matches!(
         &row.kind,
         HistoryKind::Sent { change: Some(c) } if c.to_spending && c.amount == change
@@ -1882,7 +1904,11 @@ async fn saving_send_change_lands_in_spending() {
     );
     assert_eq!(received_at(&payee).0, SEND);
     wait_saving(&backend, |state| {
-        state.history[0].status == HistoryStatus::Complete
+        let row = state
+            .history
+            .iter()
+            .find(|r| r.txid.as_ref() == Some(&txid));
+        row.is_some_and(|row| row.status == HistoryStatus::Complete)
     })
     .await;
     assert_eq!(backend.saving_state().await.unwrap().balance, Amount::ZERO);
@@ -2064,5 +2090,73 @@ async fn killed_after_sign_rebroadcasts() {
     .await;
     let (sat, txids) = received_at(&payee);
     assert_eq!((sat, txids.len()), (SEND, 1), "paid once");
+    backend.shutdown().await.unwrap();
+}
+
+/// A refill on both generations: the smallest coins that cover the gap go to
+/// the federation in one output, and reach Spending as one deposit, less the
+/// deposit's fee. Nothing comes back to Saving.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn refill_reaches_spending() {
+    const TARGET: u64 = 150_000;
+    const KEPT: u64 = 500_000;
+    let wallet = SavingWallet::new();
+    let backend = wallet.ready(esplora()).await;
+    backend
+        .set_settings(Settings {
+            chain_backend: esplora(),
+            spending_target: Amount::from_sat(TARGET),
+            ..Settings::for_network(Network::Regtest)
+        })
+        .await
+        .unwrap();
+    fund_saving(&backend, 100_000).await;
+    fund_saving(&backend, KEPT).await;
+    fund_saving(&backend, 80_000).await;
+    let before = balance_of(&backend).await;
+
+    let preview = backend.prepare_refill().await.unwrap();
+    let taken: Vec<_> = preview.coins.iter().map(|c| c.amount.as_sat()).collect();
+    assert_eq!(taken, [80_000, 100_000], "smallest first, until covered");
+    assert_eq!(preview.amount, Amount::from_sat(180_000));
+    let delivered = preview.amount.checked_sub(preview.fee).unwrap();
+    let gap = Amount::from_sat(TARGET).checked_sub(before).unwrap();
+    assert_eq!(preview.overshoot, delivered.checked_sub(gap).unwrap());
+
+    let events = backend.subscribe();
+    let id = backend.confirm_refill(preview.id).await.unwrap();
+    let (state, txid) = final_state(&events, &id).await;
+    assert_eq!(state, OperationState::Done);
+    let txid = txid.expect("a done refill names its transaction");
+    wait_for_mempool(&txid).await;
+    let row = row_of_tx(&backend, &txid).await;
+    assert_eq!(row.kind, HistoryKind::Refill);
+    assert_eq!(row.amount, delivered);
+
+    let deposit = mine_until_received(&backend, &events).await;
+    assert_eq!(deposit.kind, HistoryKind::Deposit);
+    assert_eq!(
+        deposit.txid.as_ref(),
+        Some(&txid),
+        "the refill's own deposit"
+    );
+    let after = wait_balance(&backend, |now| now > before).await;
+    let rose = after.saturating_sub(before);
+    assert!(rose <= delivered, "{rose:?} of {delivered:?}");
+    let fee = delivered.saturating_sub(rose);
+    assert!(
+        fee.as_sat() * 2 < delivered.as_sat(),
+        "most of the refill arrives: {fee:?} kept of {delivered:?}"
+    );
+    wait_saving(&backend, |state| {
+        state.coins.len() == 1
+            && state.coins[0].amount == Amount::from_sat(KEPT)
+            && state
+                .history
+                .iter()
+                .any(|r| r.txid.as_ref() == Some(&txid) && r.status == HistoryStatus::Complete)
+    })
+    .await;
     backend.shutdown().await.unwrap();
 }
