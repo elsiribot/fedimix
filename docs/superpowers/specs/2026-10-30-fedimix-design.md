@@ -14,6 +14,7 @@ UI mockups from the brainstorming session live in `.superpowers/brainstorm/` (no
 - **Spending**: Fedimint ecash in one active federation. Pays and receives via Lightning and on-chain (federation deposit/withdraw).
   - Multiple federations can be joined. The default for new deposits is the one with the largest anonymity estimate. Switching is in settings, not on the main screens.
 - **Saving**: on-chain watch-only wallet built from a hardware wallet xpub. Only the hardware wallet signs; the app never holds cold keys.
+  - Amended 2026-11-05 at the user's request: without a hardware wallet, Saving can be a software wallet on this computer, keyed from the same recovery words (BIP84). Setup says a hardware wallet is safer.
 
 ### Flows
 

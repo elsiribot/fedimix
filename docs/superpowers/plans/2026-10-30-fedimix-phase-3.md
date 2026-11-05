@@ -17,7 +17,7 @@
 - Stay on `master`; no branches or worktrees. Never `git worktree prune` or `git gc`. Never commit `ANALYSIS.md` or `.superpowers/`.
 - Before every commit: `nix develop -c just clippy` and `nix develop -c just test` pass. Commit subjects are conventional.
 - Core public API stays owned and FFI-friendly. No bdk, bitcoin or async-hwi type crosses it. Nothing under `crates/fedimix-gtk` imports them.
-- "Only the hardware wallet signs; the app never holds cold keys." The software signer exists only under the `testing` feature and never in a release binary.
+- "Only the hardware wallet signs; the app never holds cold keys." The software signer exists only under the `testing` feature and never in a release binary. Amended 2026-11-05 at the user's request: Saving may also be a software wallet on this computer, keyed from the recovery words (Task 7b). The `testing` `SoftSigner` and its hooks still never reach a release binary.
 - Each Saving send's change output is a fresh federation deposit address. Below the federation's minimum deposit it stays in Saving, labelled "small change".
 - Refill: smallest-first, no change output, never automatic, signed on the device.
 - Never charge more than the preview shows.
@@ -178,11 +178,28 @@ Gap is `target - spending balance`, positive only. Selection: unfrozen confirmed
 - [ ] **Step 3: Devimint test** `refill_reaches_spending`, both generations.
 - [ ] **Step 4: Run both suites.** Commit `feat(core): refill Spending from Saving`.
 
+### Task 7b: Software Saving wallet
+
+Added 2026-11-05 at the user's request ("Also allow software wallet if user doesn't have hww").
+
+**Files:** Create `crates/fedimix-core/src/saving/seed_signer.rs` (not behind `testing`). Modify `saving/devices.rs`, `seed.rs`, `real/saving.rs`, `api.rs`, `README.md`, `decisions.md`. Tests as Task 5.
+
+**Interfaces:**
+- Consumes: `Signer`, `DevicePort`, `DeviceKind::Software`, `Seed`.
+- Produces: `SeedSigner` (`Signer` from the recovery words, BIP84 `m/84'/coin'/0'`, coin 0 on bitcoin, 1 elsewhere); a `DevicePort` that lists hardware devices first, then always `DeviceInfo { id: "software", name: "This computer", kind: Software, connected: true }`, with `connect("software")` returning the `SeedSigner`. The `testing` `SoftSigner` (arbitrary xprv, reject hooks) is unchanged and still `testing` only; the doc comment on `DeviceKind::Software` changes to "Software wallet on this computer".
+
+The key comes from the same BIP39 words as Spending (BIP39 seed, empty passphrase), so one backup restores both. Setup, sync, send, refill and stalled handling are unchanged: a software account is an ordinary account whose signer is always connected. Signing skips `AwaitingDevice`; it still runs only from a user's confirm. The extended private key is derived for each call and not kept. No network traffic, so a proxy does not affect it.
+
+- [ ] **Step 1: Failing tests:** `seed_signer_matches_bip84_vector` (words `abandon` ×11 `about`, bitcoin: fingerprint `73c5da0a`, first receive address `bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu`), `software_is_listed_after_devices`, `software_is_listed_when_no_device_answers`, `software_wallet_sets_up_and_sends` (fake chain and port, change to the federation), `software_send_needs_no_awaiting_device`, `release_build_has_no_soft_signer` still passes.
+- [ ] **Step 2: Run; expect FAIL.** Implement.
+- [ ] **Step 3: Devimint test** `software_saving_sends_with_change`, both generations, using `SeedSigner` from the backend's own words (not the `testing` signer).
+- [ ] **Step 4:** README: the software option, that one phrase restores both wallets, and that a hardware wallet is safer for large amounts. decisions.md: one bullet per choice above. Run both suites. Commit `feat(core): offer a software Saving wallet`.
+
 ### Task 8: GTK and real UI
 
 **Files:** Modify `crates/fedimix-gtk/src/ui/{setup_saving,saving_tab,send_dialog,refill_dialog,receive_dialog,settings_page}.rs`, `present.rs`, `scripts/test-real-ui.sh`. Create `scripts/real-flows/saving-*.drive`.
 
-Real mode: Saving tab live, Settings' Hardware wallet and chain server groups visible, Exit and Cover groups stay hidden (`features.scheduler`, `features.cover` stay false). Saving Receive states the address cannot be shown on a device. Send and Refill confirm labels name the device; a missing device shows "Connect your <device>" (spec section 4). The `in_flight` line stays hidden until Phase 4.
+Real mode: Saving tab live, Settings' Hardware wallet and chain server groups visible, Exit and Cover groups stay hidden (`features.scheduler`, `features.cover` stay false). Saving Receive states the address cannot be shown on a device. Setup lists "This computer" (software wallet) after hardware devices, with the sentence "Keys stay on this computer. A hardware wallet is safer for large amounts." The Saving empty state reads "Connect a hardware wallet or use this computer". A software account skips "Connect your <device>". Send and Refill confirm labels name the device; a missing device shows "Connect your <device>" (spec section 4). The `in_flight` line stays hidden until Phase 4.
 
 `test-real-ui.sh` builds with `--features fedimix-gtk/testing`, which adds `--test-signer <xprv-file>` and a Software device. The flag does not exist in a normal build.
 
