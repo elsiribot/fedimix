@@ -38,6 +38,10 @@ pub struct Fixture {
     pub spending_history: Vec<HistoryItem>,
     pub queue: Vec<QueueItem>,
     pub waiting_for_saving: bool,
+    /// What `SavingState` says about the wallet and the chain.
+    pub saving_problem: Option<String>,
+    pub wallet_open: bool,
+    pub saving_scanning: bool,
 }
 
 pub fn device() -> DeviceInfo {
@@ -400,6 +404,9 @@ fn funded() -> Fixture {
         spending_history: funded_spending_history(),
         queue: funded_queue(),
         waiting_for_saving: false,
+        saving_problem: None,
+        wallet_open: true,
+        saving_scanning: false,
     }
 }
 
@@ -472,6 +479,9 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
             spending_history: Vec::new(),
             queue: Vec::new(),
             waiting_for_saving: false,
+            saving_problem: None,
+            wallet_open: true,
+            saving_scanning: false,
         },
         DemoScenario::Offline => Fixture {
             federation: Some(federation(false)),
@@ -493,6 +503,33 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
         },
         DemoScenario::ExitDeferred => exit_deferred(),
         DemoScenario::LongNames => long_names(),
+        DemoScenario::SavingScanning => Fixture {
+            device: Some(computer()),
+            in_flight: Amount::ZERO,
+            coins: Vec::new(),
+            saving_history: Vec::new(),
+            saving_scanning: true,
+            ..funded()
+        },
+        DemoScenario::SavingBroken => Fixture {
+            device: Some(DeviceInfo {
+                connected: false,
+                ..device()
+            }),
+            in_flight: Amount::ZERO,
+            coins: Vec::new(),
+            saving_history: Vec::new(),
+            saving_problem: Some(
+                "Fedimix could not read the account from the wallet you chose. Set up Saving again."
+                    .to_string(),
+            ),
+            wallet_open: false,
+            ..fixture(DemoScenario::BelowTarget)
+        },
+        DemoScenario::SavingStalled => Fixture {
+            saving_history: stalled_history(),
+            ..fixture(DemoScenario::BelowTarget)
+        },
         DemoScenario::DeviceDisconnected => Fixture {
             device: Some(DeviceInfo {
                 connected: false,
@@ -502,6 +539,78 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
             ..funded()
         },
     }
+}
+
+/// The software wallet, as Saving's device.
+fn computer() -> DeviceInfo {
+    DeviceInfo {
+        id: SOFTWARE_DEVICE_ID.to_string(),
+        name: SOFTWARE_DEVICE_NAME.to_string(),
+        kind: DeviceKind::Software,
+        connected: true,
+    }
+}
+
+/// Every state a Saving payment can be in that needs words: a stalled send and
+/// refill, a lost send, and two pending sends that share a coin.
+fn stalled_history() -> Vec<HistoryItem> {
+    let sent = || HistoryKind::Sent { change: None };
+    let mut refill = hist(
+        "s-st2",
+        HistoryKind::Refill,
+        0.01,
+        false,
+        HistoryStatus::Stalled,
+        HOUR,
+    );
+    refill.txid = Some(format!("{:064x}", 2));
+    vec![
+        hist(
+            "s-st1",
+            sent(),
+            0.003,
+            false,
+            HistoryStatus::Contested,
+            HOUR / 4,
+        ),
+        hist(
+            "s-st0",
+            sent(),
+            0.0031,
+            false,
+            HistoryStatus::Contested,
+            HOUR / 3,
+        ),
+        refill,
+        hist(
+            "s-st3",
+            sent(),
+            0.02,
+            false,
+            HistoryStatus::Stalled,
+            2 * HOUR,
+        ),
+        hist(
+            "s-st4",
+            sent(),
+            0.015,
+            false,
+            HistoryStatus::Lost {
+                reason: "Not sent: your earlier payment of 0.02 BTC to bc1qdemo0shop confirmed \
+                         instead, as both spent the same coins."
+                    .to_string(),
+            },
+            3 * HOUR,
+        ),
+        hist(
+            "s-h4x",
+            HistoryKind::Received { unmixed: true },
+            0.9534,
+            true,
+            complete(),
+            10 * DAY,
+        ),
+    ]
 }
 
 pub fn suggested() -> Vec<SuggestedFederation> {

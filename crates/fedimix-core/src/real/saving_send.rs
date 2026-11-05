@@ -192,6 +192,26 @@ fn rate_of(estimate: Option<f64>, network: Network) -> Result<FeeRate> {
 
 /// Whether `newer`, sharing a coin with `older`, replaced it in the user's
 /// eyes: a refill replaces anything of its own kind, a send anything.
+/// What the wallet holds, unconfirmed money from others included, that no
+/// send can spend now.
+pub(super) fn held_back_of(
+    wallet: &SavingWallet,
+    labels: &Labels,
+    locked: &HashSet<OutPoint>,
+) -> Amount {
+    let usable = wallet
+        .usable_coins(labels, locked)
+        .iter()
+        .fold(Amount::ZERO, |total, coin| Amount {
+            msat: total.msat.saturating_add(coin.amount.msat),
+        });
+    let holds = wallet
+        .balance()
+        .checked_add(wallet.in_flight())
+        .unwrap_or(Amount { msat: u64::MAX });
+    holds.saturating_sub(usable)
+}
+
 /// Two pending payments of ours that share a coin are alternatives: at most
 /// one of them confirms, so neither may read as a payment of its own.
 fn mark_contested(ledger: &[(SignedTx, Transaction, bool)], items: &mut [HistoryItem]) {
@@ -625,18 +645,9 @@ impl Core {
                 }
             })
             .collect();
-        let usable =
-            wallet
-                .usable_coins(&labels, &plan.locked)
-                .iter()
-                .fold(Amount::ZERO, |total, coin| Amount {
-                    msat: total.msat.saturating_add(coin.amount.msat),
-                });
-        let held_back = wallet.balance().saturating_sub(usable);
+        let held_back = held_back_of(&wallet, &labels, &plan.locked);
         if held_back > Amount::ZERO {
-            notes.push(format!(
-                "{held_back} of your balance cannot be sent yet: it is frozen, still unconfirmed, or tied to a send that has not settled."
-            ));
+            notes.push(held_back_sentence(held_back));
         }
         let paid = built
             .psbt

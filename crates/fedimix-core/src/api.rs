@@ -297,6 +297,22 @@ pub struct SavingState {
     /// The wallet of the stored account opened. `false` with `device` set means
     /// it could not, `problem` says why, and `setup_saving` tries again.
     pub wallet_open: bool,
+    /// The wallet has not finished its first scan of the chain, so `balance`,
+    /// `coins` and `history` are not known yet and no address is handed out.
+    /// `SavingChanged` follows when it ends.
+    pub scanning: bool,
+    /// What Saving holds but cannot send now: frozen, unconfirmed, received
+    /// or change, or tied to a send that has not settled. Say it with
+    /// [`held_back_sentence`].
+    pub held_back: Amount,
+}
+
+/// Why part of Saving cannot be sent: the one wording for the review and for a
+/// refused send.
+pub fn held_back_sentence(held_back: Amount) -> String {
+    format!(
+        "{held_back} in Saving cannot be sent yet: it is frozen, still unconfirmed, or tied to a send that has not settled."
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]

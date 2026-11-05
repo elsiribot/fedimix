@@ -1,0 +1,17 @@
+# scenario: saving-broken
+# The stored wallet cannot open: the problem instead of figures, no Send,
+# Receive or Refill, and "Set up again" offers the stored device alone.
+click Saving
+expect Fedimix could not read the account from the wallet you chose.
+expect —
+expect-not No activity yet
+expect-not 0 BTC
+shot tab
+click Set up again
+expect Connect your Ledger Nano S+ and set up again
+expect-not This computer
+shot setup-again
+close-dialog
+click Spending
+expect of 0.05 target
+expect-not Refill from Saving

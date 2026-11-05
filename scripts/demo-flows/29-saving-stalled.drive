@@ -1,0 +1,22 @@
+# scenario: saving-stalled
+# Saving payments that need words: a contested pair, a stalled refill that
+# waits, a stalled send a new send replaces, and a lost send. Then a refill
+# the device declines ends in an alert, not a toast.
+click Saving
+expect pending, one of two
+expect at most one of them confirms
+expect No server holds this refill now
+expect Refill again once it is 6 blocks deep.
+expect A new send from Saving replaces it
+expect New send (replaces this)
+expect Your earlier payment of 0.02 BTC
+shot history
+scroll-end
+shot history-end
+click Spending
+click Refill from Saving
+expect Refill Spending
+click Confirm on Ledger Nano S+
+expect Refill not finished
+expect The device rejected the transaction
+shot refill-failed

@@ -50,7 +50,7 @@ pub enum RowAction {
 impl RowAction {
     pub fn label(self) -> &'static str {
         match self {
-            Self::SendAgain => "Send again",
+            Self::SendAgain => "New send (replaces this)",
         }
     }
 }
@@ -58,7 +58,14 @@ impl RowAction {
 /// Under a stalled send. A new Saving send replaces it, as the core makes the
 /// next one spend the same coins.
 pub const STALLED_NOTE: &str = "No server holds this payment now, but it may still confirm. \
-Send again to replace it: the new send spends the same coins, so only one of the two can confirm.";
+A new send from Saving replaces it: it spends the same coins, so only one of the two can confirm.";
+
+/// When a refill has gone out; "confirmed" would claim a block it lacks.
+pub const REFILL_SENT: &str = "Refill sent";
+
+/// Under a stalled refill. Waiting gets it through; a send would cancel it.
+pub const STALLED_REFILL_NOTE: &str = "No server holds this refill now, but it may still \
+confirm, and Fedimix keeps offering it. Refill again once it is 6 blocks deep.";
 
 /// Under two pending sends that share a coin.
 pub const CONTESTED_NOTE: &str =
@@ -297,10 +304,6 @@ pub fn in_flight_line(s: &SavingState, features: Features) -> Option<String> {
 pub const SOFTWARE_NOTE: &str =
     "Keys stay on this computer. A hardware wallet is safer for large amounts.";
 
-/// The core leaves Jade out of the listing while a proxy is set; this says why.
-pub const JADE_PROXY: &str =
-    "Jade needs Blockstream's PIN server, which cannot use your proxy. Clear the proxy to use it.";
-
 /// How a device reads in the setup list.
 pub fn setup_subtitle(d: &DeviceInfo) -> &'static str {
     match (d.kind, d.connected) {
@@ -319,13 +322,37 @@ pub fn saving_wallet_heading(device: Option<&DeviceInfo>) -> &'static str {
     }
 }
 
-/// Sentences above the setup list: why a hardware wallet may be missing.
-pub fn setup_notes(listing: &DeviceList, proxy_set: bool) -> Vec<String> {
-    let mut notes: Vec<String> = listing.problem.iter().cloned().collect();
-    if proxy_set {
-        notes.push(JADE_PROXY.to_string());
+/// The sentence above the setup list: why a hardware wallet may be missing,
+/// a Jade left out for the proxy included. The core writes it.
+pub fn setup_note(listing: &DeviceList) -> Option<&str> {
+    listing.problem.as_deref()
+}
+
+/// The devices a setup offers. "Set up again" only retries the stored
+/// account, so it offers that device alone: a hardware wallet of its kind, or
+/// this computer.
+pub fn setup_choices(devices: &[DeviceInfo], stored: Option<&DeviceInfo>) -> Vec<DeviceInfo> {
+    devices
+        .iter()
+        .filter(|d| stored.is_none_or(|s| s.kind == d.kind))
+        .cloned()
+        .collect()
+}
+
+/// The setup dialog's title: "Set up again" names the device it needs.
+pub fn setup_title(stored: Option<&DeviceInfo>) -> String {
+    match stored {
+        Some(d) if d.kind == DeviceKind::Software => "Set up Saving on this computer again".into(),
+        Some(d) => format!("Connect your {} and set up again", d.name),
+        None => "Set up Saving".into(),
     }
-    notes
+}
+
+/// Whether the Saving tab's figures are Saving's: the wallet opened and has
+/// finished its first scan. Until then the tab shows no balance or history,
+/// as none is known.
+pub fn saving_figures_known(s: &SavingState) -> bool {
+    s.wallet_open && !s.scanning
 }
 
 /// Whether the Spending tab offers a refill: there is a Saving with something
@@ -334,6 +361,7 @@ pub fn setup_notes(listing: &DeviceList, proxy_set: bool) -> Vec<String> {
 pub fn refill_offered(spending: &SpendingState, saving: &SavingState) -> bool {
     spending.features.saving
         && saving.device.is_some()
+        && saving_figures_known(saving)
         && saving.balance > Amount::ZERO
         && spending.for_spending < spending.target
 }
@@ -371,8 +399,14 @@ impl SavingFix {
     }
 }
 
-/// A problem first, as waiting will not cure it; plain offline otherwise, with
-/// the numbers as last known.
+pub const SCANNING_BANNER: &str = "Scanning Saving's history\u{2026}";
+
+/// In Saving's Receive while the first scan runs; the address follows.
+pub const SCANNING_RECEIVE: &str =
+    "Fedimix is scanning Saving's history. The address appears when the scan ends.";
+
+/// A problem first, as waiting will not cure it; then the first scan, which
+/// waiting does; plain offline otherwise, with the numbers as last known.
 pub fn saving_banner_view(s: &SavingState) -> Option<SavingBanner> {
     s.device.as_ref()?;
     match &s.problem {
@@ -383,6 +417,10 @@ pub fn saving_banner_view(s: &SavingState) -> Option<SavingBanner> {
             } else {
                 SavingFix::SetUpAgain
             }),
+        }),
+        None if s.scanning => Some(SavingBanner {
+            text: SCANNING_BANNER.to_string(),
+            button: None,
         }),
         None if !s.chain_online => Some(SavingBanner {
             text: "Offline \u{b7} last known balance".to_string(),
@@ -435,7 +473,7 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
                 } else {
                     "small change"
                 };
-                format!("\u{21ba} {label} {DOT} {}", format::btc_short(c.amount))
+                format!("\u{21ba} {label} {}", format::btc_short(c.amount))
             });
             ("\u{2197}", "Sent", None, nested)
         }
@@ -460,7 +498,11 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         ),
     };
     let note = match &item.status {
-        HistoryStatus::Lost { reason } => Some(reason.clone()),
+        // The trailing text already says "not sent".
+        HistoryStatus::Lost { reason } => Some(without_not_sent(reason)),
+        HistoryStatus::Stalled if item.kind == HistoryKind::Refill => {
+            Some(STALLED_REFILL_NOTE.to_string())
+        }
         HistoryStatus::Stalled => Some(STALLED_NOTE.to_string()),
         HistoryStatus::Contested => Some(CONTESTED_NOTE.to_string()),
         _ => None,
@@ -477,7 +519,8 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         HistoryStatus::Pending => "pending".to_string(),
         HistoryStatus::Failed => "failed".to_string(),
         HistoryStatus::Refunded => "refunded".to_string(),
-        HistoryStatus::Stalled => "not confirmed, may still go through".to_string(),
+        // The row's note says it may still confirm.
+        HistoryStatus::Stalled => "not confirmed".to_string(),
         HistoryStatus::Lost { .. } => "not sent".to_string(),
         HistoryStatus::Contested => "pending, one of two".to_string(),
         HistoryStatus::Expired => "expired".to_string(),
@@ -493,6 +536,17 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         detail: history_detail(item),
         action,
     }
+}
+
+/// "Not sent: your refill…" as "Your refill…".
+fn without_not_sent(reason: &str) -> String {
+    let Some(rest) = reason.strip_prefix("Not sent: ") else {
+        return reason.to_string();
+    };
+    let mut chars = rest.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// Only a finished row has a fee that was paid.
@@ -594,7 +648,7 @@ fn sentence_or(lead: &str, why: &str) -> String {
 pub fn send_error(
     e: &fedimix_core::FedimixError,
     wallet: WalletKind,
-    balance: Option<Amount>,
+    held_back: Option<Amount>,
 ) -> String {
     if let fedimix_core::FedimixError::InsufficientFunds { available, needed } = e
         && wallet == WalletKind::Saving
@@ -602,12 +656,10 @@ pub fn send_error(
         let base = format!(
             "Not enough funds: {available} can be sent now, {needed} needed including the fee."
         );
-        return match balance {
-            Some(balance) if balance > *available => format!(
-                "{base} Of the {balance} in Saving, coins you froze and coins held by a payment \
-                 that has not confirmed cannot be sent."
-            ),
-            _ => base,
+        // The core's own wording and amount, as in the review's note.
+        return match held_back.filter(|held| *held > Amount::ZERO) {
+            Some(held) => format!("{base} {}", fedimix_core::held_back_sentence(held)),
+            None => base,
         };
     }
     user_message(e)
@@ -737,13 +789,14 @@ pub fn change_text(change: &fedimix_core::ChangeDestination) -> Option<String> {
     use fedimix_core::ChangeDestination as C;
     match change {
         C::None => None,
+        // Exact, as the amount and the total on the same review are.
         C::Spending { amount } => Some(format!(
             "Change \u{2192} Spending ({})",
-            format::btc(*amount)
+            format::btc_exact(*amount)
         )),
         C::SmallChange { amount } => Some(format!(
             "Stays in Saving as small change ({})",
-            format::btc(*amount)
+            format::btc_exact(*amount)
         )),
     }
 }
@@ -1242,6 +1295,8 @@ mod tests {
             chain_online: true,
             problem: None,
             wallet_open: true,
+            scanning: false,
+            held_back: Amount::ZERO,
         }
     }
 
@@ -1289,12 +1344,66 @@ mod tests {
             problem: Some("Fedimix cannot look for USB devices.".into()),
         };
         assert_eq!(
-            setup_notes(&listing, false),
-            ["Fedimix cannot look for USB devices."]
+            setup_note(&listing),
+            Some("Fedimix cannot look for USB devices.")
         );
-        let notes = setup_notes(&listing, true);
-        assert_eq!(notes.len(), 2);
-        assert!(notes[1].starts_with("Jade needs Blockstream's PIN server"));
+    }
+
+    /// "Set up again" retries only the stored account, so it offers only its
+    /// device and names it.
+    #[test]
+    fn setting_up_again_offers_only_the_stored_device() {
+        let ledger = device_of(DeviceKind::Ledger, true);
+        let computer = device_of(DeviceKind::Software, true);
+        let listed = [ledger.clone(), computer.clone()];
+        assert_eq!(setup_choices(&listed, None), listed);
+        assert_eq!(
+            setup_choices(&listed, Some(&ledger)),
+            std::slice::from_ref(&ledger)
+        );
+        assert_eq!(
+            setup_choices(&listed, Some(&computer)),
+            std::slice::from_ref(&computer)
+        );
+        assert_eq!(setup_title(None), "Set up Saving");
+        assert_eq!(
+            setup_title(Some(&ledger)),
+            "Connect your Ledger Nano S+ and set up again"
+        );
+        assert_eq!(
+            setup_title(Some(&computer)),
+            "Set up Saving on this computer again"
+        );
+    }
+
+    /// I1, I5: no balance is shown that is not Saving's, and no refill offered.
+    #[test]
+    fn a_scanning_or_unopened_wallet_shows_no_figures() {
+        let computer = || Some(device_of(DeviceKind::Software, true));
+        let ready = saving_with(computer(), btc(0.2));
+        assert!(saving_figures_known(&ready));
+        let scanning = SavingState {
+            scanning: true,
+            chain_online: false,
+            ..ready.clone()
+        };
+        assert!(!saving_figures_known(&scanning));
+        assert_eq!(
+            saving_banner_view(&scanning),
+            Some(SavingBanner {
+                text: "Scanning Saving's history\u{2026}".into(),
+                button: None,
+            })
+        );
+        let broken = SavingState {
+            wallet_open: false,
+            ..ready.clone()
+        };
+        assert!(!saving_figures_known(&broken));
+        let below = spending(0.01, 0.0, 0.05, true);
+        assert!(refill_offered(&below, &ready));
+        assert!(!refill_offered(&below, &scanning));
+        assert!(!refill_offered(&below, &broken));
     }
 
     #[test]
@@ -1358,18 +1467,24 @@ mod tests {
             0,
         );
         assert_eq!(lost.trailing, "not sent");
+        // "Not sent" once, in the trailing text.
         assert_eq!(
             lost.note.as_deref(),
-            Some("Not sent: your refill of 0.01 BTC confirmed instead.")
+            Some("Your refill of 0.01 BTC confirmed instead.")
         );
         assert_eq!(lost.action, None);
         let stalled = history_row(&hist(sent.clone(), false, HistoryStatus::Stalled), 0);
         assert_eq!(stalled.note.as_deref(), Some(STALLED_NOTE));
         assert_eq!(stalled.action, Some(RowAction::SendAgain));
-        assert_eq!(RowAction::SendAgain.label(), "Send again");
-        // A stalled refill is not sent again from the Send form.
+        assert_eq!(RowAction::SendAgain.label(), "New send (replaces this)");
+        // A stalled refill waits: no send, and no advice to make one.
         let refill = history_row(&hist(HistoryKind::Refill, false, HistoryStatus::Stalled), 0);
         assert_eq!(refill.action, None);
+        assert_eq!(refill.note.as_deref(), Some(STALLED_REFILL_NOTE));
+        assert!(
+            !STALLED_REFILL_NOTE.contains("send"),
+            "{STALLED_REFILL_NOTE}"
+        );
         let contested = history_row(&hist(sent, false, HistoryStatus::Contested), 0);
         assert_eq!(contested.trailing, "pending, one of two");
         assert!(
@@ -1389,16 +1504,18 @@ mod tests {
             available: btc(0.01),
             needed: btc(0.02),
         };
-        let text = send_error(&short, WalletKind::Saving, Some(btc(0.05)));
-        assert!(
-            text.starts_with(
-                "Not enough funds: 0.01 BTC can be sent now, 0.02 BTC needed including the fee."
-            ),
-            "{text}"
+        // Unconfirmed coins received are held back too: the core's sentence.
+        let text = send_error(&short, WalletKind::Saving, Some(btc(0.04)));
+        assert_eq!(
+            text,
+            format!(
+                "Not enough funds: 0.01 BTC can be sent now, 0.02 BTC needed including the fee. {}",
+                fedimix_core::held_back_sentence(btc(0.04))
+            )
         );
-        assert!(text.contains("Of the 0.05 BTC in Saving"), "{text}");
-        let all = send_error(&short, WalletKind::Saving, Some(btc(0.01)));
-        assert!(!all.contains("Of the"), "{all}");
+        assert!(text.contains("still unconfirmed"), "{text}");
+        let all = send_error(&short, WalletKind::Saving, Some(Amount::ZERO));
+        assert!(!all.contains("cannot be sent yet"), "{all}");
         assert_eq!(
             send_error(&short, WalletKind::Spending, Some(btc(0.05))),
             user_message(&short)
@@ -1420,6 +1537,8 @@ mod tests {
             chain_online: true,
             problem: None,
             wallet_open: true,
+            scanning: false,
+            held_back: Amount::ZERO,
         };
         assert_eq!(
             in_flight_line(&s, Features::ALL),
@@ -1556,10 +1675,7 @@ mod tests {
         assert_eq!(trailing(HistoryStatus::Pending), "pending");
         assert_eq!(trailing(HistoryStatus::Failed), "failed");
         assert_eq!(trailing(HistoryStatus::Refunded), "refunded");
-        assert_eq!(
-            trailing(HistoryStatus::Stalled),
-            "not confirmed, may still go through"
-        );
+        assert_eq!(trailing(HistoryStatus::Stalled), "not confirmed");
         assert_eq!(trailing(HistoryStatus::Expired), "expired");
     }
 
@@ -1973,7 +2089,7 @@ mod tests {
         assert_eq!(change_text(&C::None), None);
         assert_eq!(
             change_text(&C::Spending { amount: btc(0.1) }).unwrap(),
-            "Change \u{2192} Spending (0.1000 BTC)"
+            "Change \u{2192} Spending (0.10000000 BTC)"
         );
         assert!(
             change_text(&C::SmallChange { amount: sat(5000) })

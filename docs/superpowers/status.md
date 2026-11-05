@@ -13,14 +13,14 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## Not verified
 - Mainnet and signet: every real run was regtest.
 - A Spending on-chain receive or send through the UI (covered below the UI by `devimint.rs`); a real recovery on screen. Saving's on-chain path is covered on regtest only.
-- Real pointer and keyboard input, dark theme, accessibility, a real desktop (sway only), hardware; Task 8 screens read at 800 px (real) and 480 px (demo), not 360 px; the clipboard against another Wayland client or a clipboard manager.
+- Real pointer and keyboard input, dark theme, accessibility, a real desktop (sway only), hardware; Task 8 screens read at 800 px (real) and 480 px (demo, flows 26-29), not 360 px; the clipboard against another Wayland client or a clipboard manager.
 - Guardians gone for good: `a_stopped_federation_leaves_the_wallet_readable` stops them with SIGSTOP and brings them back.
 - A hung backend at shutdown (30 s cap) in the UI; `NON_UNIQUE` launcher behavior on a desktop.
 - That no Electrum traffic follows a proxy change beyond the one request in flight (at most 10 scripts, its answer read up to 30 s; `decisions.md`, Task 5 fix I1): tested against a stub server, not through a proxy. A Jade PIN step already under way cannot be stopped.
 - A send against real hardware or a public server; a dropped send is exercised with fakes only. Details: `decisions.md`.
 
 ## Next
-Phase 3 Tasks 1-8 done (details in `decisions.md`). Task 8 put Saving on screen in the real app: setup with hardware wallets then "This computer", the problem banner with its fix, Receive, Send with change and notes, Refill and its refusals, stalled/lost/contested history rows; Exit and Cover stay hidden, as does the `in_flight` line. Next: Task 9 (close out). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
+Phase 3 Tasks 1-8 done (details in `decisions.md`). Task 8 put Saving on screen in the real app: setup with hardware wallets then "This computer", the first scan and an unopened wallet shown as such (no stand-in balance; Receive waits for the scan), Receive, Send with change and notes, Refill ("Refill sent", failures and refusals in alerts), stalled/lost/contested history rows; Exit and Cover stay hidden, as does the `in_flight` line. Next: Task 9 (close out). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.

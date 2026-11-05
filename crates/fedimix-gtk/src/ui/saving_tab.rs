@@ -23,6 +23,9 @@ struct Inner {
     device_label: gtk::Label,
     balance: widgets::AmountButton,
     in_flight: gtk::Button,
+    send: gtk::Button,
+    receive: gtk::Button,
+    heading: gtk::Label,
     history: HistoryList,
     /// Last state rendered, to skip identical rebuilds.
     last: RefCell<Option<(SavingState, Features)>>,
@@ -66,7 +69,8 @@ impl SavingTab {
         hero.append(&device_row);
         hero.append(balance.widget());
         hero.append(&in_flight);
-        hero.append(&widgets::send_receive_row(&ctx, WalletKind::Saving));
+        let (actions, send, receive) = widgets::send_receive_buttons(&ctx, WalletKind::Saving);
+        hero.append(&actions);
 
         let heading = gtk::Label::builder().label("History").xalign(0.0).build();
         heading.add_css_class("heading");
@@ -138,6 +142,9 @@ impl SavingTab {
             device_label,
             balance,
             in_flight,
+            send,
+            receive,
+            heading,
             history,
             last: RefCell::new(None),
         });
@@ -146,7 +153,11 @@ impl SavingTab {
             let ctx = ctx.clone();
             let weak = weak.clone();
             move |_| match weak.upgrade().and_then(|inner| inner.fix.get()) {
-                Some(present::SavingFix::SetUpAgain) => setup_saving::open(&ctx),
+                Some(present::SavingFix::SetUpAgain) => {
+                    if let Some(device) = ctx.latest().and_then(|s| s.saving.device) {
+                        setup_saving::open_again(&ctx, device);
+                    }
+                }
                 Some(present::SavingFix::Settings) => settings_page::push(&ctx),
                 None => {}
             }
@@ -206,7 +217,21 @@ impl Inner {
                 self.device_icon
                     .set_icon_name(Some(present::device_icon(device)));
                 self.device_label.set_label(&present::device_line(device));
-                self.balance.set_amount(&crate::format::btc(saving.balance));
+                // Until the wallet opens and has scanned, Saving's figures are
+                // not known: the banner says why, and no number stands in.
+                let known = present::saving_figures_known(saving);
+                self.balance.set_amount(&if known {
+                    crate::format::btc(saving.balance)
+                } else {
+                    "\u{2014}".to_string()
+                });
+                self.balance.widget().set_sensitive(known);
+                self.send.set_sensitive(known);
+                // Receive waits out a scan by itself; an unopened wallet has
+                // no addresses to give.
+                self.receive.set_sensitive(saving.wallet_open);
+                self.heading.set_visible(known);
+                self.history.widget().set_visible(known);
                 match present::in_flight_line(saving, s.spending.features) {
                     Some(line) => {
                         self.in_flight.set_label(&line);

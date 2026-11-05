@@ -32,7 +32,13 @@ pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
 }
 
 fn refused(ctx: &Rc<AppContext>, sentence: &str) {
-    let dialog = adw::AlertDialog::new(Some("No refill now"), Some(sentence));
+    alert(ctx, "No refill now", sentence);
+}
+
+/// The core's sentences say what happened and what to do, and some are long
+/// ("Do not pay it again…"): a dialog shows them whole, as a toast would not.
+fn alert(ctx: &Rc<AppContext>, title: &str, sentence: &str) {
+    let dialog = adw::AlertDialog::new(Some(title), Some(sentence));
     dialog.add_response("close", "Close");
     dialog.present(Some(&ctx.nav));
 }
@@ -185,16 +191,18 @@ fn confirm(ctx: &Rc<AppContext>, preview_id: String) {
             let id = match res {
                 Ok(id) => id,
                 Err(e) => {
-                    ctx.toast(&present::user_message(&e));
+                    refused(&ctx, &present::user_message(&e));
                     return;
                 }
             };
             ctx.toast("Refill started");
             let done = ctx.clone();
             ctx.watch_operation(id, move |state| match state {
-                OperationState::Done => done.toast_now("Refill confirmed"),
+                // Done is the broadcast; the history row shows it pending
+                // until it confirms.
+                OperationState::Done => done.toast_now(present::REFILL_SENT),
                 OperationState::Failed { error } => {
-                    done.toast_now(&present::user_message(error));
+                    alert(&done, "Refill not finished", &present::user_message(error));
                 }
                 OperationState::Cancelled => done.toast_now("Refill cancelled"),
                 _ => {}

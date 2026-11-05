@@ -257,6 +257,37 @@ fn load_address(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
     );
 }
 
+/// Saving hands out no address until its first scan has ended: say so, and
+/// load the address once a snapshot says the scan is over. A problem, which
+/// waiting does not cure, is the core's to say, so that loads at once.
+fn load_when_scanned(ctx: &Rc<AppContext>, view: &PayloadView) {
+    let waiting = Rc::new(Cell::new(false));
+    let weak = view.downgrade();
+    ctx.on_snapshots({
+        let ctx = ctx.clone();
+        let waiting = waiting.clone();
+        move |s| {
+            // The dialog is gone.
+            let Some(view) = weak.upgrade() else {
+                return false;
+            };
+            if s.saving.scanning && s.saving.problem.is_none() {
+                if !waiting.replace(true) {
+                    view.clear();
+                    view.set_loading(true);
+                    view.show_status(present::SCANNING_RECEIVE);
+                }
+            } else if waiting.replace(false) {
+                load_address(&ctx, WalletKind::Saving, &view);
+            }
+            true
+        }
+    });
+    if !waiting.get() {
+        load_address(ctx, WalletKind::Saving, view);
+    }
+}
+
 /// Retry reloads the address after a failure.
 fn connect_retry(ctx: &Rc<AppContext>, wallet: WalletKind, view: &PayloadView) {
     // The retry button is part of `view`: hold the view weakly.
@@ -436,7 +467,7 @@ pub fn open(ctx: &Rc<AppContext>, wallet: WalletKind) {
                 body.append(&unverified);
             }
             toolbar.set_content(Some(&scrolled(&body)));
-            load_address(ctx, wallet, &view);
+            load_when_scanned(ctx, &view);
         }
     }
     connect_retry(ctx, wallet, &view);

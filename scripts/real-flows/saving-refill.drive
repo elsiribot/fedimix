@@ -2,8 +2,7 @@
 # this computer, and Spending reaches the target.
 expect-slow This computer
 click Receive
-# A scan may still run: Retry, as a user would.
-retry-until 120 bcrt1
+expect-within 120 bcrt1
 save-text bcrt1 saving-address-2.txt
 # The script pays 0.005 BTC to it and mines.
 shot address
@@ -27,7 +26,7 @@ expect from Saving · fee
 shot dialog
 click Confirm on This computer
 expect Refill started
-expect-slow Refill confirmed
+expect-slow Refill sent
 click Saving
 expect Refill → Spending
 shot refilled

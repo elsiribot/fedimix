@@ -87,6 +87,13 @@ pub enum DemoScenario {
     LongHistory,
     /// Without Saving, its data being rebuilt from the federation.
     Recovering,
+    /// Saving on this computer, before its first scan has ended.
+    SavingScanning,
+    /// Below target, Saving's stored wallet failing to open.
+    SavingBroken,
+    /// Below target, with stalled, lost and contested Saving payments, and a
+    /// device that refuses to sign.
+    SavingStalled,
 }
 
 /// How fast the demo moves.
@@ -142,8 +149,11 @@ impl FromStr for DemoScenario {
             "preview-expiry" => Ok(Self::PreviewExpiry),
             "device-rejects" => Ok(Self::DeviceRejects),
             "recovering" => Ok(Self::Recovering),
+            "saving-scanning" => Ok(Self::SavingScanning),
+            "saving-broken" => Ok(Self::SavingBroken),
+            "saving-stalled" => Ok(Self::SavingStalled),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, confirm-fails, long-history, recovering)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, confirm-fails, long-history, recovering, saving-scanning, saving-broken, saving-stalled)"
             )),
         }
     }
@@ -172,6 +182,9 @@ struct State {
     spending_history: Vec<HistoryItem>,
     queue: Vec<QueueItem>,
     waiting_for_saving: bool,
+    saving_problem: Option<String>,
+    wallet_open: bool,
+    saving_scanning: bool,
     settings: Settings,
     sends: Previews<SendPreview>,
     refills: Previews<RefillPreview>,
@@ -398,6 +411,9 @@ impl State {
             spending_history: f.spending_history,
             queue: f.queue,
             waiting_for_saving: f.waiting_for_saving,
+            saving_problem: f.saving_problem,
+            wallet_open: f.wallet_open,
+            saving_scanning: f.saving_scanning,
             // The demo has no seed to back up, so it never prompts.
             settings: Settings {
                 recovery_words_shown: true,
@@ -767,7 +783,10 @@ impl DemoBackend {
             state: Arc::new(Mutex::new(State::new(scenario))),
             senders: Arc::new(StdMutex::new(Vec::new())),
             timing,
-            rejects: scenario == DemoScenario::DeviceRejects,
+            rejects: matches!(
+                scenario,
+                DemoScenario::DeviceRejects | DemoScenario::SavingStalled
+            ),
         })
     }
 
@@ -859,9 +878,11 @@ impl Backend for DemoBackend {
             in_flight: st.in_flight,
             coins: st.coins.clone(),
             history: newest(&st.saving_history),
-            chain_online: true,
-            problem: None,
-            wallet_open: true,
+            chain_online: !st.saving_scanning,
+            problem: st.saving_problem.clone(),
+            wallet_open: st.wallet_open,
+            scanning: st.saving_scanning,
+            held_back: Amount::ZERO,
         })
     }
 
@@ -1355,7 +1376,7 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 14] = [
+    const ALL: [DemoScenario; 17] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
@@ -1370,6 +1391,9 @@ mod tests {
         DemoScenario::ConfirmFails,
         DemoScenario::LongHistory,
         DemoScenario::Recovering,
+        DemoScenario::SavingScanning,
+        DemoScenario::SavingBroken,
+        DemoScenario::SavingStalled,
     ];
 
     fn btc(v: f64) -> Amount {

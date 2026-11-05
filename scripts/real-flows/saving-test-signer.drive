@@ -18,10 +18,11 @@ shot setup
 click Set up
 expect-slow Saving is set up
 expect Test Ledger
-expect-gone-within 120 Offline
-shot scanned
+expect-not Offline
+shot scanning
 click Receive
-retry-until 120 bcrt1
+expect-within 120 bcrt1
+expect-not Could not get an address
 expect Your device cannot display this address.
 save-text bcrt1 ledger-address.txt
 # The script pays 0.004 BTC to it and mines.

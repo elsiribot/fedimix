@@ -79,6 +79,14 @@ pub fn hero_box() -> gtk::Box {
 
 /// Centered `Send` / `Receive` pill buttons for `wallet`.
 pub fn send_receive_row(ctx: &Rc<AppContext>, wallet: WalletKind) -> gtk::Box {
+    send_receive_buttons(ctx, wallet).0
+}
+
+/// [`send_receive_row`], with its Send and Receive buttons.
+pub fn send_receive_buttons(
+    ctx: &Rc<AppContext>,
+    wallet: WalletKind,
+) -> (gtk::Box, gtk::Button, gtk::Button) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
@@ -100,7 +108,7 @@ pub fn send_receive_row(ctx: &Rc<AppContext>, wallet: WalletKind) -> gtk::Box {
     });
     row.append(&send);
     row.append(&receive);
-    row
+    (row, send, receive)
 }
 
 /// Current Unix time in seconds.

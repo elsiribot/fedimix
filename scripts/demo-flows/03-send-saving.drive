@@ -22,5 +22,5 @@ expect Broadcasting
 expect Payment sent
 # Only true after the send: no fixture row has -0.0123 or this change.
 expect −0.0123
-expect change → Spending · 0.941
+expect change → Spending 0.941
 shot sent

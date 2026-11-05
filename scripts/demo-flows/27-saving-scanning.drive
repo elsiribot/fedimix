@@ -1,0 +1,13 @@
+# scenario: saving-scanning
+# Saving on this computer before its first scan ends: the tab says it is
+# scanning, shows no balance as if known, and Receive waits for the scan.
+click Saving
+expect Scanning Saving's history…
+expect-not Offline
+expect —
+expect-not No activity yet
+shot tab
+click Receive
+expect Fedimix is scanning Saving's history. The address appears when the scan ends.
+expect-not Could not get an address
+shot receive

@@ -217,8 +217,8 @@ fn build(
                                 nav.push(&review_page(&ctx, &dialog, &nav, &error, preview));
                             }
                             Err(e) => {
-                                let balance = ctx.latest().map(|s| s.saving.balance);
-                                let text = present::send_error(&e, wallet, balance);
+                                let held_back = ctx.latest().map(|s| s.saving.held_back);
+                                let text = present::send_error(&e, wallet, held_back);
                                 set_error(&error, Some(&text));
                             }
                         }

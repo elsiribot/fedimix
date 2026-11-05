@@ -13,12 +13,13 @@ expect-slow Saving is set up
 expect This computer
 # The software wallet is always there: nothing asks to connect it.
 expect-not Connect your
-# The first scan reaches the chain server.
-expect-gone-within 120 Offline
-shot scanned
+# Right after setup the first scan runs: the tab says so, not Offline.
+expect-not Offline
+shot scanning
 click Receive
-# Right after setup the first scan may still run: Retry, as a user would.
-retry-until 120 bcrt1
+# The address appears once the scan ends, with no Retry pressed.
+expect-within 120 bcrt1
+expect-not Could not get an address
 expect Coins received this way are marked unmixed
 expect-not Your device cannot display this address
 save-text bcrt1 saving-address.txt

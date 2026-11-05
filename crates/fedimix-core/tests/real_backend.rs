@@ -3596,6 +3596,62 @@ async fn receive_waits_for_the_first_scan() {
     backend.shutdown().await.unwrap();
 }
 
+/// I1: the state says a first scan is running, so a front end can say so and
+/// not show a balance as known; it ends with the scan.
+#[tokio::test]
+async fn saving_state_says_while_the_first_scan_runs() {
+    let saving = SavingHarness::new();
+    let backend = saving.with_server().await;
+    assert!(
+        !backend.saving_state().await.unwrap().scanning,
+        "not set up"
+    );
+    saving.chain.set_stalled(true);
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    let state = backend.saving_state().await.unwrap();
+    assert!(state.scanning && state.wallet_open && !state.chain_online);
+    assert_eq!(state.problem, None);
+    saving.chain.set_stalled(false);
+    wait_chain(&*backend, true).await;
+    assert!(!backend.saving_state().await.unwrap().scanning);
+    backend.shutdown().await.unwrap();
+}
+
+/// I2: what cannot be sent counts coins received and not yet confirmed, as
+/// the balance leaves them out, and the review's note says the same.
+#[tokio::test]
+async fn held_back_counts_unconfirmed_coins_received() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    assert_eq!(
+        backend.saving_state().await.unwrap().held_back,
+        Amount::ZERO
+    );
+    let info = backend.receive(on_chain()).await.unwrap();
+    let tx = payment(&info.payload, 40_000, 7);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    saving.chain.push_sync(in_mempool(tx, now, 2));
+    wait_until("the unconfirmed coin held back", || async {
+        sync_saving_now(&backend);
+        backend.saving_state().await.unwrap().held_back == sat(40_000)
+    })
+    .await;
+    let preview = backend.prepare_send(saving_sat(1_000)).await.unwrap();
+    assert!(
+        preview
+            .notes
+            .contains(&fedimix_core::held_back_sentence(sat(40_000))),
+        "{:?}",
+        preview.notes
+    );
+    backend.shutdown().await.unwrap();
+}
+
 /// Nothing is scanning, so "still scanning" would be untrue.
 #[tokio::test]
 async fn receive_says_why_no_scan_can_finish() {
@@ -3908,8 +3964,10 @@ async fn jade_is_not_offered_through_a_proxy() {
     let kinds = |found: Vec<fedimix_core::DeviceInfo>| {
         found.into_iter().map(|d| d.kind).collect::<Vec<_>>()
     };
+    let listing = backend.detect_devices().await.unwrap();
+    assert_eq!(listing.problem, None);
     assert_eq!(
-        kinds(backend.detect_devices().await.unwrap().devices),
+        kinds(listing.devices),
         [DeviceKind::Ledger, DeviceKind::Jade, DeviceKind::Software]
     );
     backend
@@ -3919,11 +3977,14 @@ async fn jade_is_not_offered_through_a_proxy() {
         })
         .await
         .unwrap();
+    let listing = backend.detect_devices().await.unwrap();
     assert_eq!(
-        kinds(backend.detect_devices().await.unwrap().devices),
+        kinds(listing.devices),
         [DeviceKind::Ledger, DeviceKind::Software],
         "the software wallet sends nothing over the network"
     );
+    // The Jade left out is said, so the person knows why it is missing.
+    assert_eq!(listing.problem.as_deref(), Some(JADE_PROXY));
     assert_eq!(
         backend.setup_saving("jade:port".into()).await,
         Err(FedimixError::NotSetUp(JADE_PROXY.into()))
@@ -4713,7 +4774,7 @@ async fn the_preview_explains_a_balance_above_spendable() {
     assert_eq!(
         preview.notes,
         [
-            "60000 sat of your balance cannot be sent yet: it is frozen, still unconfirmed, or tied to a send that has not settled."
+            "60000 sat in Saving cannot be sent yet: it is frozen, still unconfirmed, or tied to a send that has not settled."
         ]
     );
     backend.shutdown().await.unwrap();

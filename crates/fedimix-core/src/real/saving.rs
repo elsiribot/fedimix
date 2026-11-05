@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use super::saving_send::SavingOp;
+use super::saving_send::{SavingOp, held_back_of};
 use super::{ChainFactory, Core, DB_FILE, Gate, SHUTTING_DOWN, held, problem_of};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
@@ -195,9 +195,12 @@ impl Core {
             chain_online,
             problem,
             wallet_open: wallet.is_some(),
+            scanning: wallet.as_ref().is_some_and(|w| !w.first_scan_done()),
+            held_back: Amount::ZERO,
         };
         if let Some(wallet) = wallet {
             let labels = Labels::load(&self.store())?;
+            state.held_back = held_back_of(&wallet, &labels, &self.locked_outpoints()?);
             let snapshot = wallet.snapshot(&labels);
             state.balance = snapshot.balance;
             state.in_flight = snapshot.in_flight;
@@ -266,19 +269,35 @@ impl Core {
     /// to Blockstream outside any proxy. Doubles as the poll behind
     /// `SavingState::device`.
     pub(super) async fn poll_devices(&self) -> (Vec<DeviceInfo>, Option<FedimixError>) {
-        let (mut found, problem) = self.devices.list().await;
-        if self.chain.borrow().proxy.is_some() {
-            found.retain(|device| device.kind != DeviceKind::Jade);
-        }
-        self.note_devices(&found);
+        let (found, problem, _) = self.poll_devices_noting_jade().await;
         (found, problem)
     }
 
+    /// [`Self::poll_devices`], and whether a Jade was left out for the proxy.
+    async fn poll_devices_noting_jade(&self) -> (Vec<DeviceInfo>, Option<FedimixError>, bool) {
+        let (mut found, problem) = self.devices.list().await;
+        let listed = found.len();
+        if self.chain.borrow().proxy.is_some() {
+            found.retain(|device| device.kind != DeviceKind::Jade);
+        }
+        let jade_hidden = found.len() != listed;
+        self.note_devices(&found);
+        (found, problem, jade_hidden)
+    }
+
+    /// A Jade left out for the proxy is said in `problem`, so the person knows
+    /// why the one they plugged in is missing.
     pub(super) async fn detect_devices(&self) -> Result<DeviceList> {
-        let (devices, problem) = self.poll_devices().await;
+        let (devices, problem, jade_hidden) = self.poll_devices_noting_jade().await;
+        let sentences: Vec<String> = problem
+            .as_ref()
+            .and_then(problem_of)
+            .into_iter()
+            .chain(jade_hidden.then(|| JADE_PROXY.to_string()))
+            .collect();
         Ok(DeviceList {
             devices,
-            problem: problem.as_ref().and_then(problem_of),
+            problem: (!sentences.is_empty()).then(|| sentences.join(" ")),
         })
     }
 

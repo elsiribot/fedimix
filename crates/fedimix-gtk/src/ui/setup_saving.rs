@@ -10,6 +10,17 @@ use crate::present;
 use crate::ui::app_state::AppContext;
 
 pub fn open(ctx: &Rc<AppContext>) {
+    open_for(ctx, None);
+}
+
+/// "Set up again" for the stored account, whose wallet did not open: only its
+/// device can succeed, so only its device is offered, by name.
+pub fn open_again(ctx: &Rc<AppContext>, stored: DeviceInfo) {
+    open_for(ctx, Some(stored));
+}
+
+fn open_for(ctx: &Rc<AppContext>, stored: Option<DeviceInfo>) {
+    let title = present::setup_title(stored.as_ref());
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .valign(gtk::Align::Start)
@@ -49,9 +60,13 @@ pub fn open(ctx: &Rc<AppContext>) {
     let retry = gtk::Button::with_label("Retry");
     retry.add_css_class("pill");
     retry.set_halign(gtk::Align::Center);
+    let empty_title = match &stored {
+        Some(device) => format!("Connect your {} and unlock it", device.name),
+        None => "Connect your device and unlock it".to_string(),
+    };
     let empty = adw::StatusPage::builder()
         .icon_name("media-removable-symbolic")
-        .title("Connect your device and unlock it")
+        .title(empty_title)
         .child(&retry)
         .vexpand(true)
         .build();
@@ -65,7 +80,7 @@ pub fn open(ctx: &Rc<AppContext>) {
     toolbar.add_top_bar(&adw::HeaderBar::new());
     toolbar.set_content(Some(&pages));
     let dialog = adw::Dialog::builder()
-        .title("Set up Saving")
+        .title(title)
         .content_width(420)
         .child(&toolbar)
         .build();
@@ -76,6 +91,7 @@ pub fn open(ctx: &Rc<AppContext>) {
         dialog: dialog.downgrade(),
         error: error.downgrade(),
         notes: notes.downgrade(),
+        stored,
     };
     retry.connect_clicked({
         let ctx = ctx.clone();
@@ -94,26 +110,24 @@ struct View {
     dialog: glib::WeakRef<adw::Dialog>,
     error: glib::WeakRef<gtk::Label>,
     notes: glib::WeakRef<gtk::Label>,
+    /// Set for "Set up again": the stored account's device.
+    stored: Option<DeviceInfo>,
 }
 
 fn scan(ctx: &Rc<AppContext>, view: &View) {
     let core = ctx.bridge.core();
     let shown = ctx.clone();
     let view = view.clone();
-    let fetch = async move {
-        let (listing, settings) = tokio::join!(core.detect_devices(), core.settings());
-        Ok((listing?, settings?.socks5_proxy.is_some()))
-    };
-    ctx.run(fetch, move |(listing, proxy_set)| {
+    ctx.run(async move { core.detect_devices().await }, move |listing| {
         let (Some(list), Some(pages)) = (view.list.upgrade(), view.pages.upgrade()) else {
             return;
         };
         if let Some(label) = view.notes.upgrade() {
-            let notes = present::setup_notes(&listing, proxy_set);
-            label.set_label(&notes.join("\n\n"));
-            label.set_visible(!notes.is_empty());
+            let note = present::setup_note(&listing);
+            label.set_label(note.unwrap_or(""));
+            label.set_visible(note.is_some());
         }
-        let devices = listing.devices;
+        let devices = present::setup_choices(&listing.devices, view.stored.as_ref());
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
