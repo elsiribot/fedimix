@@ -19,7 +19,7 @@ use std::sync::Arc;
 use bitcoin::OutPoint;
 
 use super::Core;
-use super::saving_send::{FROZEN_STALLED, HeldSaving, NO_ACCOUNT, margin_of};
+use super::saving_send::{FROZEN_STALLED, HeldSaving, NO_ACCOUNT, SETTLED_DEPTH, margin_of};
 use super::send::{PREVIEW_TTL, fresh_id};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
@@ -29,7 +29,6 @@ use crate::store::SignedState;
 const AT_TARGET: &str = "Spending is at or above its target, so there is nothing to refill.";
 const NO_FEDERATION: &str = "Join a federation first: a refill pays into it.";
 const ON_ITS_WAY: &str = "Spending reaches its target with the money already on its way to it, so there is nothing to refill.";
-const REFILL_PENDING: &str = "Your last refill has not settled yet. Try again once it has.";
 
 impl Core {
     /// The active federation, its balance and the target. Refused at or above
@@ -57,23 +56,34 @@ impl Core {
 
     /// What is on its way to `federation` and not in its balance yet, less the
     /// deposit fee each pays: its deposits not settled, and what Saving signed
-    /// to its addresses that it has not seen. A stalled payment is not counted,
-    /// as it may never arrive; refills wait while one exists.
+    /// to its addresses that it has not seen. Each counts once: a deposit row
+    /// that names a stored transaction stands for it. A v1 deposit confirming
+    /// shows what arrived on chain, before the fee; a v2 one pending, after it.
+    /// A stalled payment is not counted, as it may never arrive.
     fn on_its_way(&self, federation: &str, deposit_fee: Amount) -> Result<Amount> {
         let deposits = self.store().deposit_rows(federation)?;
         let mut total = Amount::ZERO;
         let mut seen = HashSet::new();
         for row in &deposits {
             seen.extend(row.txid.clone());
-            if matches!(
-                row.status,
-                HistoryStatus::Pending | HistoryStatus::Confirming { .. }
-            ) {
-                total = total.checked_add(row.amount).unwrap_or(total);
-            }
+            let arrives = match row.status {
+                HistoryStatus::Pending => row.amount,
+                HistoryStatus::Confirming { .. } => row.amount.saturating_sub(deposit_fee),
+                _ => continue,
+            };
+            total = total.checked_add(arrives).unwrap_or(total);
         }
         for (row, tx, superseded) in self.open_ledger()? {
-            if superseded || row.state == SignedState::Stalled || seen.contains(&row.txid) {
+            // A row from before schema 9 names no federation, and counts here.
+            let elsewhere = row
+                .federation_id
+                .as_deref()
+                .is_some_and(|id| id != federation);
+            if superseded
+                || elsewhere
+                || row.state == SignedState::Stalled
+                || seen.contains(&row.txid)
+            {
                 continue;
             }
             let Some(script) = row
@@ -104,18 +114,34 @@ impl Core {
     }
 
     /// What no refill may run beside: another refill not final, which is money
-    /// on its way, or a stalled send, which a refill would cancel. Named, so
-    /// the user knows which payment holds it.
+    /// on its way, or a stalled send that is the newest of its coins, which a
+    /// refill would cancel. Each sentence says when the block lifts.
     fn refuse_refill_now(&self, wallet: &SavingWallet) -> Result<()> {
         let ledger = self.open_ledger()?;
-        if ledger
+        let refill = ledger
             .iter()
-            .any(|(row, _, _)| row.kind == OperationKind::Refill)
-        {
-            return Err(FedimixError::NotSetUp(REFILL_PENDING.into()));
+            .rev()
+            .find(|(row, _, _)| row.kind == OperationKind::Refill);
+        if let Some((row, _, superseded)) = refill {
+            let sentence = if *superseded {
+                format!(
+                    "A send from Saving replaced your last refill. Refill again once that send is {SETTLED_DEPTH} blocks deep."
+                )
+            } else if row.state == SignedState::Stalled {
+                format!(
+                    "No chain server holds your last refill now, and it may still go through. Refill again once it is {SETTLED_DEPTH} blocks deep, or once a send from Saving that replaces it is."
+                )
+            } else {
+                format!(
+                    "Your last refill is not yet {SETTLED_DEPTH} blocks deep. Refill again once it is."
+                )
+            };
+            return Err(FedimixError::NotSetUp(sentence));
         }
-        let stalled = ledger.iter().find(|(row, _, _)| {
-            row.kind == OperationKind::Send && row.state == SignedState::Stalled
+        // One a newer send replaced is covered by that send's coins: the user
+        // chose to replace it, and only one of the two can confirm.
+        let stalled = ledger.iter().find(|(row, _, superseded)| {
+            row.kind == OperationKind::Send && row.state == SignedState::Stalled && !superseded
         });
         if let Some((row, tx, _)) = stalled {
             let labels = Labels::load(&self.store())?;
@@ -123,7 +149,7 @@ impl Core {
             let to = wallet.recipient(tx, row.change_address.as_deref());
             let to = to.unwrap_or_else(|| "an address of yours".to_string());
             return Err(FedimixError::NotSetUp(format!(
-                "Your payment of {} to {to} has not confirmed and may still go through. A refill would cancel it, so refill once it has confirmed, or after you send it again.",
+                "Your payment of {} to {to} has not confirmed and may still go through. A refill would cancel it, so refill once a chain server holds it again, or after you send from Saving, which replaces it.",
                 item.amount
             )));
         }
@@ -131,11 +157,15 @@ impl Core {
     }
 
     /// What must still hold of a refill at confirm, beside what holds of every
-    /// Saving preview.
+    /// Saving preview: the same blocks, and the same amount to deliver, so the
+    /// review's overshoot is the one that lands.
     pub(super) fn check_refill(&self, wallet: &SavingWallet, held: &HeldSaving) -> Result<()> {
         self.refuse_refill_now(wallet)?;
         let federation = held.federation.as_ref().map(|f| f.id.as_str());
-        self.refill_needs(federation.unwrap_or(""), held.deposit_fee)?;
+        let needs = self.refill_needs(federation.unwrap_or(""), held.deposit_fee)?;
+        if needs != held.needs {
+            return Err(FedimixError::PreviewExpired);
+        }
         Ok(())
     }
 
@@ -147,7 +177,12 @@ impl Core {
         let account = account.ok_or_else(|| FedimixError::NotSetUp(NO_ACCOUNT.into()))?;
         self.refuse_jade_behind_proxy(Some(&account))?;
         self.refuse_refill_now(&wallet)?;
-        self.refill_target()?;
+        let (active, _, _) = self.refill_target()?;
+        // Refused before a deposit address is used up, also when what is on
+        // its way already fills Spending.
+        self.ensure_open()?;
+        let early_fee = self.connected(&active)?.min_deposit().await?;
+        self.refill_needs(&active, early_fee)?;
         let fee_rate = self.saving_fee_rate(None).await?;
         let must_spend = self.stalled_inputs(&wallet)?;
         let spends: HashSet<OutPoint> = must_spend.iter().copied().collect();
@@ -206,6 +241,7 @@ impl Core {
             change_vout: None,
             federation: Some(federation),
             deposit_fee,
+            needs,
             generation: self.saving().generation,
             expires_at: preview.expires_at,
         };

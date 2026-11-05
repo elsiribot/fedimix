@@ -332,17 +332,23 @@ impl<'c> OnChain<'c> {
         while let Some(state) = states.next().await {
             let update = match state {
                 DepositStateV2::WaitingForTransaction => continue,
-                DepositStateV2::WaitingForConfirmation { btc_deposited, .. } => {
-                    WatchUpdate::Confirming {
-                        confirmations: 0,
-                        required,
-                        amount: sat_amount(btc_deposited),
-                    }
-                }
-                DepositStateV2::Confirmed { btc_deposited, .. } => WatchUpdate::Confirming {
+                DepositStateV2::WaitingForConfirmation {
+                    btc_deposited,
+                    btc_out_point,
+                } => WatchUpdate::Confirming {
+                    confirmations: 0,
+                    required,
+                    amount: sat_amount(btc_deposited),
+                    txid: Some(btc_out_point.txid.to_string()),
+                },
+                DepositStateV2::Confirmed {
+                    btc_deposited,
+                    btc_out_point,
+                } => WatchUpdate::Confirming {
                     confirmations: required,
                     required,
                     amount: sat_amount(btc_deposited),
+                    txid: Some(btc_out_point.txid.to_string()),
                 },
                 DepositStateV2::Claimed {
                     btc_deposited,

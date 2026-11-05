@@ -81,11 +81,14 @@ pub enum WithdrawTerms {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WatchUpdate {
     /// `confirmations` stays 0 until the federation has seen enough of them:
-    /// the client reports no count in between.
+    /// the client reports no count in between. A deposit's `amount` is what
+    /// arrived on chain, before the deposit fee, and `txid` names its
+    /// transaction where the generation says it.
     Confirming {
         confirmations: u32,
         required: u32,
         amount: Amount,
+        txid: Option<String>,
     },
     /// `amount` is what the operation moved: for a receive what reached the
     /// wallet before the ecash fee, for a send what the recipient got. `fee` is

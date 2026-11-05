@@ -261,12 +261,16 @@ impl Core {
                 confirmations,
                 required,
                 amount,
+                txid,
             } => {
                 let status = HistoryStatus::Confirming {
                     confirmations: *confirmations,
                     required: *required,
                 };
-                Some(incoming(&watch.id, kind, *amount, status, now))
+                Some(HistoryItem {
+                    txid: txid.clone(),
+                    ..incoming(&watch.id, kind, *amount, status, now)
+                })
             }
             WatchUpdate::Settled { amount, fee, txid } => Some(HistoryItem {
                 fee: paid_fee(*fee),

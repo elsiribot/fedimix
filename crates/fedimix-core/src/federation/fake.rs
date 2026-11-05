@@ -737,6 +737,7 @@ mod tests {
                 confirmations: 1,
                 required: 2,
                 amount: Amount::from_sat(5),
+                txid: None,
             },
         );
         client.push_update("op", WatchUpdate::Expired);

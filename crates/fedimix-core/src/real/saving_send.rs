@@ -67,7 +67,7 @@ const FIRST_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
 /// How deep a block must lie before no reorg is to be expected: a transaction
 /// or a conflict there settles a stored transaction.
-const SETTLED_DEPTH: u32 = 6;
+pub(super) const SETTLED_DEPTH: u32 = 6;
 /// How long a first broadcast may go without a verdict before it stalls,
 /// counted from the stored row, so a restart does not start it over.
 const NO_VERDICT_LIMIT: Timestamp = 30 * 60;
@@ -112,9 +112,10 @@ pub(super) struct HeldSaving {
     pub(super) change_vout: Option<u32>,
     /// `Some` only when the PSBT pays it.
     pub(super) federation: Option<ChangeFederation>,
-    /// A refill's: the federation's deposit fee it counted, which the gap is
-    /// checked with again at confirm. Zero for a send.
+    /// A refill's: the federation's deposit fee it counted, and what it had to
+    /// deliver, which confirm checks again. Zero for a send.
     pub(super) deposit_fee: Amount,
+    pub(super) needs: Amount,
     pub(super) generation: u64,
     pub(super) expires_at: Timestamp,
 }
@@ -622,6 +623,7 @@ impl Core {
             change_vout: built.change.map(|(vout, _)| vout),
             federation,
             deposit_fee: Amount::ZERO,
+            needs: Amount::ZERO,
             generation: self.saving().generation,
             expires_at: preview.expires_at,
         };
@@ -939,6 +941,7 @@ impl Core {
             created_at: (self.clock)(),
             lost_to: None,
             kind: held.kind,
+            federation_id: federation.map(|federation| federation.id.clone()),
         };
         self.store().add_signed(&row)?;
         Ok(row)
@@ -1326,6 +1329,7 @@ mod tests {
             created_at: 1,
             lost_to: None,
             kind,
+            federation_id: None,
         };
         (row, tx, false)
     }

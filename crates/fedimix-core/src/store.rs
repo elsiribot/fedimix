@@ -14,7 +14,7 @@ use crate::api::{
 use crate::error::{FedimixError, Result};
 use crate::saving::{DeviceAccount, Label, Labels, SentRecord, Tag};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -100,6 +100,11 @@ const LOST_TO: &str = "ALTER TABLE saving_signed ADD COLUMN lost_to TEXT;";
 /// still reports as one and shows as one. Rows from before it are sends.
 const SIGNED_KIND: &str = "ALTER TABLE saving_signed ADD COLUMN kind TEXT NOT NULL DEFAULT 'send';";
 
+/// Schema 9: the federation a stored transaction pays, if any, so money on its
+/// way is counted against that federation alone. Rows from before it read as
+/// unknown.
+const SIGNED_FEDERATION: &str = "ALTER TABLE saving_signed ADD COLUMN federation_id TEXT;";
+
 /// A write transaction that takes the write lock up front, so it waits for the
 /// busy timeout instead of failing halfway.
 fn begin(conn: &Connection) -> Result<Transaction<'_>> {
@@ -148,6 +153,7 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
         5 => tx.execute_batch(SIGNED_SCHEMA).map_err(db_err),
         6 => tx.execute_batch(LOST_TO).map_err(db_err),
         7 => tx.execute_batch(SIGNED_KIND).map_err(db_err),
+        8 => tx.execute_batch(SIGNED_FEDERATION).map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -257,6 +263,9 @@ pub(crate) struct SignedTx {
     pub lost_to: Option<String>,
     /// `Send` or `Refill`.
     pub kind: OperationKind,
+    /// The federation `change_address` belongs to; `None` when it pays none,
+    /// or for a row from before schema 9.
+    pub federation_id: Option<String>,
 }
 
 fn signed_kind_str(kind: OperationKind) -> &'static str {
@@ -417,6 +426,7 @@ impl Store {
             tx.execute_batch(SIGNED_SCHEMA).map_err(db_err)?;
             tx.execute_batch(LOST_TO).map_err(db_err)?;
             tx.execute_batch(SIGNED_KIND).map_err(db_err)?;
+            tx.execute_batch(SIGNED_FEDERATION).map_err(db_err)?;
             tx.execute(
                 "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
                 [SCHEMA_VERSION],
@@ -1097,8 +1107,9 @@ impl Store {
     pub(crate) fn add_signed(&self, signed: &SignedTx) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO saving_signed (id, txid, tx_hex, state, change_address, created_at, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO saving_signed
+                    (id, txid, tx_hex, state, change_address, created_at, kind, federation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     signed.id,
                     signed.txid,
@@ -1106,7 +1117,8 @@ impl Store {
                     signed.state.as_str(),
                     signed.change_address,
                     to_db(signed.created_at),
-                    signed_kind_str(signed.kind)
+                    signed_kind_str(signed.kind),
+                    signed.federation_id
                 ],
             )
             .map_err(db_err)?;
@@ -1115,7 +1127,8 @@ impl Store {
 
     fn signed_where(&self, condition: &str, args: &[&str]) -> Result<Vec<SignedTx>> {
         let sql = format!(
-            "SELECT id, txid, tx_hex, state, change_address, created_at, lost_to, kind
+            "SELECT id, txid, tx_hex, state, change_address, created_at, lost_to, kind,
+                    federation_id
              FROM saving_signed WHERE {condition} ORDER BY rowid"
         );
         let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
@@ -1130,12 +1143,13 @@ impl Store {
                     r.get::<_, i64>(5)?,
                     r.get::<_, Option<String>>(6)?,
                     r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, txid, tx_hex, state, change_address, created_at, lost_to, kind) =
+            let (id, txid, tx_hex, state, change_address, created_at, lost_to, kind, federation_id) =
                 row.map_err(db_err)?;
             out.push(SignedTx {
                 id,
@@ -1146,6 +1160,7 @@ impl Store {
                 created_at: from_db(created_at),
                 lost_to,
                 kind: signed_kind_parse(&kind)?,
+                federation_id,
             });
         }
         Ok(out)
@@ -1788,6 +1803,7 @@ mod tests {
             created_at: 7,
             lost_to: None,
             kind: OperationKind::Refill,
+            federation_id: Some("fed".into()),
         };
         store.add_signed(&signed).unwrap();
         assert_eq!(
@@ -1841,6 +1857,7 @@ mod tests {
                     created_at,
                     lost_to: None,
                     kind: OperationKind::Send,
+                    federation_id: None,
                 })
                 .unwrap();
         }
@@ -1864,6 +1881,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE saving_signed DROP COLUMN lost_to;
                      ALTER TABLE saving_signed DROP COLUMN kind;
+                     ALTER TABLE saving_signed DROP COLUMN federation_id;
                      UPDATE schema_version SET version = 6;",
                 )
                 .unwrap();
@@ -1883,6 +1901,7 @@ mod tests {
                 .conn
                 .execute_batch(
                     "ALTER TABLE saving_signed DROP COLUMN kind;
+                     ALTER TABLE saving_signed DROP COLUMN federation_id;
                      INSERT INTO saving_signed (id, txid, tx_hex, state, created_at)
                      VALUES ('saving-1', 'txid', '00', 'seen', 1);
                      UPDATE schema_version SET version = 7;",
@@ -1898,6 +1917,29 @@ mod tests {
 
     /// A sent record knows it is a refill from the signed row of its
     /// transaction.
+    /// A row from before schema 9 pays no known federation.
+    #[test]
+    fn a_version_8_database_gains_the_federation_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE saving_signed DROP COLUMN federation_id;
+                     INSERT INTO saving_signed (id, txid, tx_hex, state, created_at, kind)
+                     VALUES ('saving-1', 'txid', '00', 'seen', 1, 'refill');
+                     UPDATE schema_version SET version = 8;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows = store.open_signed().unwrap();
+        assert_eq!(rows[0].federation_id, None);
+        assert_eq!(rows[0].kind, OperationKind::Refill);
+    }
+
     #[test]
     fn a_refill_record_reads_as_a_refill() {
         let (_dir, store) = open();
@@ -1921,6 +1963,7 @@ mod tests {
                     created_at: 1,
                     lost_to: None,
                     kind,
+                    federation_id: None,
                 })
                 .unwrap();
         }
