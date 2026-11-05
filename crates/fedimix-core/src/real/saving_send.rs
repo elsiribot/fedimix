@@ -112,8 +112,9 @@ pub(super) struct HeldSaving {
     pub(super) change_vout: Option<u32>,
     /// `Some` only when the PSBT pays it.
     pub(super) federation: Option<ChangeFederation>,
-    /// A refill's: what its one output delivers to the federation.
-    pub(super) delivered: Option<bitcoin::Amount>,
+    /// A refill's: the federation's deposit fee it counted, which the gap is
+    /// checked with again at confirm. Zero for a send.
+    pub(super) deposit_fee: Amount,
     pub(super) generation: u64,
     pub(super) expires_at: Timestamp,
 }
@@ -139,6 +140,13 @@ impl Drop for OpGuard {
         if live.op.as_ref().is_some_and(|op| op.id == self.id) {
             live.op = None;
         }
+    }
+}
+
+/// What change, or a refill, must exceed to go to the federation.
+pub(super) fn margin_of(min_deposit: Amount) -> Amount {
+    Amount {
+        msat: min_deposit.msat.saturating_mul(CHANGE_MARGIN),
     }
 }
 
@@ -171,32 +179,23 @@ fn rate_of(estimate: Option<f64>, network: Network) -> Result<FeeRate> {
     }
 }
 
+/// Whether `newer`, sharing a coin with `older`, replaced it in the user's
+/// eyes: a refill replaces anything of its own kind, a send anything.
+fn replaces(newer: &SignedTx, older: &SignedTx) -> bool {
+    newer.kind == OperationKind::Send || older.kind == OperationKind::Refill
+}
+
 fn tx_of(row: &SignedTx) -> Result<Transaction> {
     deserialize_hex(&row.tx_hex).map_err(|_| internal(UNREADABLE_TX))
 }
 
 /// What a device handed back pays what was reviewed, down to the fee. The fee
 /// is read again because a PSBT carries its input amounts apart from the
-/// transaction.
+/// transaction. The same outputs: for a refill, the one output delivers what
+/// its preview showed, to the address it showed.
 fn same_as_reviewed(signed: &Psbt, reviewed: &Psbt, fee: Amount) -> bool {
     signed.unsigned_tx == reviewed.unsigned_tx
         && signed.fee().is_ok_and(|paid| from_btc(paid) == fee)
-}
-
-/// A refill pays what its preview showed: one output, to the federation, of
-/// the amount delivered. A send has nothing more to check here.
-fn delivers_as_reviewed(
-    tx: &Transaction,
-    held: &HeldSaving,
-    to: Option<&bitcoin::ScriptBuf>,
-) -> bool {
-    let Some(delivered) = held.delivered else {
-        return true;
-    };
-    match (tx.output.as_slice(), to) {
-        ([output], Some(to)) => output.value == delivered && output.script_pubkey == *to,
-        _ => false,
-    }
 }
 
 impl Core {
@@ -220,8 +219,9 @@ impl Core {
         rate_of(estimate, self.config.network)
     }
 
-    /// Where change can go, with the margin: `None` with no active federation.
-    /// Asks for the minimum first, so a failure uses up no address.
+    /// Where change can go, with the federation's minimum deposit, which is
+    /// also its deposit fee: `None` with no active federation. Asks for the
+    /// minimum first, so a failure uses up no address.
     pub(super) async fn change_federation(
         &self,
         spends: &HashSet<OutPoint>,
@@ -236,10 +236,7 @@ impl Core {
         if self.address_held(&address, spends)? {
             return Err(FedimixError::NotSetUp(SAME_ADDRESS.into()));
         }
-        let margin = Amount {
-            msat: min_deposit.msat.saturating_mul(CHANGE_MARGIN),
-        };
-        Ok(Some((ChangeFederation { id, address, watch }, margin)))
+        Ok(Some((ChangeFederation { id, address, watch }, min_deposit)))
     }
 
     pub(super) fn checked_script(&self, address: &str) -> Result<bitcoin::ScriptBuf> {
@@ -259,7 +256,7 @@ impl Core {
     /// that is not dropped spends one of its coins. Of a set that shares coins
     /// only the newest is ever offered to a server and holds the coins: the
     /// older ones are what the user replaced, and the newest's coins cover theirs.
-    fn open_ledger(&self) -> Result<Vec<(SignedTx, Transaction, bool)>> {
+    pub(super) fn open_ledger(&self) -> Result<Vec<(SignedTx, Transaction, bool)>> {
         let rows = self.store().open_signed()?;
         let txs = rows.iter().map(tx_of).collect::<Result<Vec<_>>>()?;
         let spent: Vec<HashSet<OutPoint>> = txs
@@ -275,6 +272,29 @@ impl Core {
             .zip(superseded)
             .map(|((row, tx), superseded)| (row, tx, superseded))
             .collect())
+    }
+
+    /// Whether the history keeps quiet about `row` of `ledger` as superseded:
+    /// only when a newer transaction sharing a coin replaced it as a payment
+    /// of the same kind. A send is never hidden behind a refill.
+    fn hidden_in_history(ledger: &[(SignedTx, Transaction, bool)], id: &str) -> bool {
+        let Some(at) = ledger.iter().position(|(row, _, _)| row.id == id) else {
+            return false;
+        };
+        let (row, tx, superseded) = &ledger[at];
+        if !superseded {
+            return false;
+        }
+        let spent: HashSet<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
+        ledger[at + 1..]
+            .iter()
+            .filter(|(_, newer, _)| {
+                newer
+                    .input
+                    .iter()
+                    .any(|i| spent.contains(&i.previous_output))
+            })
+            .all(|(newer, _, _)| replaces(newer, row))
     }
 
     /// The coins signed away by a transaction not yet settled, whatever the
@@ -357,7 +377,7 @@ impl Core {
         let item = wallet.signed_item(tx, HistoryStatus::Complete, row.created_at, labels);
         if row.kind == OperationKind::Refill {
             return format!(
-                "Not sent: your earlier refill of {} confirmed instead, as both spent the same coins.",
+                "Not sent: your refill of {} confirmed instead, as both spent the same coins.",
                 item.amount
             );
         }
@@ -383,8 +403,12 @@ impl Core {
         }
         if let Some(lost_to) = &row.lost_to {
             let winner = self.store().signed_after(lost_to, &row.id)?;
-            // A later send of ours won: the user replaced this one.
-            if winner.as_ref().is_some_and(|(_, later)| *later) {
+            // A later send of ours won: the user replaced this one. A send a
+            // refill beat keeps its row: it was never replaced by a payment.
+            if winner
+                .as_ref()
+                .is_some_and(|(winner, later)| *later && replaces(winner, row))
+            {
                 return Ok(None);
             }
             let winner = winner
@@ -420,9 +444,7 @@ impl Core {
         let ledger = self.open_ledger()?;
         for row in &rows {
             let tx = tx_of(row)?;
-            let superseded = ledger
-                .iter()
-                .any(|(open, _, superseded)| open.id == row.id && *superseded);
+            let superseded = Self::hidden_in_history(&ledger, &row.id);
             if let Some(item) = self.signed_row(wallet, labels, row, &tx, superseded)? {
                 items.push(item);
             }
@@ -469,7 +491,8 @@ impl Core {
         let spends: HashSet<OutPoint> = must_spend.iter().copied().collect();
         // A send of everything makes no change, so it needs no federation.
         let federation = if amount.is_some() {
-            self.change_federation(&spends).await?
+            let found = self.change_federation(&spends).await?;
+            found.map(|(federation, min_deposit)| (federation, margin_of(min_deposit)))
         } else {
             None
         };
@@ -598,7 +621,7 @@ impl Core {
             change: preview.change.clone(),
             change_vout: built.change.map(|(vout, _)| vout),
             federation,
-            delivered: None,
+            deposit_fee: Amount::ZERO,
             generation: self.saving().generation,
             expires_at: preview.expires_at,
         };
@@ -633,6 +656,9 @@ impl Core {
             return Err(FedimixError::PreviewExpired);
         }
         self.check_active(held)?;
+        if held.kind == OperationKind::Refill {
+            self.check_refill(wallet, held)?;
+        }
         let spends: HashSet<OutPoint> = held
             .psbt
             .unsigned_tx
@@ -745,7 +771,13 @@ impl Core {
                 let live = self.saving();
                 live.op.as_ref().filter(|op| op.id == id).map(|op| op.kind)
             })
-            .or_else(|| self.store().signed_kind(id).ok().flatten())
+            .or_else(|| {
+                let stored = self.store().signed_kind(id);
+                stored
+                    .inspect_err(|e| eprintln!("fedimix: reading the kind of {id}: {e}"))
+                    .ok()
+                    .flatten()
+            })
             .unwrap_or(OperationKind::Send)
     }
 
@@ -928,10 +960,6 @@ impl Core {
             () = cancel.notified() => Err(FedimixError::Cancelled),
             () = stopping(&mut gate) => Err(FedimixError::Cancelled),
         };
-        let to = held
-            .federation
-            .as_ref()
-            .and_then(|federation| self.checked_script(&federation.address).ok());
         let stored = match signed {
             Ok(psbt) if !same_as_reviewed(&psbt, &held.psbt, held.fee) => Err(internal(TAMPERED)),
             Ok(_) if self.check_active(&held).is_err() => Err(FedimixError::PreviewExpired),
@@ -939,7 +967,6 @@ impl Core {
                 Ok(tx) if tx.compute_txid() != held.psbt.unsigned_tx.compute_txid() => {
                     Err(internal(TAMPERED))
                 }
-                Ok(tx) if !delivers_as_reviewed(&tx, &held, to.as_ref()) => Err(internal(TAMPERED)),
                 Ok(_) if !self.enter_broadcasting(&id) => Err(FedimixError::Cancelled),
                 Ok(tx) => self
                     .store_signed(&id, &tx, &held, &wallet)
@@ -1186,9 +1213,7 @@ impl Core {
             lost_to: Some(winner.clone()),
             ..row.clone()
         };
-        let superseded = ledger
-            .iter()
-            .any(|(open, _, superseded)| open.id == row.id && *superseded);
+        let superseded = Self::hidden_in_history(ledger, &row.id);
         let labels = Labels::load(&self.store())?;
         if let Some(item) = self.signed_row(wallet, &labels, &row, tx, superseded)? {
             self.events.emit(&Event::HistoryItemUpdated {
@@ -1272,6 +1297,60 @@ mod tests {
                 rate_of(None, network),
                 Err(FedimixError::NotSetUp(NO_ESTIMATE.into()))
             );
+        }
+    }
+
+    fn ledger_row(n: u8, kind: OperationKind, coin: u8) -> (SignedTx, Transaction, bool) {
+        use bitcoin::hashes::Hash as _;
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([coin; 32]),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(u64::from(n) * 1_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let row = SignedTx {
+            id: format!("saving-{n}"),
+            txid: tx.compute_txid().to_string(),
+            tx_hex: serialize_hex(&tx),
+            state: SignedState::Stalled,
+            change_address: None,
+            created_at: 1,
+            lost_to: None,
+            kind,
+        };
+        (row, tx, false)
+    }
+
+    /// A send replaced by a send, or a refill by anything, goes quiet in the
+    /// history; a send behind a refill never does.
+    #[test]
+    fn a_send_never_hides_behind_a_refill() {
+        use OperationKind::{Refill, Send};
+        for (older, newer, hidden) in [
+            (Send, Send, true),
+            (Refill, Send, true),
+            (Refill, Refill, true),
+            (Send, Refill, false),
+        ] {
+            let mut ledger = vec![ledger_row(1, older, 9), ledger_row(2, newer, 9)];
+            ledger[0].2 = true;
+            assert_eq!(
+                Core::hidden_in_history(&ledger, "saving-1"),
+                hidden,
+                "{older:?} then {newer:?}"
+            );
+            assert!(!Core::hidden_in_history(&ledger, "saving-2"));
+            let winner = &ledger[1].0;
+            assert_eq!(replaces(winner, &ledger[0].0), hidden);
         }
     }
 

@@ -604,7 +604,7 @@ impl State {
             };
             self.queue.push(item);
         }
-        let out = self.history_item(HistoryKind::Sent { change: None }, p.amount, false);
+        let out = self.history_item(HistoryKind::Refill, arrived, false);
         let inc = self.history_item(HistoryKind::Deposit, arrived, true);
         self.saving_history.insert(0, out.clone());
         self.spending_history.insert(0, inc.clone());

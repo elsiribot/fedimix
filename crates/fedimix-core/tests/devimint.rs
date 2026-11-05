@@ -2115,14 +2115,19 @@ async fn refill_reaches_spending() {
     fund_saving(&backend, KEPT).await;
     fund_saving(&backend, 80_000).await;
     let before = balance_of(&backend).await;
+    // The deposit fee a refill counts in what it must deliver.
+    let deposit_fee = address(&backend).await.min_deposit.unwrap();
 
     let preview = backend.prepare_refill().await.unwrap();
     let taken: Vec<_> = preview.coins.iter().map(|c| c.amount.as_sat()).collect();
     assert_eq!(taken, [80_000, 100_000], "smallest first, until covered");
     assert_eq!(preview.amount, Amount::from_sat(180_000));
     let delivered = preview.amount.checked_sub(preview.fee).unwrap();
-    let gap = Amount::from_sat(TARGET).checked_sub(before).unwrap();
-    assert_eq!(preview.overshoot, delivered.checked_sub(gap).unwrap());
+    let needs = Amount::from_sat(TARGET)
+        .checked_sub(before)
+        .and_then(|gap| gap.checked_add(deposit_fee))
+        .unwrap();
+    assert_eq!(preview.overshoot, delivered.checked_sub(needs).unwrap());
 
     let events = backend.subscribe();
     let id = backend.confirm_refill(preview.id).await.unwrap();
@@ -2141,13 +2146,22 @@ async fn refill_reaches_spending() {
         Some(&txid),
         "the refill's own deposit"
     );
-    let after = wait_balance(&backend, |now| now > before).await;
-    let rose = after.saturating_sub(before);
-    assert!(rose <= delivered, "{rose:?} of {delivered:?}");
-    let fee = delivered.saturating_sub(rose);
+    let fee = deposit.fee.expect("a settled deposit names its fee");
+    assert_eq!(
+        deposit.amount.checked_add(fee),
+        Some(delivered),
+        "the deposit is the refill, less exactly its fee"
+    );
+    // The mint may keep a small fee for issuing the notes (v2 kept ~0.06%):
+    // the balance lands within 1% of the deposit, never above it.
+    let floor = deposit.amount.saturating_sub(Amount {
+        msat: deposit.amount.msat / 100,
+    });
+    let after = wait_balance(&backend, |now| now.saturating_sub(before) >= floor).await;
+    assert!(after.saturating_sub(before) <= deposit.amount, "{after:?}");
     assert!(
-        fee.as_sat() * 2 < delivered.as_sat(),
-        "most of the refill arrives: {fee:?} kept of {delivered:?}"
+        after >= Amount::from_sat(TARGET),
+        "the deposit fee was counted: {after:?}"
     );
     wait_saving(&backend, |state| {
         state.coins.len() == 1

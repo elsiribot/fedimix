@@ -5997,17 +5997,14 @@ async fn every_send_conflicts_with_every_stalled_one() {
     );
     backend.shutdown().await.unwrap();
 
-    // A refill replaces a stalled send, and a send replaces the refill once it
-    // stalls in turn.
+    // A refill joins the net: it goes while nothing is stalled, a send then
+    // replaces it once it stalls, and no refill runs beside it.
     let saving = SavingHarness::new();
     let backend = saving.refillable(20_000).await;
     saving.fund(&backend, 100_000, 0).await;
     saving.fund(&backend, 90_000, 1).await;
     saving.fund(&backend, 80_000, 2).await;
-    let (_, _) = saving.stalled(&backend).await;
     let preview = backend.prepare_refill().await.unwrap();
-    saving.synced(&backend).await;
-    saving.chain.clear_broadcast_script();
     assert_eq!(
         refill_checked(&saving, &backend, preview).await,
         OperationState::Done
@@ -6024,6 +6021,10 @@ async fn every_send_conflicts_with_every_stalled_one() {
             .any(|tx| tx.compute_txid() == refill)
     })
     .await;
+    assert_eq!(
+        backend.prepare_refill().await.map(|_| ()),
+        Err(FedimixError::NotSetUp(REFILL_PENDING.into()))
+    );
     let preview = backend.prepare_send(saving_sat(1_000)).await.unwrap();
     saving.synced(&backend).await;
     saving.chain.clear_broadcast_script();
@@ -6068,6 +6069,10 @@ async fn a_seen_send_with_no_answer_keeps_its_row() {
 // Refill (Task 7).
 
 const AT_TARGET: &str = "Spending is at or above its target, so there is nothing to refill.";
+const ON_ITS_WAY: &str = "Spending reaches its target with the money already on its way to it, so there is nothing to refill.";
+const REFILL_PENDING: &str = "Your last refill has not settled yet. Try again once it has.";
+/// The fake federation's minimum deposit, which is also its deposit fee.
+const DEPOSIT_FEE: u64 = 1_000;
 
 impl SavingHarness {
     /// Joined, with Spending empty and a target of `target` sat.
@@ -6121,7 +6126,8 @@ async fn smallest_first_until_covered() {
     assert_eq!(outpoints(&preview), [ten.clone(), twenty.clone()]);
     assert_eq!(preview.amount, sat(30_000));
     assert_eq!(preview.device_name, "Test device");
-    // 30k of coins cover a gap of 30k only before the fee: one more coin.
+    // The gap of 25k and the deposit fee of 1k are covered by 30k less the
+    // fee. 30k of coins cover a gap of 30k only before the fees: one more coin.
     backend
         .set_settings(Settings {
             spending_target: sat(30_000),
@@ -6145,10 +6151,10 @@ async fn delivered_is_net_of_fee() {
     assert_eq!(preview.amount, sat(50_000));
     assert!(preview.fee > Amount::ZERO);
     let delivered = preview.amount.checked_sub(preview.fee).unwrap();
-    assert_eq!(
-        preview.overshoot,
-        delivered.checked_sub(sat(20_000)).unwrap()
-    );
+    // The gap of 20k, and the federation's deposit fee, so Spending lands at
+    // or above the target.
+    let needs = sat(20_000 + DEPOSIT_FEE);
+    assert_eq!(preview.overshoot, delivered.checked_sub(needs).unwrap());
     let fee = preview.fee;
     let tx = saving.refilled(&backend).await;
     assert_eq!(tx.output.len(), 1);
@@ -6263,7 +6269,8 @@ async fn refill_needs_the_federation_online() {
 #[tokio::test]
 async fn refill_same_v2_address_is_refused() {
     let saving = SavingHarness::new();
-    let backend = saving.refillable(30_000).await;
+    // Above what the send's change brings on its way.
+    let backend = saving.refillable(200_000).await;
     saving.fund(&backend, 100_000, 0).await;
     saving.fund(&backend, 90_000, 1).await;
     saving.fund(&backend, 80_000, 2).await;
@@ -6276,7 +6283,6 @@ async fn refill_same_v2_address_is_refused() {
     // The scanner moved on; the refill's own address then holds the next one.
     client.set_deposit_address(Some(regtest_address("next")));
     saving.refilled(&backend).await;
-    assert_eq!(backend.prepare_refill().await.map(|_| ()), same);
     assert_eq!(
         backend.prepare_send(saving_sat(30_000)).await.map(|_| ()),
         same
@@ -6404,6 +6410,83 @@ async fn a_refill_preview_confirms_only_as_a_refill() {
     assert_eq!(
         backend.confirm_refill(send.id.clone()).await,
         Err(FedimixError::UnknownItem(send.id.clone()))
+    );
+    backend.shutdown().await.unwrap();
+}
+
+/// A refill on its way is money on its way: no second one runs beside it.
+#[tokio::test]
+async fn a_refill_waits_for_the_last_one() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 90_000, 1).await;
+    saving.fund(&backend, 80_000, 2).await;
+    saving.refilled(&backend).await;
+    assert_eq!(
+        backend.prepare_refill().await.map(|_| ()),
+        Err(FedimixError::NotSetUp(REFILL_PENDING.into()))
+    );
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+/// A refill would cancel a stalled payment to someone else: it is refused,
+/// naming that payment, which stays in the history.
+#[tokio::test]
+async fn a_refill_never_cancels_a_stalled_send() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(10_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    saving.fund(&backend, 5_000, 1).await;
+    let (old, _) = saving.stalled(&backend).await;
+    let reply = backend.prepare_refill().await.map(|_| ());
+    let Err(FedimixError::NotSetUp(sentence)) = reply else {
+        panic!("{reply:?}");
+    };
+    assert!(sentence.contains(&payee()), "{sentence}");
+    assert!(sentence.contains(&sat(30_000).to_string()), "{sentence}");
+    let txid = old.compute_txid().to_string();
+    let rows = saving_rows(&backend).await;
+    let row = rows.iter().find(|r| r.txid.as_ref() == Some(&txid));
+    assert_eq!(row.expect("the send stays").status, HistoryStatus::Stalled);
+    assert_eq!(saving.chain.broadcasts().len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+/// Change on its way to Spending counts toward the target, less its deposit
+/// fee, and so does the refill's own deposit fee.
+#[tokio::test]
+async fn change_on_its_way_counts_toward_the_target() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(100_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let preview = backend.prepare_send(saving_sat(39_000)).await.unwrap();
+    let ChangeDestination::Spending { amount: change } = preview.change else {
+        panic!("{:?}", preview.change);
+    };
+    let (_, state) = saving.send(&backend, preview).await;
+    assert_eq!(state, OperationState::Done);
+    saving.fund(&backend, 200_000, 1).await;
+    let refill = backend.prepare_refill().await.unwrap();
+    let delivered = refill.amount.checked_sub(refill.fee).unwrap();
+    let arrives = change.checked_sub(sat(DEPOSIT_FEE)).unwrap();
+    let needs = sat(100_000)
+        .checked_sub(arrives)
+        .and_then(|gap| gap.checked_add(sat(DEPOSIT_FEE)))
+        .unwrap();
+    assert_eq!(delivered.checked_sub(refill.overshoot), Some(needs));
+    // A lower target the change alone reaches.
+    backend
+        .set_settings(Settings {
+            spending_target: arrives,
+            ..chain_settings(CHAIN_URL)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.prepare_refill().await.map(|_| ()),
+        Err(FedimixError::InvalidAmount(ON_ITS_WAY.into()))
     );
     backend.shutdown().await.unwrap();
 }

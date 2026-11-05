@@ -8,8 +8,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::api::{
-    Amount, ChainBackend, DeviceKind, HistoryItem, HistoryStatus, Network, OperationKind,
-    SentChange, Settings, Timestamp, WalletKind,
+    Amount, ChainBackend, DeviceKind, HistoryItem, HistoryKind, HistoryStatus, Network,
+    OperationKind, SentChange, Settings, Timestamp, WalletKind,
 };
 use crate::error::{FedimixError, Result};
 use crate::saving::{DeviceAccount, Label, Labels, SentRecord, Tag};
@@ -630,6 +630,34 @@ impl Store {
             .map_err(db_err)?;
         json.map(|json| serde_json::from_str(&json).map_err(db_err))
             .transpose()
+    }
+
+    /// Spending's deposit rows of `federation`, in no order. A row that no
+    /// longer parses is skipped, as in [`Self::history_page`].
+    pub(crate) fn deposit_rows(&self, federation_id: &str) -> Result<Vec<HistoryItem>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT json FROM history WHERE wallet = ?1 AND federation_id = ?2
+                 AND json LIKE '%\"Deposit\"%'",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![wallet_name(WalletKind::Spending), federation_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for json in rows {
+            let json = json.map_err(db_err)?;
+            match serde_json::from_str::<HistoryItem>(&json) {
+                Ok(item) if item.kind == HistoryKind::Deposit => out.push(item),
+                Ok(_) => {}
+                Err(e) => eprintln!("fedimix: skipping a history row that does not parse: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     /// Newest first by `(timestamp, id)` within one wallet and federation
