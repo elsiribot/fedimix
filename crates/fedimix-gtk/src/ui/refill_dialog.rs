@@ -167,7 +167,10 @@ fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {
             let core = ctx.bridge.core();
             let id = id.clone();
             if response == "confirm" {
-                confirm(&ctx, id);
+                let device = present::refill_wait_device(
+                    ctx.latest().and_then(|s| s.saving.device).as_ref(),
+                );
+                confirm(&ctx, id, device);
             } else {
                 ctx.bridge
                     .call(async move { core.discard_preview(id).await }, |_| {});
@@ -182,7 +185,7 @@ fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {
 }
 
 /// The dialog is gone by now, so the context reports how it ends.
-fn confirm(ctx: &Rc<AppContext>, preview_id: String) {
+fn confirm(ctx: &Rc<AppContext>, preview_id: String, device: Option<String>) {
     let core = ctx.bridge.core();
     let ctx = ctx.clone();
     ctx.clone().bridge.call(
@@ -196,16 +199,31 @@ fn confirm(ctx: &Rc<AppContext>, preview_id: String) {
                 }
             };
             ctx.toast("Refill started");
+            // A hardware device needs the user: say what it waits for.
+            let waiting = device.map(|name| {
+                let dialog = adw::AlertDialog::new(Some("Refill Spending"), None);
+                dialog.add_response("close", "Close");
+                dialog.present(Some(&ctx.nav));
+                (dialog, name)
+            });
             let done = ctx.clone();
-            ctx.watch_operation(id, move |state| match state {
-                // Done is the broadcast; the history row shows it pending
-                // until it confirms.
-                OperationState::Done => done.toast_now(present::REFILL_SENT),
-                OperationState::Failed { error } => {
-                    alert(&done, "Refill not finished", &present::user_message(error));
+            ctx.watch_operation(id, move |state| {
+                if let Some((dialog, name)) = &waiting {
+                    dialog.set_body(&present::operation_caption(state, name));
+                    if state.is_final() {
+                        dialog.force_close();
+                    }
                 }
-                OperationState::Cancelled => done.toast_now("Refill cancelled"),
-                _ => {}
+                match state {
+                    // Done is the broadcast; the history row shows it pending
+                    // until it confirms.
+                    OperationState::Done => done.toast_now(present::REFILL_SENT),
+                    OperationState::Failed { error } => {
+                        alert(&done, "Refill not finished", &present::user_message(error));
+                    }
+                    OperationState::Cancelled => done.toast_now("Refill cancelled"),
+                    _ => {}
+                }
             });
         },
     );

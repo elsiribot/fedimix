@@ -835,6 +835,14 @@ pub fn confirm_button(
     }
 }
 
+/// Name of the device a refill waits for once confirmed: none for "This
+/// computer", which signs at once and shows nothing to wait for.
+pub fn refill_wait_device(device: Option<&DeviceInfo>) -> Option<String> {
+    device
+        .filter(|d| d.kind != DeviceKind::Software)
+        .map(|d| d.name.clone())
+}
+
 /// Refill dialog note about the overshoot; empty when there is none.
 pub fn refill_overshoot_note(overshoot: Amount) -> String {
     if overshoot == Amount::ZERO {
@@ -1060,6 +1068,25 @@ pub fn settings_from_form(form: &SettingsForm) -> Result<Settings, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refill_waits_for_a_hardware_device_only() {
+        let device = |kind, name: &str| DeviceInfo {
+            id: "d".into(),
+            name: name.into(),
+            kind,
+            connected: true,
+        };
+        assert_eq!(
+            refill_wait_device(Some(&device(DeviceKind::Ledger, "Ledger Nano"))),
+            Some("Ledger Nano".to_string())
+        );
+        assert_eq!(
+            refill_wait_device(Some(&device(DeviceKind::Software, "This computer"))),
+            None
+        );
+        assert_eq!(refill_wait_device(None), None);
+    }
+
     use super::*;
 
     fn preview() -> SendPreview {
