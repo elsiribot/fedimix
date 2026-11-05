@@ -33,9 +33,36 @@ pub struct HistoryRowView {
     pub amount: String,
     pub trailing: String,
     pub nested: Option<String>,
+    /// What the status means for the user, as a sentence.
+    pub note: Option<String>,
     /// Fee and transaction, to read or copy.
     pub detail: Option<String>,
+    pub action: Option<RowAction>,
 }
+
+/// What a history row offers to do about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    /// A stalled Saving send: a new send spends the same coins and replaces it.
+    SendAgain,
+}
+
+impl RowAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SendAgain => "Send again",
+        }
+    }
+}
+
+/// Under a stalled send. A new Saving send replaces it, as the core makes the
+/// next one spend the same coins.
+pub const STALLED_NOTE: &str = "No server holds this payment now, but it may still confirm. \
+Send again to replace it: the new send spends the same coins, so only one of the two can confirm.";
+
+/// Under two pending sends that share a coin.
+pub const CONTESTED_NOTE: &str =
+    "This payment and another one spend the same coins: at most one of them confirms.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueueRowView {
@@ -136,7 +163,7 @@ pub struct SavingEmptyState {
 pub fn saving_empty_state(can_set_up: bool) -> SavingEmptyState {
     if can_set_up {
         SavingEmptyState {
-            title: "Connect a hardware wallet",
+            title: "Connect a hardware wallet or use this computer",
             button: "Set up",
             button_enabled: true,
             caption: None,
@@ -240,6 +267,15 @@ pub fn join_description(has_suggestions: bool) -> &'static str {
     }
 }
 
+/// The icon beside the device line: a computer for the software wallet.
+pub fn device_icon(d: &DeviceInfo) -> &'static str {
+    if d.kind == DeviceKind::Software {
+        "computer-symbolic"
+    } else {
+        "media-removable-symbolic"
+    }
+}
+
 /// Saving tab status line. An unplugged device stays named, so the user
 /// knows what to reach for.
 pub fn device_line(d: &DeviceInfo) -> String {
@@ -250,9 +286,110 @@ pub fn device_line(d: &DeviceInfo) -> String {
     }
 }
 
-pub fn in_flight_line(s: &SavingState) -> Option<String> {
-    (s.in_flight > Amount::ZERO)
+/// Exits are what put money in flight to Saving, so without a scheduler the
+/// line has nothing true to say.
+pub fn in_flight_line(s: &SavingState, features: Features) -> Option<String> {
+    (features.scheduler && s.in_flight > Amount::ZERO)
         .then(|| format!("+{} depositing {CHEVRON}", format::btc(s.in_flight)))
+}
+
+/// Under the setup choice that keeps the keys here.
+pub const SOFTWARE_NOTE: &str =
+    "Keys stay on this computer. A hardware wallet is safer for large amounts.";
+
+/// The core leaves Jade out of the listing while a proxy is set; this says why.
+pub const JADE_PROXY: &str =
+    "Jade needs Blockstream's PIN server, which cannot use your proxy. Clear the proxy to use it.";
+
+/// How a device reads in the setup list.
+pub fn setup_subtitle(d: &DeviceInfo) -> &'static str {
+    match (d.kind, d.connected) {
+        (DeviceKind::Software, _) => SOFTWARE_NOTE,
+        (_, true) => "Connected",
+        (_, false) => "Not connected",
+    }
+}
+
+/// The Settings group for Saving's signer: the spec's "Hardware wallet",
+/// unless Saving lives on this computer.
+pub fn saving_wallet_heading(device: Option<&DeviceInfo>) -> &'static str {
+    match device {
+        Some(d) if d.kind == DeviceKind::Software => "Saving wallet",
+        _ => "Hardware wallet",
+    }
+}
+
+/// Sentences above the setup list: why a hardware wallet may be missing.
+pub fn setup_notes(listing: &DeviceList, proxy_set: bool) -> Vec<String> {
+    let mut notes: Vec<String> = listing.problem.iter().cloned().collect();
+    if proxy_set {
+        notes.push(JADE_PROXY.to_string());
+    }
+    notes
+}
+
+/// Whether the Spending tab offers a refill: there is a Saving with something
+/// in it, and Spending is below its target. An unplugged device still offers
+/// it, as the review asks for the device.
+pub fn refill_offered(spending: &SpendingState, saving: &SavingState) -> bool {
+    spending.features.saving
+        && saving.device.is_some()
+        && saving.balance > Amount::ZERO
+        && spending.for_spending < spending.target
+}
+
+/// Under a Saving address. Plain BIP84 addresses cannot be shown on a device
+/// through async-hwi, so a hardware wallet cannot confirm one; this computer
+/// has nothing to confirm on.
+pub fn device_address_note(device: Option<&DeviceInfo>) -> Option<&'static str> {
+    device
+        .filter(|d| d.kind != DeviceKind::Software)
+        .map(|_| "Your device cannot display this address.")
+}
+
+/// What the Saving tab's banner says about the chain, and what it offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavingBanner {
+    pub text: String,
+    pub button: Option<SavingFix>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavingFix {
+    /// The stored wallet did not open; a setup tries again.
+    SetUpAgain,
+    /// The chain server or proxy is what is wrong.
+    Settings,
+}
+
+impl SavingFix {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SetUpAgain => "Set up again",
+            Self::Settings => "Settings",
+        }
+    }
+}
+
+/// A problem first, as waiting will not cure it; plain offline otherwise, with
+/// the numbers as last known.
+pub fn saving_banner_view(s: &SavingState) -> Option<SavingBanner> {
+    s.device.as_ref()?;
+    match &s.problem {
+        Some(problem) => Some(SavingBanner {
+            text: problem.clone(),
+            button: Some(if s.wallet_open {
+                SavingFix::Settings
+            } else {
+                SavingFix::SetUpAgain
+            }),
+        }),
+        None if !s.chain_online => Some(SavingBanner {
+            text: "Offline \u{b7} last known balance".to_string(),
+            button: None,
+        }),
+        None => None,
+    }
 }
 
 pub fn privacy_tag(t: &PrivacyTag) -> TagView {
@@ -322,6 +459,15 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
             None,
         ),
     };
+    let note = match &item.status {
+        HistoryStatus::Lost { reason } => Some(reason.clone()),
+        HistoryStatus::Stalled => Some(STALLED_NOTE.to_string()),
+        HistoryStatus::Contested => Some(CONTESTED_NOTE.to_string()),
+        _ => None,
+    };
+    let action = (item.status == HistoryStatus::Stalled
+        && matches!(item.kind, HistoryKind::Sent { .. }))
+    .then_some(RowAction::SendAgain);
     let trailing = match &item.status {
         HistoryStatus::Confirming {
             confirmations,
@@ -333,6 +479,7 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         HistoryStatus::Refunded => "refunded".to_string(),
         HistoryStatus::Stalled => "not confirmed, may still go through".to_string(),
         HistoryStatus::Lost { .. } => "not sent".to_string(),
+        HistoryStatus::Contested => "pending, one of two".to_string(),
         HistoryStatus::Expired => "expired".to_string(),
     };
     HistoryRowView {
@@ -342,7 +489,9 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         amount: format::signed(item.amount, item.incoming),
         trailing,
         nested,
+        note,
         detail: history_detail(item),
+        action,
     }
 }
 
@@ -437,6 +586,31 @@ fn sentence_or(lead: &str, why: &str) -> String {
     } else {
         format!("{lead}: {why}")
     }
+}
+
+/// A Send review that cannot be made, said against what the user sees. A
+/// Saving refusal carries what can be sent now, which can be less than the
+/// balance shown: say why, or it reads as a wrong number.
+pub fn send_error(
+    e: &fedimix_core::FedimixError,
+    wallet: WalletKind,
+    balance: Option<Amount>,
+) -> String {
+    if let fedimix_core::FedimixError::InsufficientFunds { available, needed } = e
+        && wallet == WalletKind::Saving
+    {
+        let base = format!(
+            "Not enough funds: {available} can be sent now, {needed} needed including the fee."
+        );
+        return match balance {
+            Some(balance) if balance > *available => format!(
+                "{base} Of the {balance} in Saving, coins you froze and coins held by a payment \
+                 that has not confirmed cannot be sent."
+            ),
+            _ => base,
+        };
+    }
+    user_message(e)
 }
 
 /// The text shown to the user for any core error. The core's sentences say
@@ -1026,6 +1200,215 @@ mod tests {
         assert_eq!(device_line(&d), "Coldcard \u{b7} Not connected");
     }
 
+    fn device_of(kind: DeviceKind, connected: bool) -> DeviceInfo {
+        DeviceInfo {
+            id: "d".into(),
+            name: "Ledger Nano S+".into(),
+            kind,
+            connected,
+        }
+    }
+
+    /// Plain BIP84 addresses cannot be shown on a device through async-hwi;
+    /// the software wallet has no screen to show one on, so says nothing.
+    #[test]
+    fn device_cannot_show_address() {
+        for kind in [
+            DeviceKind::Ledger,
+            DeviceKind::Coldcard,
+            DeviceKind::Jade,
+            DeviceKind::BitBox,
+        ] {
+            assert_eq!(
+                device_address_note(Some(&device_of(kind, false))),
+                Some("Your device cannot display this address."),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            device_address_note(Some(&device_of(DeviceKind::Software, true))),
+            None
+        );
+        assert_eq!(device_address_note(None), None);
+    }
+
+    fn saving_with(device: Option<DeviceInfo>, balance: Amount) -> SavingState {
+        SavingState {
+            device,
+            balance,
+            in_flight: Amount::ZERO,
+            coins: vec![],
+            history: vec![],
+            chain_online: true,
+            problem: None,
+            wallet_open: true,
+        }
+    }
+
+    #[test]
+    fn refill_offered_only_with_saving_below_target() {
+        let computer = || Some(device_of(DeviceKind::Software, true));
+        let below = spending(0.01, 0.0, 0.05, true);
+        let at = spending(0.05, 0.0, 0.05, true);
+        assert!(refill_offered(&below, &saving_with(computer(), btc(0.2))));
+        assert!(!refill_offered(&at, &saving_with(computer(), btc(0.2))));
+        let above = spending(0.05, 0.3, 0.05, true);
+        assert!(!refill_offered(&above, &saving_with(computer(), btc(0.2))));
+        // Nothing in Saving to refill from.
+        assert!(!refill_offered(
+            &below,
+            &saving_with(computer(), Amount::ZERO)
+        ));
+        // No Saving at all.
+        let unset = spending(0.01, 0.0, 0.05, false);
+        assert!(!refill_offered(&unset, &saving_with(None, Amount::ZERO)));
+        // An unplugged device still offers it: the review asks for the device.
+        let unplugged = Some(device_of(DeviceKind::Ledger, false));
+        assert!(refill_offered(&below, &saving_with(unplugged, btc(0.2))));
+        // A backend without Saving never does.
+        let none = SpendingState {
+            features: Features::NONE,
+            ..below.clone()
+        };
+        assert!(!refill_offered(&none, &saving_with(computer(), btc(0.2))));
+    }
+
+    #[test]
+    fn setup_lists_this_computer_with_its_warning_and_says_why_a_device_is_missing() {
+        let computer = device_of(DeviceKind::Software, true);
+        assert_eq!(
+            setup_subtitle(&computer),
+            "Keys stay on this computer. A hardware wallet is safer for large amounts."
+        );
+        assert_eq!(
+            setup_subtitle(&device_of(DeviceKind::Ledger, true)),
+            "Connected"
+        );
+        let listing = DeviceList {
+            devices: vec![computer],
+            problem: Some("Fedimix cannot look for USB devices.".into()),
+        };
+        assert_eq!(
+            setup_notes(&listing, false),
+            ["Fedimix cannot look for USB devices."]
+        );
+        let notes = setup_notes(&listing, true);
+        assert_eq!(notes.len(), 2);
+        assert!(notes[1].starts_with("Jade needs Blockstream's PIN server"));
+    }
+
+    #[test]
+    fn settings_names_the_saving_wallet_by_what_holds_the_keys() {
+        assert_eq!(saving_wallet_heading(None), "Hardware wallet");
+        let ledger = device_of(DeviceKind::Ledger, false);
+        assert_eq!(saving_wallet_heading(Some(&ledger)), "Hardware wallet");
+        let computer = device_of(DeviceKind::Software, true);
+        assert_eq!(saving_wallet_heading(Some(&computer)), "Saving wallet");
+    }
+
+    #[test]
+    fn the_saving_banner_says_the_problem_and_offers_its_fix() {
+        let computer = || Some(device_of(DeviceKind::Software, true));
+        assert_eq!(
+            saving_banner_view(&saving_with(computer(), Amount::ZERO)),
+            None
+        );
+        let offline = SavingState {
+            chain_online: false,
+            ..saving_with(computer(), Amount::ZERO)
+        };
+        let banner = saving_banner_view(&offline).unwrap();
+        assert!(banner.text.starts_with("Offline"));
+        assert_eq!(banner.button, None);
+        let no_server = SavingState {
+            problem: Some("Enter a chain server in Settings.".into()),
+            ..offline.clone()
+        };
+        assert_eq!(
+            saving_banner_view(&no_server),
+            Some(SavingBanner {
+                text: "Enter a chain server in Settings.".into(),
+                button: Some(SavingFix::Settings),
+            })
+        );
+        // The stored wallet did not open: a setup is the way out.
+        let broken = SavingState {
+            wallet_open: false,
+            ..no_server
+        };
+        assert_eq!(
+            saving_banner_view(&broken).unwrap().button,
+            Some(SavingFix::SetUpAgain)
+        );
+        // Not set up: the empty state speaks instead.
+        assert_eq!(saving_banner_view(&saving_with(None, Amount::ZERO)), None);
+    }
+
+    #[test]
+    fn saving_rows_say_what_their_status_means() {
+        let sent = HistoryKind::Sent { change: None };
+        let lost = history_row(
+            &hist(
+                sent.clone(),
+                false,
+                HistoryStatus::Lost {
+                    reason: "Not sent: your refill of 0.01 BTC confirmed instead.".into(),
+                },
+            ),
+            0,
+        );
+        assert_eq!(lost.trailing, "not sent");
+        assert_eq!(
+            lost.note.as_deref(),
+            Some("Not sent: your refill of 0.01 BTC confirmed instead.")
+        );
+        assert_eq!(lost.action, None);
+        let stalled = history_row(&hist(sent.clone(), false, HistoryStatus::Stalled), 0);
+        assert_eq!(stalled.note.as_deref(), Some(STALLED_NOTE));
+        assert_eq!(stalled.action, Some(RowAction::SendAgain));
+        assert_eq!(RowAction::SendAgain.label(), "Send again");
+        // A stalled refill is not sent again from the Send form.
+        let refill = history_row(&hist(HistoryKind::Refill, false, HistoryStatus::Stalled), 0);
+        assert_eq!(refill.action, None);
+        let contested = history_row(&hist(sent, false, HistoryStatus::Contested), 0);
+        assert_eq!(contested.trailing, "pending, one of two");
+        assert!(
+            contested
+                .note
+                .unwrap()
+                .contains("at most one of them confirms")
+        );
+        let refill = history_row(&hist(HistoryKind::Refill, false, HistoryStatus::Pending), 0);
+        assert_eq!(refill.title, "Refill \u{2192} Spending");
+    }
+
+    #[test]
+    fn a_saving_shortfall_is_explained_against_the_balance() {
+        use fedimix_core::FedimixError as E;
+        let short = E::InsufficientFunds {
+            available: btc(0.01),
+            needed: btc(0.02),
+        };
+        let text = send_error(&short, WalletKind::Saving, Some(btc(0.05)));
+        assert!(
+            text.starts_with(
+                "Not enough funds: 0.01 BTC can be sent now, 0.02 BTC needed including the fee."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Of the 0.05 BTC in Saving"), "{text}");
+        let all = send_error(&short, WalletKind::Saving, Some(btc(0.01)));
+        assert!(!all.contains("Of the"), "{all}");
+        assert_eq!(
+            send_error(&short, WalletKind::Spending, Some(btc(0.05))),
+            user_message(&short)
+        );
+        assert_eq!(
+            send_error(&E::Offline, WalletKind::Saving, None),
+            user_message(&E::Offline)
+        );
+    }
+
     #[test]
     fn in_flight_hidden_when_zero() {
         let mut s = SavingState {
@@ -1036,13 +1419,20 @@ mod tests {
             history: vec![],
             chain_online: true,
             problem: None,
+            wallet_open: true,
         };
         assert_eq!(
-            in_flight_line(&s),
+            in_flight_line(&s, Features::ALL),
             Some("+0.4200 BTC depositing \u{203a}".to_string())
         );
+        // Until Phase 4 nothing moves to Saving, so the line says nothing.
+        let saving_only = Features {
+            saving: true,
+            ..Features::NONE
+        };
+        assert_eq!(in_flight_line(&s, saving_only), None);
         s.in_flight = Amount::ZERO;
-        assert_eq!(in_flight_line(&s), None);
+        assert_eq!(in_flight_line(&s, Features::ALL), None);
     }
 
     #[test]
@@ -1345,7 +1735,7 @@ mod tests {
         assert_ne!(real.title, real.button, "the page must not say it twice");
 
         let demo = saving_empty_state(true);
-        assert_eq!(demo.title, "Connect a hardware wallet");
+        assert_eq!(demo.title, "Connect a hardware wallet or use this computer");
         assert_eq!(demo.button, "Set up");
         assert!(demo.button_enabled);
         assert_eq!(demo.caption, None);
@@ -1862,7 +2252,7 @@ mod tests {
         let caption = spending_caption(&sp);
         assert!(caption.queue_link.is_some() && !caption.shows_refill);
         let saving = core.saving_state().await.unwrap();
-        assert!(in_flight_line(&saving).is_some());
+        assert!(in_flight_line(&saving, sp.features).is_some());
         let preview = core
             .prepare_send(SendRequest {
                 wallet: WalletKind::Saving,

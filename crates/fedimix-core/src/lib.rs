@@ -51,6 +51,42 @@ pub mod testing {
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 
+    /// The id and name of the device `real_backend_with_test_signer` lists.
+    #[cfg(feature = "testing")]
+    pub const TEST_SIGNER_ID: &str = "ledger:test";
+    #[cfg(feature = "testing")]
+    pub const TEST_SIGNER_NAME: &str = "Test Ledger";
+
+    /// The production [`crate::RealBackend`], but with one device: a Ledger
+    /// in the listing that signs with `xprv`, or declines when `rejects`, as
+    /// the core tests stand in for hardware. For the real UI flows only.
+    #[cfg(feature = "testing")]
+    pub async fn real_backend_with_test_signer(
+        config: crate::CoreConfig,
+        xprv: &str,
+        rejects: bool,
+    ) -> crate::Result<std::sync::Arc<crate::RealBackend>> {
+        let signer = SoftSigner::from_xprv(xprv)?;
+        let signer = if rejects { signer.rejecting() } else { signer };
+        let devices = FakeDevices::new();
+        devices.add(
+            TEST_SIGNER_ID,
+            TEST_SIGNER_NAME,
+            crate::DeviceKind::Ledger,
+            std::sync::Arc::new(signer),
+        );
+        let port = std::sync::Arc::new(FedimintPort::new(std::path::Path::new(&config.data_dir)));
+        crate::RealBackend::with_ports(
+            config,
+            port,
+            std::sync::Arc::new(|backend: &crate::ChainBackend, proxy: Option<&str>| {
+                connect_chain(backend, proxy)
+            }),
+            std::sync::Arc::new(devices),
+        )
+        .await
+    }
+
     /// [`crate::RealBackend`] over `port`, reading the time from `clock`, with
     /// the real chain connector and no devices.
     #[cfg(feature = "testing")]

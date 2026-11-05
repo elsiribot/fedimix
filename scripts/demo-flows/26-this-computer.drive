@@ -1,0 +1,24 @@
+# scenario: no-saving
+# Saving on this computer: listed after the hardware wallet with its warning,
+# no device to connect, and no claim that the device shows the address.
+click Saving
+expect Connect a hardware wallet or use this computer
+click Set up
+expect Ledger Nano S+
+expect Keys stay on this computer. A hardware wallet is safer for large amounts.
+shot setup
+click This computer
+expect Saving is set up
+expect This computer
+expect-not Not connected
+shot saving
+click Receive
+expect bc1qdemo
+expect Coins received this way are marked unmixed
+expect-not Your device cannot display this address
+shot receive
+close-dialog
+action app.settings
+expect Saving wallet
+expect Keys stay on this computer
+shot settings

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Drives the real binary against a devimint federation under headless sway: Join
 # from the invite, receive over Lightning from LND, restart, a second launch on
-# the same folder, a Lightning payment to a second wallet, and the folder refusing
-# another network. Needs the
-# `integration` dev shell; see `just test-real-ui`.
+# the same folder, a Lightning payment to a second wallet, Saving on this
+# computer (setup, a receive from bitcoind, a send whose change reaches
+# Spending, a refill), the testing build's Ledger stand-in declining to sign, and
+# the folder refusing another network. Needs the `integration` dev shell; see
+# `just test-real-ui`. Built with `fedimix-gtk/testing` for `--test-signer`; the
+# Saving flows on this computer do not use it.
 # Output: target/screenshots/real/<flow>-<shot>.png
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -20,9 +23,20 @@ passed="=== real UI steps passed ==="
 
 work=""
 sway_pid=""
+miner_pid=""
 app_pids=()
 
+btc() { $FM_BTC_CLIENT -rpcwallet=default "$@"; }
+mine() { btc generatetoaddress "$1" "$(btc getnewaddress)" >/dev/null; }
+
+# Saving and the federation's deposits wait on blocks: one every 2 s.
+start_miner() {
+    (while sleep 2; do mine 1 || true; done) &
+    miner_pid=$!
+}
+
 cleanup() {
+    [[ -n "$miner_pid" ]] && kill "$miner_pid" 2>/dev/null || true
     for pid in ${app_pids[@]+"${app_pids[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
@@ -54,18 +68,22 @@ start_sway() {
 # `shot` steps, and calls `on_shot_<name> <shot>` for each if that is defined.
 # `exited` is the final line of an app that never printed a DRIVE line, so no
 # flow may want it. Returns 1 unless all match. The network is $flow_network,
-# regtest by default.
+# regtest by default; the folder $flow_dir, $work/wallet by default; any
+# further arguments for the app are in $flow_args.
 flow() {
     local name="$1" wanted_exit="$2" wanted_line="$3" wanted_err="${4:-}"
     local out="$work/$name.out" err="$work/$name.err" stdin="$work/$name.stdin"
-    local fd pid seen=0 total line status="" deadline=$((SECONDS + 400)) code=0
+    local fd pid seen=0 total line status="" deadline=$((SECONDS + 900)) code=0
+    local extra=()
+    read -r -a extra <<<"${flow_args:-}"
     : > "$out"
     rm -f "$stdin"
     mkfifo "$stdin"
     exec {fd}<>"$stdin"
     (cd "$work" && LD_LIBRARY_PATH="${FEDIMIX_UI_LD_LIBRARY_PATH:-}" \
         GDK_BACKEND=wayland GSK_RENDERER=cairo GTK_A11Y=none \
-        exec "$root/target/debug/fedimix" --data-dir "$work/wallet" --network "${flow_network:-regtest}" \
+        exec "$root/target/debug/fedimix" --data-dir "${flow_dir:-$work/wallet}" \
+        --network "${flow_network:-regtest}" ${extra[@]+"${extra[@]}"} \
         --demo-drive "$root/scripts/real-flows/$name.drive") \
         <&"$fd" >"$out" 2>"$err" &
     pid=$!
@@ -161,6 +179,46 @@ pay_second_wallet() {
     return 1
 }
 
+# Pays `amount` BTC to the address the flow saved in `file`, and mines it.
+fund_saving() {
+    local file="$1" amount="$2"
+    btc -named sendtoaddress address="$(cat "$work/$file")" amount="$amount" >/dev/null
+    mine 1
+    echo "paid $amount BTC to Saving at $(cat "$work/$file")"
+}
+
+on_shot_saving-setup() {
+    if [[ "$1" == address ]]; then fund_saving saving-address.txt 0.01; fi
+}
+on_shot_saving-refill() {
+    if [[ "$1" == address ]]; then fund_saving saving-address-2.txt 0.005; fi
+}
+on_shot_saving-test-signer() {
+    if [[ "$1" == address ]]; then fund_saving ledger-address.txt 0.004; fi
+}
+
+# The stand-in Ledger's key: the master key of a bitcoind wallet of its own,
+# which nothing else spends from. Its second line makes it decline to sign.
+test_signer_key() {
+    $FM_BTC_CLIENT -named createwallet wallet_name=test-signer >/dev/null
+    $FM_BTC_CLIENT -rpcwallet=test-signer listdescriptors true |
+        grep -o 'tprv[1-9A-HJ-NP-Za-km-z]*' | sed -n 1p > "$work/test-signer.key"
+    [[ -s "$work/test-signer.key" ]] || { echo "no tprv from bitcoind" >&2; return 1; }
+    echo rejects >> "$work/test-signer.key"
+}
+
+saving_flows() {
+    start_miner
+    export FEDIMIX_SAVING_DEST
+    FEDIMIX_SAVING_DEST=$(btc getnewaddress)
+    flow saving-setup 0 "DRIVE OK"
+    flow saving-send 0 "DRIVE OK"
+    flow saving-refill 0 "DRIVE OK"
+    test_signer_key
+    flow_dir="$work/ledger-wallet" flow_args="--test-signer $work/test-signer.key" \
+        flow saving-test-signer 0 "DRIVE OK"
+}
+
 inner() {
     trap cleanup EXIT
     work="$(mktemp -d -p "${XDG_CACHE_HOME:-$HOME/.cache}")"
@@ -173,6 +231,7 @@ inner() {
     [[ -n "$paid" ]] || { echo "LND paid no invoice" >&2; return 1; }
     flow reopen 0 "DRIVE OK"
     pay_second_wallet
+    saving_flows
     flow_network=signet flow wrong-network 1 "DRIVE OK" \
         "This data folder is for regtest, but Fedimix was started for signet."
     echo "$passed"
@@ -185,7 +244,7 @@ fi
 
 # ---- Outside: same shape as scripts/test-integration.sh ----
 
-cargo build -q -p fedimix-gtk
+cargo build -q -p fedimix-gtk --features fedimix-gtk/testing
 
 out="$(mktemp)"
 trap 'rm -f "$out"' EXIT

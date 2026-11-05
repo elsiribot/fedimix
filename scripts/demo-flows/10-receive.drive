@@ -17,3 +17,11 @@ click On-chain
 expect bc1qdemo
 expect Deposits of 10000 sat or less are not credited.
 shot address
+close-dialog
+# Saving on a hardware wallet: the address cannot be checked on the device.
+click Saving
+click Receive
+expect bc1qdemo
+expect Coins received this way are marked unmixed
+expect Your device cannot display this address.
+shot saving-address

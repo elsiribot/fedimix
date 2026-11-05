@@ -28,8 +28,7 @@ use crate::store::{SignedState, SignedTx};
 
 const AT_TARGET: &str = "Spending is at or above its target, so there is nothing to refill.";
 const NO_FEDERATION: &str = "Join a federation first: a refill pays into it.";
-const NOT_CREDITED: &str =
-    "Your last refill has not reached Spending yet. Refill again once Spending shows it.";
+const NOT_CREDITED: &str = "Your last refill has not reached Spending yet. Refill again once Spending shows it. Until then Fedimix cannot tell what Spending holds, so it refills no federation, this one or another.";
 const ON_ITS_WAY: &str = "Spending reaches its target with the money already on its way to it, so there is nothing to refill.";
 
 impl Core {

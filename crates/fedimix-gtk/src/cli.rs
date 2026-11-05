@@ -59,7 +59,15 @@ pub struct Args {
     /// `None` picks the network's default folder.
     pub data_dir: Option<PathBuf>,
     pub network: Network,
+    /// A file holding an extended private key: a Ledger-kind device signs
+    /// with it. Only a build with the `testing` feature has it.
+    #[cfg(feature = "testing")]
+    pub test_signer: Option<PathBuf>,
 }
+
+/// Why `--test-signer` is refused in every other build.
+#[cfg(not(feature = "testing"))]
+const NO_TEST_SIGNER: &str = "--test-signer exists only in a build with the testing feature";
 
 /// Where `network` keeps its data unless `--data-dir` says otherwise.
 pub fn default_data_dir(
@@ -87,6 +95,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut demo_step_ms = None;
     let mut data_dir = None;
     let mut network = None;
+    #[cfg(feature = "testing")]
+    let mut test_signer: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--demo" => demo = true,
@@ -117,6 +127,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let v = args.next().ok_or("--network needs a value")?;
                 network = Some(v.parse::<Network>()?);
             }
+            #[cfg(feature = "testing")]
+            "--test-signer" => {
+                let v = args.next().ok_or("--test-signer needs a key file")?;
+                test_signer = Some(PathBuf::from(v));
+            }
+            #[cfg(not(feature = "testing"))]
+            "--test-signer" => return Err(NO_TEST_SIGNER.to_string()),
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -130,6 +147,11 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     if !demo && drive.is_some() && network.is_none_or(|n| n == Network::Bitcoin) {
         return Err("--demo-drive is refused on --network bitcoin".to_string());
     }
+    // A key on disk signs real money, so it never runs on real bitcoin either.
+    #[cfg(feature = "testing")]
+    if test_signer.is_some() && (demo || network.is_none_or(|n| n == Network::Bitcoin)) {
+        return Err("--test-signer needs --network regtest or signet, without --demo".to_string());
+    }
     Ok(Args {
         demo,
         scenario: scenario.unwrap_or(DemoScenario::Funded),
@@ -138,6 +160,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         demo_step_ms,
         data_dir,
         network: network.unwrap_or(Network::Bitcoin),
+        #[cfg(feature = "testing")]
+        test_signer,
     })
 }
 
@@ -271,6 +295,26 @@ mod tests {
             );
         }
         assert_eq!(dir(Network::Bitcoin, None, None), None);
+    }
+
+    /// The test signer exists only in a build with the `testing` feature; any
+    /// other build refuses the flag by name, so no release binary takes it.
+    #[test]
+    fn test_signer_needs_the_feature() {
+        let args = p(&["--network", "regtest", "--test-signer", "key.xprv"]);
+        #[cfg(feature = "testing")]
+        {
+            let a = args.unwrap();
+            assert_eq!(a.test_signer, Some("key.xprv".into()));
+            assert!(p(&["--network", "regtest", "--test-signer"]).is_err());
+            assert!(p(&["--demo", "--test-signer", "key.xprv"]).is_err());
+            assert!(p(&["--test-signer", "key.xprv"]).is_err(), "not on bitcoin");
+        }
+        #[cfg(not(feature = "testing"))]
+        assert_eq!(
+            args.unwrap_err(),
+            "--test-signer exists only in a build with the testing feature"
+        );
     }
 
     #[test]

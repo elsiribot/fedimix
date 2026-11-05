@@ -216,7 +216,11 @@ fn build(
                             Ok(preview) => {
                                 nav.push(&review_page(&ctx, &dialog, &nav, &error, preview));
                             }
-                            Err(e) => set_error(&error, Some(&present::user_message(&e))),
+                            Err(e) => {
+                                let balance = ctx.latest().map(|s| s.saving.balance);
+                                let text = present::send_error(&e, wallet, balance);
+                                set_error(&error, Some(&text));
+                            }
                         }
                     }
                 ),
@@ -461,6 +465,17 @@ fn review_page(
         .build();
     body.append(hero.widget());
     body.append(&revealer);
+    // Why less than the balance can go, or that this replaces a stalled send.
+    for note in &preview.notes {
+        let line = gtk::Label::builder()
+            .label(note)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .xalign(0.0)
+            .build();
+        line.add_css_class("dim-label");
+        body.append(&line);
+    }
     body.append(&caption("To"));
     body.append(&long_text(&preview.destination));
     body.append(&caption(present::fee_label(wallet)));

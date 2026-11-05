@@ -1,0 +1,38 @@
+# A refill below the target: fund Saving again, raise the target, refill on
+# this computer, and Spending reaches the target.
+expect-slow This computer
+click Receive
+# A scan may still run: Retry, as a user would.
+retry-until 120 bcrt1
+save-text bcrt1 saving-address-2.txt
+# The script pays 0.005 BTC to it and mines.
+shot address
+close-dialog
+expect-within 180 0.0050 BTC
+action app.settings
+expect Saving wallet
+expect-not Anonymity target
+expect-not Budget (sat per month)
+type "Target (BTC)" 0.011
+wait 800
+click Back
+click Spending
+expect of 0.011 target
+expect Refill from Saving
+shot below-target
+click Refill from Saving
+expect-slow Refill Spending
+expect Confirm on This computer
+expect from Saving · fee
+shot dialog
+click Confirm on This computer
+expect Refill started
+expect-slow Refill confirmed
+click Saving
+expect Refill → Spending
+shot refilled
+click Spending
+# Once credited, Spending is at its target and no refill is offered.
+expect-within 400 for spending
+expect-not Refill from Saving
+shot refill-arrived

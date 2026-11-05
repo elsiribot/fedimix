@@ -526,14 +526,14 @@ impl Inner {
         self.url.set_visible(features.saving);
         match &s.saving.device {
             Some(device) => {
+                self.hardware
+                    .set_title(present::saving_wallet_heading(Some(device)));
                 self.hw_name.set_subtitle(&device.name);
-                self.hw_status.set_subtitle(if device.connected {
-                    "Connected"
-                } else {
-                    "Not connected"
-                });
+                self.hw_status.set_subtitle(present::setup_subtitle(device));
             }
             None => {
+                self.hardware
+                    .set_title(present::saving_wallet_heading(None));
                 self.hw_name.set_subtitle("None");
                 self.hw_status.set_subtitle("Not set up");
             }

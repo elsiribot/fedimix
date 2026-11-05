@@ -227,6 +227,9 @@ pub enum HistoryStatus {
     Lost {
         reason: String,
     },
+    /// A Saving payment on the network beside another of ours that spends a
+    /// coin of it: at most one of the two confirms. Never stored.
+    Contested,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,6 +294,9 @@ pub struct SavingState {
     /// What the user can do about the chain server, as a sentence. Being
     /// offline is not one: waiting cures that.
     pub problem: Option<String>,
+    /// The wallet of the stored account opened. `false` with `device` set means
+    /// it could not, `problem` says why, and `setup_saving` tries again.
+    pub wallet_open: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

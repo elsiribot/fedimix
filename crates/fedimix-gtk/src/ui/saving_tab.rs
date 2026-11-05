@@ -4,29 +4,33 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use fedimix_core::{SavingState, WalletKind};
+use fedimix_core::{Features, SavingState, WalletKind};
 
 use crate::present;
 use crate::ui::app_state::{AppContext, Snapshots};
 use crate::ui::history_list::HistoryList;
-use crate::ui::{coins_page, setup_saving, widgets};
+use crate::ui::{coins_page, settings_page, setup_saving, widgets};
 
 struct Inner {
+    /// The chain server's problem or being offline, and what fixes it.
+    banner: adw::Banner,
+    fix: std::cell::Cell<Option<present::SavingFix>>,
     pages: gtk::Stack,
     empty: adw::StatusPage,
     setup: gtk::Button,
     setup_note: gtk::Label,
+    device_icon: gtk::Image,
     device_label: gtk::Label,
     balance: widgets::AmountButton,
     in_flight: gtk::Button,
     history: HistoryList,
     /// Last state rendered, to skip identical rebuilds.
-    last: RefCell<Option<SavingState>>,
+    last: RefCell<Option<(SavingState, Features)>>,
 }
 
 #[derive(Clone)]
 pub struct SavingTab {
-    root: gtk::ScrolledWindow,
+    root: gtk::Box,
 }
 
 impl SavingTab {
@@ -40,7 +44,8 @@ impl SavingTab {
             .halign(gtk::Align::Center)
             .build();
         device_row.add_css_class("dim-label");
-        device_row.append(&gtk::Image::from_icon_name("media-removable-symbolic"));
+        let device_icon = gtk::Image::from_icon_name("media-removable-symbolic");
+        device_row.append(&device_icon);
         device_row.append(&device_label);
 
         let balance = widgets::amount_button("hero-balance");
@@ -110,16 +115,26 @@ impl SavingTab {
             .maximum_size(600)
             .child(&pages)
             .build();
-        let root = gtk::ScrolledWindow::builder()
+        let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
             .child(&clamp)
             .build();
+        let banner = adw::Banner::new("");
+        // A chain server's words can reach it, so it is not markup.
+        banner.set_use_markup(false);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&banner);
+        root.append(&scroll);
 
         let inner = Rc::new(Inner {
+            banner: banner.clone(),
+            fix: std::cell::Cell::new(None),
             pages,
             empty,
             setup,
             setup_note,
+            device_icon,
             device_label,
             balance,
             in_flight,
@@ -127,6 +142,15 @@ impl SavingTab {
             last: RefCell::new(None),
         });
         let weak: Weak<Inner> = Rc::downgrade(&inner);
+        banner.connect_button_clicked({
+            let ctx = ctx.clone();
+            let weak = weak.clone();
+            move |_| match weak.upgrade().and_then(|inner| inner.fix.get()) {
+                Some(present::SavingFix::SetUpAgain) => setup_saving::open(&ctx),
+                Some(present::SavingFix::Settings) => settings_page::push(&ctx),
+                None => {}
+            }
+        });
         ctx.on_snapshots(move |s| match weak.upgrade() {
             Some(inner) => {
                 inner.update(s);
@@ -144,17 +168,29 @@ impl SavingTab {
         Self { root }
     }
 
-    pub fn widget(&self) -> &gtk::ScrolledWindow {
+    pub fn widget(&self) -> &gtk::Box {
         &self.root
     }
 }
 
 impl Inner {
     fn update(&self, s: &Snapshots) {
-        if self.last.borrow().as_ref() == Some(&s.saving) {
+        let shown = (s.saving.clone(), s.spending.features);
+        if self.last.borrow().as_ref() == Some(&shown) {
             return;
         }
         let saving = &s.saving;
+        let banner = present::saving_banner_view(saving);
+        self.fix.set(banner.as_ref().and_then(|b| b.button));
+        self.banner
+            .set_title(banner.as_ref().map_or("", |b| b.text.as_str()));
+        self.banner.set_button_label(
+            banner
+                .as_ref()
+                .and_then(|b| b.button)
+                .map(present::SavingFix::label),
+        );
+        self.banner.set_revealed(banner.is_some());
         match &saving.device {
             None => {
                 let empty = present::saving_empty_state(s.spending.features.saving);
@@ -167,9 +203,11 @@ impl Inner {
             }
             Some(device) => {
                 self.pages.set_visible_child_name("content");
+                self.device_icon
+                    .set_icon_name(Some(present::device_icon(device)));
                 self.device_label.set_label(&present::device_line(device));
                 self.balance.set_amount(&crate::format::btc(saving.balance));
-                match present::in_flight_line(saving) {
+                match present::in_flight_line(saving, s.spending.features) {
                     Some(line) => {
                         self.in_flight.set_label(&line);
                         self.in_flight.set_visible(true);
@@ -179,6 +217,6 @@ impl Inner {
                 self.history.set_snapshot(&saving.history, true);
             }
         }
-        *self.last.borrow_mut() = Some(saving.clone());
+        *self.last.borrow_mut() = Some(shown);
     }
 }

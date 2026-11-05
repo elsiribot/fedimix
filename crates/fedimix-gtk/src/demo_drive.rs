@@ -18,6 +18,12 @@
 //!   of the mapped label containing `<text>` to `<path>`, relative to the
 //!   working directory. Polls up to 3 s.
 //! - `expect-slow <text>`: as `expect`, for a real federation: up to 60 s.
+//! - `expect-within <seconds> <text>`: as `expect`, for up to `<seconds>`, for
+//!   what waits on blocks and a federation's poll.
+//! - `expect-gone-within <seconds> <text>`: as `expect-not`, for up to
+//!   `<seconds>`.
+//! - `retry-until <seconds> <text>`: as `expect-within`, clicking a usable
+//!   `Retry` each second meanwhile, as a user would while a wallet scans.
 //! - `expect-numbered <n>`: the mapped labels hold exactly the words `1. x` to
 //!   `<n>. x`, each one word.
 //! - `expect-clipboard <text>`: the clipboard holds `<text>`.
@@ -66,6 +72,9 @@ pub enum Step {
     SaveText { text: String, path: String },
     Expect(String),
     ExpectSlow(String),
+    ExpectWithin { secs: u64, text: String },
+    ExpectGoneWithin { secs: u64, text: String },
+    RetryUntil { secs: u64, text: String },
     ExpectClipboard(String),
     ExpectClipboardEmpty,
     ExpectNumbered(u32),
@@ -111,6 +120,18 @@ fn parse_line(line: &str) -> Result<Step, String> {
         "click" => Step::Click(need("a label")?),
         "expect" => Step::Expect(need("text")?),
         "expect-slow" => Step::ExpectSlow(need("text")?),
+        "expect-within" => {
+            let (secs, text) = seconds_and_text(cmd, rest)?;
+            Step::ExpectWithin { secs, text }
+        }
+        "retry-until" => {
+            let (secs, text) = seconds_and_text(cmd, rest)?;
+            Step::RetryUntil { secs, text }
+        }
+        "expect-gone-within" => {
+            let (secs, text) = seconds_and_text(cmd, rest)?;
+            Step::ExpectGoneWithin { secs, text }
+        }
         "expect-clipboard" => Step::ExpectClipboard(need("text")?),
         "expect-clipboard-empty" => Step::ExpectClipboardEmpty,
         "expect-numbered" => Step::ExpectNumbered(
@@ -159,6 +180,17 @@ fn parse_line(line: &str) -> Result<Step, String> {
     })
 }
 
+/// `<seconds> <text>`.
+fn seconds_and_text(cmd: &str, rest: &str) -> Result<(u64, String), String> {
+    let (secs, text) = rest
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| format!("'{cmd}' needs seconds and text"))?;
+    let secs = secs
+        .parse()
+        .map_err(|_| format!("'{cmd}' needs seconds, got '{secs}'"))?;
+    Ok((secs, text.trim().to_string()))
+}
+
 /// `<first> <rest>`, where `<first>` may be in double quotes.
 fn two_args(cmd: &str, rest: &str) -> Result<(String, String), String> {
     let (first, second) = if let Some(quoted) = rest.strip_prefix('"') {
@@ -186,6 +218,11 @@ impl fmt::Display for Step {
             Step::SaveText { text, path } => write!(f, "save-text \"{text}\" {path}"),
             Step::Expect(t) => write!(f, "expect {t}"),
             Step::ExpectSlow(t) => write!(f, "expect-slow {t}"),
+            Step::ExpectWithin { secs, text } => write!(f, "expect-within {secs} {text}"),
+            Step::ExpectGoneWithin { secs, text } => {
+                write!(f, "expect-gone-within {secs} {text}")
+            }
+            Step::RetryUntil { secs, text } => write!(f, "retry-until {secs} {text}"),
             Step::ExpectClipboard(t) => write!(f, "expect-clipboard {t}"),
             Step::ExpectClipboardEmpty => write!(f, "expect-clipboard-empty"),
             Step::ExpectNumbered(n) => write!(f, "expect-numbered {n}"),
@@ -276,6 +313,36 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
             })
             .await
             .ok_or_else(|| format!("no visible label containing '{text}'"))?;
+        }
+        Step::ExpectWithin { secs, text } => {
+            poll_up_to(polls_in(*secs), || {
+                has_label_containing(env, text).then_some(())
+            })
+            .await
+            .ok_or_else(|| format!("no visible label containing '{text}' within {secs} s"))?;
+        }
+        Step::RetryUntil { secs, text } => {
+            let mut found = false;
+            for _ in 0..*secs {
+                if has_label_containing(env, text) {
+                    found = true;
+                    break;
+                }
+                click(env, "Retry");
+                glib::timeout_future(Duration::from_secs(1)).await;
+            }
+            if !(found || has_label_containing(env, text)) {
+                return Err(format!(
+                    "no visible label containing '{text}' within {secs} s"
+                ));
+            }
+        }
+        Step::ExpectGoneWithin { secs, text } => {
+            poll_up_to(polls_in(*secs), || {
+                (!has_label_containing(env, text)).then_some(())
+            })
+            .await
+            .ok_or_else(|| format!("a visible label still contains '{text}' after {secs} s"))?;
         }
         Step::ExpectNumbered(n) => {
             poll(|| numbered_words_are(&mapped_labels(env), *n).then_some(()))
@@ -380,6 +447,12 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// How many polls make `secs` seconds.
+fn polls_in(secs: u64) -> u32 {
+    let polls = secs.saturating_mul(1000) / POLL.as_millis() as u64;
+    u32::try_from(polls).unwrap_or(u32::MAX)
 }
 
 async fn poll<T>(f: impl FnMut() -> Option<T>) -> Option<T> {
@@ -725,6 +798,9 @@ save-text lnbcrt invoice.txt
 save-text \"two words\" /tmp/out.txt
 expect Fedi Alpha
 expect-slow Fedi Beta
+expect-within 300 Txid
+expect-gone-within 120 Offline
+retry-until 60 bcrt1
 expect-clipboard demo
 expect-clipboard-empty
 expect-not Cover traffic
@@ -768,6 +844,18 @@ action app.settings
                 },
                 Step::Expect("Fedi Alpha".into()),
                 Step::ExpectSlow("Fedi Beta".into()),
+                Step::ExpectWithin {
+                    secs: 300,
+                    text: "Txid".into()
+                },
+                Step::ExpectGoneWithin {
+                    secs: 120,
+                    text: "Offline".into()
+                },
+                Step::RetryUntil {
+                    secs: 60,
+                    text: "bcrt1".into()
+                },
                 Step::ExpectClipboard("demo".into()),
                 Step::ExpectClipboardEmpty,
                 Step::ExpectNot("Cover traffic".into()),
@@ -820,6 +908,9 @@ action app.settings
             "type-env onlywidget",
             "save-text onlytext",
             "expect-slow",
+            "expect-within Txid",
+            "expect-within 300",
+            "expect-gone-within soon Offline",
             "expect-clipboard",
             "expect-numbered twelve",
             "shot",

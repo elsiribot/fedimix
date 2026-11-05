@@ -1,4 +1,4 @@
-//! Saving setup dialog: pick a detected hardware wallet to set up.
+//! Saving setup dialog: pick a detected hardware wallet, or this computer.
 
 use std::rc::Rc;
 
@@ -22,10 +22,19 @@ pub fn open(ctx: &Rc<AppContext>) {
         .visible(false)
         .build();
     error.add_css_class("error");
+    // Why a hardware wallet may be missing from the list.
+    let notes = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    notes.add_css_class("dim-label");
     let list_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
         .build();
+    list_box.append(&notes);
     list_box.append(&list);
     list_box.append(&error);
     let list_clamp = adw::Clamp::builder()
@@ -66,6 +75,7 @@ pub fn open(ctx: &Rc<AppContext>) {
         pages: pages.downgrade(),
         dialog: dialog.downgrade(),
         error: error.downgrade(),
+        notes: notes.downgrade(),
     };
     retry.connect_clicked({
         let ctx = ctx.clone();
@@ -83,18 +93,27 @@ struct View {
     pages: glib::WeakRef<gtk::Stack>,
     dialog: glib::WeakRef<adw::Dialog>,
     error: glib::WeakRef<gtk::Label>,
+    notes: glib::WeakRef<gtk::Label>,
 }
 
 fn scan(ctx: &Rc<AppContext>, view: &View) {
     let core = ctx.bridge.core();
     let shown = ctx.clone();
     let view = view.clone();
-    // The listing's `problem` is Task 8's to show.
-    ctx.run(async move { core.detect_devices().await }, move |listing| {
-        let devices = listing.devices;
+    let fetch = async move {
+        let (listing, settings) = tokio::join!(core.detect_devices(), core.settings());
+        Ok((listing?, settings?.socks5_proxy.is_some()))
+    };
+    ctx.run(fetch, move |(listing, proxy_set)| {
         let (Some(list), Some(pages)) = (view.list.upgrade(), view.pages.upgrade()) else {
             return;
         };
+        if let Some(label) = view.notes.upgrade() {
+            let notes = present::setup_notes(&listing, proxy_set);
+            label.set_label(&notes.join("\n\n"));
+            label.set_visible(!notes.is_empty());
+        }
+        let devices = listing.devices;
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
@@ -106,13 +125,11 @@ fn scan(ctx: &Rc<AppContext>, view: &View) {
 }
 
 fn device_row(ctx: &Rc<AppContext>, view: &View, device: &DeviceInfo) -> adw::ActionRow {
+    // A device names itself, so its name is not markup.
     let row = adw::ActionRow::builder()
+        .use_markup(false)
         .title(&device.name)
-        .subtitle(if device.connected {
-            "Connected"
-        } else {
-            "Not connected"
-        })
+        .subtitle(present::setup_subtitle(device))
         .build();
     let spinner = gtk::Spinner::builder().visible(false).build();
     row.add_suffix(&spinner);
@@ -173,5 +190,7 @@ fn device_row(ctx: &Rc<AppContext>, view: &View, device: &DeviceInfo) -> adw::Ac
         }
     });
     row.add_suffix(&button);
+    // The whole row picks the device, as its button does.
+    row.set_activatable_widget(Some(&button));
     row
 }

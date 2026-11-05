@@ -9,8 +9,9 @@ use crate::format;
 use crate::present;
 use crate::ui::app_state::AppContext;
 
-/// Prepare a refill and show the confirmation dialog. A failed preparation
-/// is a toast and no dialog. `expanded` starts with the coin list revealed.
+/// Prepare a refill and show the confirmation dialog. A refusal says why in a
+/// dialog of its own: its sentences say when a refill works again, and are too
+/// long for a toast. `expanded` starts with the coin list revealed.
 pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
     if !ctx.claim_refill() {
         return;
@@ -24,10 +25,16 @@ pub fn open(ctx: &Rc<AppContext>, expanded: bool) {
                 Ok(preview) => show(&ctx, preview, expanded),
                 Err(e) => {
                     ctx.release_refill();
-                    ctx.toast(&present::user_message(&e));
+                    refused(&ctx, &present::user_message(&e));
                 }
             }
         });
+}
+
+fn refused(ctx: &Rc<AppContext>, sentence: &str) {
+    let dialog = adw::AlertDialog::new(Some("No refill now"), Some(sentence));
+    dialog.add_response("close", "Close");
+    dialog.present(Some(&ctx.nav));
 }
 
 fn show(ctx: &Rc<AppContext>, preview: RefillPreview, expanded: bool) {

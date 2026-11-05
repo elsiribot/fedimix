@@ -119,7 +119,14 @@ fn main() -> gtk::glib::ExitCode {
             data_dir: dir.to_string_lossy().into_owned(),
             network: args.network,
         };
-        match bridge::open_real(&runtime, config) {
+        #[cfg(feature = "testing")]
+        let opened = match &args.test_signer {
+            Some(key_file) => bridge::open_with_test_signer(&runtime, config, key_file),
+            None => bridge::open_real(&runtime, config),
+        };
+        #[cfg(not(feature = "testing"))]
+        let opened = bridge::open_real(&runtime, config);
+        match opened {
             Ok(backend) => (backend, present::SEND_LOCK_TIMEOUT),
             Err(e) => return show_start_failure(&present::user_message(&e), drive),
         }

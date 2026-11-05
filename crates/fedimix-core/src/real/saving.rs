@@ -194,6 +194,7 @@ impl Core {
             history: Vec::new(),
             chain_online,
             problem,
+            wallet_open: wallet.is_some(),
         };
         if let Some(wallet) = wallet {
             let labels = Labels::load(&self.store())?;

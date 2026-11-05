@@ -1,0 +1,24 @@
+# A send from Saving with change: the review names this computer and where the
+# change goes, and the change arrives in Spending.
+expect-slow 0.0100 BTC
+click Send
+type-env "Bitcoin address" FEDIMIX_SAVING_DEST
+type "Amount (BTC)" 0.002
+click Review
+expect-slow Confirm on This computer
+expect Network fee
+expect-not Saving arrives in a later version
+click 0.00200000 BTC
+expect Change → Spending
+shot review
+click Confirm on This computer
+expect-slow Payment sent
+expect Sent
+expect change → Spending
+shot sent
+click Spending
+expect-not Txid
+# Spending lists the change once the federation credits it.
+expect-within 400 Txid
+expect Deposit
+shot change-arrived

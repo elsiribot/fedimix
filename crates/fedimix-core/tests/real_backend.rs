@@ -5656,6 +5656,47 @@ async fn two_seen_sends_sharing_a_coin_offer_only_the_newest() {
     backend.shutdown().await.unwrap();
 }
 
+/// N20: two sends of ours on the network that share a coin do not read as two
+/// payments: both rows say that at most one of them confirms.
+#[tokio::test]
+async fn two_seen_sends_sharing_a_coin_read_as_alternatives() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let (old, new) = replaced(&saving, &backend, 1_000).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    saving.chain.push_sync(in_mempool(old.clone(), now + 1, 2));
+    wait_until("both seen", || async {
+        sync_saving_now(&backend);
+        signed_states(&saving) == ["seen", "seen"]
+    })
+    .await;
+    let ids = [
+        old.compute_txid().to_string(),
+        new.compute_txid().to_string(),
+    ];
+    wait_until("both rows contested", || async {
+        let rows = saving_rows(&backend).await;
+        let shown: Vec<_> = rows
+            .iter()
+            .filter(|r| r.txid.as_ref().is_some_and(|t| ids.contains(t)))
+            .collect();
+        shown.len() == 2 && shown.iter().all(|r| r.status == HistoryStatus::Contested)
+    })
+    .await;
+    // The payment that funded Saving is no alternative of anything.
+    let rows = saving_rows(&backend).await;
+    assert!(
+        rows.iter()
+            .filter(|r| r.incoming)
+            .all(|r| r.status != HistoryStatus::Contested)
+    );
+    backend.shutdown().await.unwrap();
+}
+
 /// N4: a replacement that stalls does not bring back the send it replaced.
 #[tokio::test]
 async fn a_stalled_replacement_does_not_revive_the_old_send() {
@@ -5827,7 +5868,7 @@ async fn a_restart_mid_replacement_resumes_only_the_replacement() {
 
 // ---- Fix round 3 ----
 
-const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms before sending from Saving again.";
+const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms, and up to 6 blocks after that, before sending from Saving again. Fedimix cannot raise the fee to make either confirm sooner.";
 
 /// The stored state of `tx`.
 fn state_of(saving: &SavingHarness, tx: &Transaction) -> String {
@@ -6706,8 +6747,7 @@ async fn a_changed_gap_expires_the_refill_preview() {
     backend.shutdown().await.unwrap();
 }
 
-const NOT_CREDITED: &str =
-    "Your last refill has not reached Spending yet. Refill again once Spending shows it.";
+const NOT_CREDITED: &str = "Your last refill has not reached Spending yet. Refill again once Spending shows it. Until then Fedimix cannot tell what Spending holds, so it refills no federation, this one or another.";
 
 /// Puts `tx` 6 blocks deep and waits for its row to say so.
 async fn six_deep(saving: &SavingHarness, backend: &Real, tx: &Transaction) {

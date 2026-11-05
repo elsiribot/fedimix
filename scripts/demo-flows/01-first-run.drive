@@ -11,12 +11,20 @@ expect 0 of 0.05 target
 expect-not Refill from Saving
 shot spending
 click Saving
+expect Connect a hardware wallet or use this computer
 shot saving
 click Set up
 expect Set up Saving
+# This computer comes after the hardware wallet, with what it costs.
+expect Ledger Nano S+
+expect This computer
+expect Keys stay on this computer. A hardware wallet is safer for large amounts.
 shot setup-dialog
 click Set up
 expect Saving is set up
+expect Ledger Nano S+
 shot saving-ready
 click Spending
-expect Refill from Saving
+# Below target, but Saving holds nothing yet: there is nothing to refill from.
+expect 0 of 0.05 target
+expect-not Refill from Saving

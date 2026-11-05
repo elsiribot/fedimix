@@ -54,6 +54,8 @@ const SIGNED_PLAN: &[OperationState] = &[
     OperationState::Broadcasting,
 ];
 const UNSIGNED_PLAN: &[OperationState] = &[OperationState::Broadcasting];
+/// The software wallet is always there, so it never waits for a device.
+const SOFTWARE_PLAN: &[OperationState] = &[OperationState::Signing, OperationState::Broadcasting];
 /// Largest first; used to split a balance into notes.
 const DENOMINATIONS_SAT: [u64; 13] = [
     10_000_000, 5_000_000, 2_000_000, 1_000_000, 500_000, 200_000, 100_000, 50_000, 20_000, 10_000,
@@ -360,12 +362,30 @@ impl Run {
     }
 }
 
+fn software_device() -> DeviceInfo {
+    DeviceInfo {
+        id: SOFTWARE_DEVICE_ID.to_string(),
+        name: SOFTWARE_DEVICE_NAME.to_string(),
+        kind: DeviceKind::Software,
+        connected: true,
+    }
+}
+
 impl State {
+    /// How a Saving payment signs: the software wallet waits for nothing.
+    fn signed_plan(&self) -> &'static [OperationState] {
+        match &self.device {
+            Some(device) if device.kind == DeviceKind::Software => SOFTWARE_PLAN,
+            _ => SIGNED_PLAN,
+        }
+    }
+
     fn new(scenario: DemoScenario) -> Self {
         let f = fixtures::fixture(scenario);
         State {
             device: f.device,
-            detected: f.detected,
+            // As the real backend lists it: after any hardware wallet, always.
+            detected: f.detected.into_iter().chain([software_device()]).collect(),
             suggested: f.suggested,
             in_flight: f.in_flight,
             coins: f.coins,
@@ -841,6 +861,7 @@ impl Backend for DemoBackend {
             history: newest(&st.saving_history),
             chain_online: true,
             problem: None,
+            wallet_open: true,
         })
     }
 
@@ -1108,7 +1129,7 @@ impl Backend for DemoBackend {
         }
         let (_, preview) = held;
         let plan = if preview.wallet == WalletKind::Saving {
-            SIGNED_PLAN
+            st.signed_plan()
         } else {
             UNSIGNED_PLAN
         };
@@ -1208,7 +1229,8 @@ impl Backend for DemoBackend {
             st.refills.insert(preview_id, held);
             return Err(e);
         }
-        self.start(st, preview_id, Job::Refill(held.1), SIGNED_PLAN)
+        let plan = st.signed_plan();
+        self.start(st, preview_id, Job::Refill(held.1), plan)
     }
 
     async fn prepare_refill(&self) -> Result<RefillPreview> {

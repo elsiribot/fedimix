@@ -16,3 +16,8 @@ fedimix-core = { path = "../fedimix-core" }
 async-channel.workspace = true
 qrcode.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+
+[features]
+# `--test-signer`: a Ledger-kind device signing with a key from a file, for the
+# real UI flows that need a hardware kind or a rejection. Never in a release.
+testing = ["fedimix-core/testing"]

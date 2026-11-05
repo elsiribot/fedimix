@@ -8,7 +8,7 @@ use fedimix_core::{HistoryItem, WalletKind};
 
 use crate::present::{self, HistoryRowView};
 use crate::ui::app_state::AppContext;
-use crate::ui::widgets;
+use crate::ui::{send_dialog, widgets};
 
 const SHOW_MORE: &str = "Show more";
 const LOADING: &str = "Loading\u{2026}";
@@ -44,7 +44,7 @@ fn label(text: &str) -> gtk::Label {
         .build()
 }
 
-fn build_row(item: &HistoryRowView) -> gtk::ListBoxRow {
+fn build_row(ctx: &Rc<AppContext>, item: &HistoryRowView) -> gtk::ListBoxRow {
     let line = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -90,6 +90,31 @@ fn build_row(item: &HistoryRowView) -> gtk::ListBoxRow {
         nested_label.add_css_class("dim-label");
         nested_label.add_css_class("caption");
         content.append(&nested_label);
+    }
+    if let Some(note) = &item.note {
+        // A whole sentence, so it wraps instead of being cut.
+        let note_label = gtk::Label::builder()
+            .label(note)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .margin_start(28)
+            .build();
+        note_label.add_css_class("caption");
+        content.append(&note_label);
+    }
+    if let Some(action) = item.action {
+        let button = gtk::Button::with_label(action.label());
+        button.set_halign(gtk::Align::Start);
+        button.set_margin_start(28);
+        button.add_css_class("pill");
+        button.connect_clicked({
+            let ctx = ctx.clone();
+            move |_| match action {
+                present::RowAction::SendAgain => send_dialog::open(&ctx, WalletKind::Saving),
+            }
+        });
+        content.append(&button);
     }
     if let Some(detail) = &item.detail {
         // Selectable, as a recipient may ask for the txid.
@@ -204,7 +229,7 @@ impl Inner {
         }
         for item in &shown {
             self.list
-                .append(&build_row(&present::history_row(item, now)));
+                .append(&build_row(&self.ctx, &present::history_row(item, now)));
         }
         if self.more.get() {
             self.more_label.set_label(if self.loading.get() {

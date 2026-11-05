@@ -5,22 +5,22 @@ Phase 2 (real Spending wallet) is complete: Tasks 1-10 and the final review's fi
 ## What works (commands run in `nix develop`)
 - `just run [--data-dir PATH] [--network bitcoin|signet|regtest]`: the real wallet. `just demo`: the complete UI over the demo backend.
 - `just clippy`, `just fmt`, `just test` (includes `tests/real_backend.rs` over a fake port).
-- `just test-integration`: devimint, both module sets, 35 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
-- `just test-real-ui`: the real binary through Join, Lightning receive and send, restart, lock, wrong network, under headless sway.
+- `just test-integration`: devimint, both module sets, 36 tests each at `FM_FED_SIZE=1` (default); `FM_FED_SIZE=4` last passed with 24, before the final fixes.
+- `just test-real-ui`: the real binary through Join, Lightning receive and send, restart, lock, Saving on "This computer" (setup, receive from bitcoind, send whose change reaches Spending, refill), the `--test-signer` Ledger stand-in declining a signature, wrong network, under headless sway. Built with `fedimix-gtk/testing`.
 - `just interact-demo`, `just screenshot-all`: scripted demo flows and screenshots at 480 and 360 px.
 - `nix build` / `just build-nix`: wrapped release binary plus flake checks. Release build from clean: 7 min 16 s, 88 MiB, 64 MiB stripped.
 
 ## Not verified
 - Mainnet and signet: every real run was regtest.
-- A real on-chain receive or send through the UI (covered below the UI by `devimint.rs`); a real recovery on screen.
-- Real pointer and keyboard input, dark theme, accessibility, a real desktop (sway only), hardware; the clipboard against another Wayland client or a clipboard manager.
+- A Spending on-chain receive or send through the UI (covered below the UI by `devimint.rs`); a real recovery on screen. Saving's on-chain path is covered on regtest only.
+- Real pointer and keyboard input, dark theme, accessibility, a real desktop (sway only), hardware; Task 8 screens read at 800 px (real) and 480 px (demo), not 360 px; the clipboard against another Wayland client or a clipboard manager.
 - Guardians gone for good: `a_stopped_federation_leaves_the_wallet_readable` stops them with SIGSTOP and brings them back.
 - A hung backend at shutdown (30 s cap) in the UI; `NON_UNIQUE` launcher behavior on a desktop.
 - That no Electrum traffic follows a proxy change beyond the one request in flight (at most 10 scripts, its answer read up to 30 s; `decisions.md`, Task 5 fix I1): tested against a stub server, not through a proxy. A Jade PIN step already under way cannot be stopped.
 - A send against real hardware or a public server; a dropped send is exercised with fakes only. Details: `decisions.md`.
 
 ## Next
-Phase 3 (Saving, hardware wallet), Tasks 1-7 and 7b done: chain access, the watch-only wallet, devices (`HwiPort`, compile-only; `SoftSigner` under `testing`), `RealBackend` Saving state and sync, Saving send with change to a federation deposit address (signed transaction stored before broadcast, rebroadcast until settled, stalled sends replaced), and Task 7: `prepare_refill`/`confirm_refill`, the smallest coins that cover the gap to the target (less what is on its way until Spending credits it, plus the deposit fee) in one output to the active federation, no change, never beside another refill or over a stalled send, on the same path as a send (`saving_signed.kind` and `federation_id`, schemas 8-9; history `Refill`). Task 7b: a software Saving wallet, "This computer" (`SeedSigner`, BIP84 from the recovery words, listed after any device, skips AwaitingDevice; one phrase restores both wallets). GTK's Send, Refill and the software choice arrive in Task 8. Next: Task 8. Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
+Phase 3 Tasks 1-8 done (details in `decisions.md`). Task 8 put Saving on screen in the real app: setup with hardware wallets then "This computer", the problem banner with its fix, Receive, Send with change and notes, Refill and its refusals, stalled/lost/contested history rows; Exit and Cover stay hidden, as does the `in_flight` line. Next: Task 9 (close out). Open from the Phase 2 re-review: O1-O4 and N8 (accepted).
 
 ## Needs user
 - A real-network trial with small amounts before trusting the wallet with more.

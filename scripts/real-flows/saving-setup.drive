@@ -1,0 +1,37 @@
+# Saving on this computer, through the real UI with no test signer: the empty
+# state, the choice and its warning, the first scan, then a direct receive.
+expect-slow Devimint Federation
+click Saving
+expect Connect a hardware wallet or use this computer
+shot empty
+click Set up
+expect This computer
+expect Keys stay on this computer. A hardware wallet is safer for large amounts.
+shot setup
+click Set up
+expect-slow Saving is set up
+expect This computer
+# The software wallet is always there: nothing asks to connect it.
+expect-not Connect your
+# The first scan reaches the chain server.
+expect-gone-within 120 Offline
+shot scanned
+click Receive
+# Right after setup the first scan may still run: Retry, as a user would.
+retry-until 120 bcrt1
+expect Coins received this way are marked unmixed
+expect-not Your device cannot display this address
+save-text bcrt1 saving-address.txt
+# The script pays 0.01 BTC to it and mines.
+shot address
+close-dialog
+expect-within 180 0.0100 BTC
+expect Received
+expect unmixed
+expect-not depositing
+shot funded
+# Nothing moves to Saving until Phase 4, set up or not.
+click Spending
+expect waiting for Saving
+expect-not moving to Saving
+shot spending

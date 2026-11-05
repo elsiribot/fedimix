@@ -424,6 +424,17 @@ pub fn open(ctx: &Rc<AppContext>, wallet: WalletKind) {
             note.add_css_class("dim-label");
             note.add_css_class("caption");
             body.append(&note);
+            let device = ctx.latest().and_then(|s| s.saving.device);
+            if let Some(text) = present::device_address_note(device.as_ref()) {
+                let unverified = gtk::Label::builder()
+                    .label(text)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build();
+                unverified.add_css_class("dim-label");
+                unverified.add_css_class("caption");
+                body.append(&unverified);
+            }
             toolbar.set_content(Some(&scrolled(&body)));
             load_address(ctx, wallet, &view);
         }

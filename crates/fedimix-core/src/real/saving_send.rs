@@ -85,7 +85,7 @@ const OWN_ADDRESS: &str =
     "This is your federation's deposit address. To move Saving into Spending, use Refill.";
 const REPLACES: &str = "An earlier payment has not confirmed and may still go through. This send spends the same coins, so only one of the two can confirm.";
 const STALLED_COIN_GONE: &str = "A coin of a payment that has not confirmed is missing from the chain server's answer, so the next send cannot be made to conflict with it. Try again after the next sync.";
-const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms before sending from Saving again.";
+const OLD_BACK: &str = "An earlier payment is back on the network while the payment that replaced it has not confirmed. Wait until one of them confirms, and up to 6 blocks after that, before sending from Saving again. Fedimix cannot raise the fee to make either confirm sooner.";
 pub(super) const FROZEN_STALLED: &str = "A coin you froze is tied to a payment that has not confirmed. Unfreeze it to send: the next send must spend it, so that only one of the two can confirm.";
 const NO_ESTIMATE: &str =
     "The chain server has no fee estimate right now. Enter a fee rate, or try again later.";
@@ -192,6 +192,36 @@ fn rate_of(estimate: Option<f64>, network: Network) -> Result<FeeRate> {
 
 /// Whether `newer`, sharing a coin with `older`, replaced it in the user's
 /// eyes: a refill replaces anything of its own kind, a send anything.
+/// Two pending payments of ours that share a coin are alternatives: at most
+/// one of them confirms, so neither may read as a payment of its own.
+fn mark_contested(ledger: &[(SignedTx, Transaction, bool)], items: &mut [HistoryItem]) {
+    let coins_of = |txid: &str| {
+        ledger
+            .iter()
+            .find(|(_, tx, _)| tx.compute_txid().to_string() == txid)
+            .map(|(_, tx, _)| {
+                tx.input
+                    .iter()
+                    .map(|input| input.previous_output)
+                    .collect::<HashSet<_>>()
+            })
+    };
+    let pending: Vec<(usize, HashSet<OutPoint>)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.status == HistoryStatus::Pending && !item.incoming)
+        .filter_map(|(at, item)| Some((at, coins_of(item.txid.as_deref()?)?)))
+        .collect();
+    for (at, coins) in &pending {
+        let shares = pending
+            .iter()
+            .any(|(other, theirs)| other != at && !coins.is_disjoint(theirs));
+        if shares {
+            items[*at].status = HistoryStatus::Contested;
+        }
+    }
+}
+
 fn replaces(newer: &SignedTx, older: &SignedTx) -> bool {
     newer.kind == OperationKind::Send || older.kind == OperationKind::Refill
 }
@@ -460,6 +490,7 @@ impl Core {
                 items.push(item);
             }
         }
+        mark_contested(&ledger, items);
         sort_history(items);
         Ok(())
     }

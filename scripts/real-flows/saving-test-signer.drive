@@ -1,0 +1,42 @@
+# The testing build's Ledger stand-in (--test-signer), in a folder of its own:
+# listed before this computer, its address cannot be shown on it, and a
+# signature it declines ends the send with nothing sent.
+expect-slow Join a federation
+type-env "Paste an invite code" FM_INVITE_CODE
+click Join
+expect-slow Devimint Federation
+action app.settings
+type-env "Server URL" FEDIMIX_CHAIN_URL
+apply Server URL
+wait 800
+click Back
+click Saving
+click Set up
+expect Test Ledger
+expect This computer
+shot setup
+click Set up
+expect-slow Saving is set up
+expect Test Ledger
+expect-gone-within 120 Offline
+shot scanned
+click Receive
+retry-until 120 bcrt1
+expect Your device cannot display this address.
+save-text bcrt1 ledger-address.txt
+# The script pays 0.004 BTC to it and mines.
+shot address
+close-dialog
+expect-within 180 0.0040 BTC
+click Send
+type-env "Bitcoin address" FEDIMIX_SAVING_DEST
+type "Amount (BTC)" 0.001
+click Review
+expect-slow Confirm on Test Ledger
+shot review
+click Confirm on Test Ledger
+expect-slow The device rejected the transaction
+shot rejected
+close-dialog
+expect 0.0040 BTC
+expect-not Sent

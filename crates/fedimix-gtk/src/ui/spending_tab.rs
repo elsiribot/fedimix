@@ -25,8 +25,9 @@ struct Inner {
     hint: gtk::Label,
     history: HistoryList,
     show_cover: gtk::CheckButton,
-    /// Last state rendered, to skip identical rebuilds.
-    last: RefCell<Option<SpendingState>>,
+    /// Last state rendered, and whether a refill is offered, to skip
+    /// identical rebuilds.
+    last: RefCell<Option<(SpendingState, bool)>>,
 }
 
 #[derive(Clone)]
@@ -216,16 +217,22 @@ impl Inner {
             s.spending.total_balance,
             s.recovery_words_shown,
         ));
-        if self.last.borrow().as_ref() == Some(&s.spending) {
+        let shown = (
+            s.spending.clone(),
+            present::refill_offered(&s.spending, &s.saving),
+        );
+        if self.last.borrow().as_ref() == Some(&shown) {
             return;
         }
-        *self.last.borrow_mut() = Some(s.spending.clone());
+        *self.last.borrow_mut() = Some(shown);
         self.render();
     }
 
     fn render(&self) {
         let last = self.last.borrow();
-        let Some(s) = last.as_ref() else { return };
+        let Some((s, refill_offered)) = last.as_ref() else {
+            return;
+        };
         // Without a federation the window shows the Join page instead.
         self.show_cover.set_visible(s.features.cover);
         let connection = present::connection_banner(s.federation.as_ref());
@@ -253,7 +260,8 @@ impl Inner {
         self.caption_link
             .set_label(caption.queue_link.as_deref().unwrap_or(""));
         self.caption_link.set_visible(caption.queue_link.is_some());
-        self.refill.set_visible(caption.shows_refill);
+        self.refill
+            .set_visible(caption.shows_refill && *refill_offered);
 
         self.history
             .set_snapshot(&s.history, self.show_cover.is_active());

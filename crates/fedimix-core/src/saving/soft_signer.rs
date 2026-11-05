@@ -25,6 +25,17 @@ impl SoftSigner {
         }
     }
 
+    /// From an extended private key as text, such as `tprv…`.
+    pub fn from_xprv(text: &str) -> Result<Self> {
+        let key = Xpriv::from_str(text.trim()).map_err(|_| {
+            FedimixError::Internal("The test signer's key is not an extended private key.".into())
+        })?;
+        Ok(SoftSigner {
+            key,
+            rejects: false,
+        })
+    }
+
     /// The same key, but `sign` answers as if the user declined on the device.
     pub fn rejecting(mut self) -> Self {
         self.rejects = true;
@@ -130,6 +141,17 @@ pub(super) mod tests {
             Err(FedimixError::DeviceRejected)
         );
         assert!(psbt.inputs[0].partial_sigs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_key_read_as_text_is_the_same_key() {
+        let key = signer().key.to_string();
+        let read = SoftSigner::from_xprv(&format!("{key}\n")).unwrap();
+        assert_eq!(
+            read.fingerprint().await.unwrap(),
+            signer().fingerprint().await.unwrap()
+        );
+        assert!(SoftSigner::from_xprv("not a key").is_err());
     }
 
     #[tokio::test]
