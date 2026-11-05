@@ -15,7 +15,7 @@ Phase 3 (Saving) is complete. `fedimix` runs Spending and Saving on the real bac
 - Real pointer input, dark theme, accessibility, a real desktop (sway only).
 
 ## Next
-Phase 4: exits and cover traffic (the scheduler and the mixer), then their UI.
+Phase 4 (scheduler and anonymity estimate): plan `docs/superpowers/plans/2026-10-30-fedimix-phase-4.md`. Task 1 spike: sessions decode on both generations. Task 2 done: pure `scheduler` and `anonymity` modules with unit tests; nothing calls them yet. Next: Tasks 3-11.
 
 ## Needs user
 - Hardware testing on each device kind: Ledger (policy `wpkh(@0/**)`, no hmac), BitBox02 pairing, Coldcard, Jade (its PIN step uses Blockstream's server outside any proxy).
