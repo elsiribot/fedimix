@@ -5,8 +5,10 @@ libadwaita, for a Fedimint-based bitcoin mixer. It is a workspace of
 `fedimix-core` (logic, API types, `Backend` trait, demo backend) and
 `fedimix-gtk` (the app). `fedimix` runs on the real backend: Spending holds
 ecash in a Fedimint federation you join with an invite code, over Lightning and
-on-chain. Saving, the cold-storage side, arrives in a later version; `--demo`
-shows the complete UI over an in-memory demo backend.
+on-chain. Saving, the cold-storage side, is on-chain bitcoin kept on a hardware
+wallet (Ledger, Coldcard, Jade or BitBox02) or, without one, on this computer;
+Refill moves it into Spending. Hardware signing has never been run on a real
+device. `--demo` shows the complete UI over an in-memory demo backend.
 
 Development uses Nix. `nix develop` (or `direnv allow`, via the bundled
 `.envrc`) gives you a shell with the stable Rust toolchain (including clippy,
@@ -81,15 +83,48 @@ To restore by hand on a new device:
 5. If Saving was the software wallet, set it up again with "This computer": the
    same words give the same Saving account, and its first scan finds the coins.
 
-## Saving without a hardware wallet
+## Saving
 
-Saving is meant for a hardware wallet (Ledger, Coldcard, Jade, BitBox02). If you
-have none, Saving can be a software wallet on this computer, listed after any
-hardware wallet as "This computer". Its key comes from the same recovery words
-as Spending (BIP84, account `m/84'/0'/0'` on bitcoin, `m/84'/1'/0'` on test
-networks, no passphrase), so one phrase restores both wallets. It signs only
-when you confirm a send or a refill, and it talks to no server, so a proxy
-does not affect it.
+Saving holds on-chain bitcoin that only a device you control can spend. Set it
+up once per data folder, from the Saving tab. Receive gives a fresh address each
+time; Send pays any address, with change going to your active federation; Refill
+moves Saving's coins into Spending. Every spend is reviewed in the app, then
+confirmed on the device. Saving needs a chain server (Esplora or Electrum,
+chosen in Settings); on signet it uses 1 sat/vB when the server has no fee
+estimate, on bitcoin it refuses to send until the server has one.
+
+### Hardware wallets
+
+Supported: Ledger (Bitcoin app open), Coldcard, Jade and BitBox02 (first
+connection pairs with a code shown on the device and the computer). Trezor is
+not supported: the library Fedimix uses for devices, async-hwi, has none.
+
+The kernel must let your user talk to the device. Install the vendor's udev
+rules and re-plug the device (on NixOS, add the rules package to
+`services.udev.packages`):
+
+- Ledger: `20-hw1.rules` from LedgerHQ's `udev-rules` (vendor 2c97).
+- Coldcard: `51-coinkite.rules` (vendor d13e).
+- Jade: `51-jade.rules` from Blockstream's Jade repository (USB serial chips).
+- BitBox02: `50-shiftcrypto-bitbox02.rules` (vendor 03eb, product 2403).
+
+These names are from the vendors' documentation and were not tried here. The
+Nix package of Fedimix carries libudev, which the app needs at run time; other
+packaging must declare it.
+
+Fedimix cannot make the device show a receive address for verification: plain
+BIP84 addresses cannot be displayed through async-hwi, so the Receive dialog
+says "Your device cannot display this address." Check a first receive with a
+small amount, or compare the address in the device's own app.
+
+### This computer
+
+Without a hardware wallet, Saving can be a software wallet on this computer,
+listed after any hardware wallet as "This computer". Its key comes from the same
+recovery words as Spending (BIP84, account `m/84'/0'/0'` on bitcoin,
+`m/84'/1'/0'` on test networks, no passphrase), so one phrase restores both
+wallets. It signs only when you confirm a send or a refill, and it talks to no
+server, so a proxy does not affect it.
 
 A hardware wallet is safer for large amounts: with the software wallet, anyone
 who can read the `seed` file can spend Saving too, not just Spending. Choose
@@ -99,9 +134,8 @@ address of the hardware wallet.
 
 ## Not yet
 
-- Saving (the cold-storage side) and hardware wallets: the controls are hidden
-  in the real wallet.
-- Exits and cover traffic.
+- Exits and cover traffic: their controls are hidden in the real wallet.
+- Trezor.
 - A proxy for federation traffic: fedimint has no SOCKS5 support, so setting a
   proxy keeps federations offline instead of connecting directly.
 - Restoring from the recovery words inside the app; see the manual steps above.
