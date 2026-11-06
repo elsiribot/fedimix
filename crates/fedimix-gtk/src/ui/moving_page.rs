@@ -17,6 +17,8 @@ struct Inner {
     total: gtk::Label,
     summary: gtk::Label,
     list: gtk::ListBox,
+    /// Exits that may have left: what Fedimix cannot tell about them.
+    unknown: gtk::Label,
     empty: adw::StatusPage,
     /// Anonymity target; the spec default until settings arrive.
     target: Cell<u32>,
@@ -36,6 +38,12 @@ pub fn push(ctx: &Rc<AppContext>) {
         .valign(gtk::Align::Start)
         .build();
     list.add_css_class("boxed-list");
+    let unknown = gtk::Label::builder()
+        .wrap(true)
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    unknown.add_css_class("dim-label");
     let empty = adw::StatusPage::builder()
         .title("Nothing to move")
         .icon_name("emblem-ok-symbolic")
@@ -49,6 +57,7 @@ pub fn push(ctx: &Rc<AppContext>) {
     content.append(&total);
     content.append(&summary);
     content.append(&list);
+    content.append(&unknown);
     content.append(&empty);
     let page = nav_page("Moving to Saving", &page_body(&content));
 
@@ -57,6 +66,7 @@ pub fn push(ctx: &Rc<AppContext>) {
         total,
         summary,
         list,
+        unknown,
         empty,
         target: Cell::new(Settings::default().anonymity_target),
         last: RefCell::new(None),
@@ -116,6 +126,9 @@ impl Inner {
             self.list
                 .append(&self.build_row(item, q.waiting_for_saving));
         }
+        let note = present::unknown_exits_note(q);
+        self.unknown.set_label(note.as_deref().unwrap_or(""));
+        self.unknown.set_visible(note.is_some());
         let none = q.items.is_empty();
         self.empty.set_visible(none);
         self.list.set_visible(!none);
@@ -145,7 +158,8 @@ impl Inner {
         action.connect_activate({
             let ctx = self.ctx.clone();
             let id = item.id.clone();
-            move |_, _| confirm_exit(&ctx, id.clone())
+            let estimate = item.anonymity_current;
+            move |_, _| confirm_exit(&ctx, id.clone(), estimate)
         });
         let group = gio::SimpleActionGroup::new();
         group.add_action(&action);
@@ -166,19 +180,21 @@ impl Inner {
 }
 
 /// Quote the exit, then ask. A refused quote is a toast and no dialog.
-fn confirm_exit(ctx: &Rc<AppContext>, item_id: String) {
+/// `estimate` is the item's anonymity estimate as its row shows it.
+fn confirm_exit(ctx: &Rc<AppContext>, item_id: String, estimate: u32) {
     let core = ctx.bridge.core();
     let shown = ctx.clone();
     ctx.run(
         async move { core.prepare_exit(item_id).await },
         move |preview| {
-            show_exit_dialog(&shown, preview);
+            show_exit_dialog(&shown, preview, estimate);
         },
     );
 }
 
-fn show_exit_dialog(ctx: &Rc<AppContext>, preview: ExitPreview) {
-    let dialog = adw::AlertDialog::new(Some("Exit now?"), Some(&present::exit_warning(&preview)));
+fn show_exit_dialog(ctx: &Rc<AppContext>, preview: ExitPreview, estimate: u32) {
+    let warning = present::exit_warning(&preview, estimate);
+    let dialog = adw::AlertDialog::new(Some("Exit now?"), Some(&warning));
     dialog.add_responses(&[("cancel", "Cancel"), ("exit", "Exit now")]);
     dialog.set_response_appearance("exit", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));

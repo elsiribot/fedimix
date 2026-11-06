@@ -1570,15 +1570,15 @@ async fn a_proxy_shows_offline_rather_than_a_recovery_that_cannot_run() {
 }
 
 #[tokio::test]
-async fn the_real_backend_offers_no_later_features() {
+async fn the_real_backend_offers_exits_but_no_cover_traffic() {
     let harness = Harness::new();
     let backend = harness.open().await.unwrap();
     let state = backend.spending_state().await.unwrap();
     assert_eq!(
         state.features,
         Features {
-            saving: true,
-            ..Features::NONE
+            cover: false,
+            ..Features::ALL
         }
     );
     backend.shutdown().await.unwrap();
@@ -8020,9 +8020,11 @@ async fn in_flight_counts_exits_until_they_confirm() {
         .iter()
         .find(|item| item.id == "leaving")
         .unwrap();
+    // No watch follows it, so it reads as an exit whose outcome is unknown;
+    // it is on its way all the same.
     assert_eq!(
         leaving.status,
-        fedimix_core::QueueItemStatus::Withdrawing { txid: None }
+        fedimix_core::QueueItemStatus::OutcomeUnknown
     );
     // Only what is still queued is moving: an exit on its way has left.
     assert_eq!(queue.total, mbtc(420));
@@ -8839,7 +8841,7 @@ async fn an_exit_whose_outcome_is_unknown_is_not_requeued() {
     wait_status(&*backend, &id, HistoryStatus::Failed).await;
     assert_eq!(
         status_of(&*backend, &item).await,
-        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+        Some(fedimix_core::QueueItemStatus::OutcomeUnknown)
     );
     assert!(matches!(
         backend.prepare_exit(item.clone()).await,
@@ -8884,7 +8886,7 @@ async fn a_lost_database_with_a_submitted_exit_does_not_requeue() {
     wait_status(&*backend, &id, HistoryStatus::Failed).await;
     assert_eq!(
         status_of(&*backend, &item).await,
-        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+        Some(fedimix_core::QueueItemStatus::OutcomeUnknown)
     );
     assert_eq!(saving.harness.first.withdraw_calls(), 1);
     port.set_recover_held(false);

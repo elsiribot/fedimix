@@ -4,6 +4,8 @@
 //! (Phase 1 ruling O1). Each change reads and writes the store under one hold
 //! of its lock, so two changes never book the same money.
 
+use std::collections::HashSet;
+
 use super::Core;
 use super::send::{fresh_id, is_send};
 use crate::anonymity::{
@@ -210,12 +212,10 @@ impl Core {
     fn unresolved_exits(&self, store: &Store, federation: &str) -> Result<Amount> {
         let submitting = self.submitting.borrow();
         let mut taking = Amount::ZERO;
-        let mut open = std::collections::HashSet::new();
         for (watch, operation) in store.sends()? {
             if watch.kind != WatchKind::Exit || watch.federation_id != federation {
                 continue;
             }
-            open.insert(watch.id.clone());
             if operation.is_some() || submitting.contains_key(&watch.id) {
                 continue;
             }
@@ -224,18 +224,40 @@ impl Core {
                 taking = sum([taking, item.denomination, fee]);
             }
         }
+        drop(submitting);
+        let lost = self.lost_exits(store, federation)?;
         for item in store.exit_items(Some(federation))? {
-            let lost = item.state == ExitState::Withdrawing
-                && item.txid.is_none()
-                && item.intent.as_ref().is_some_and(|intent| {
-                    !open.contains(intent) && !submitting.contains_key(intent)
-                });
-            if lost {
+            if lost.contains(&item.id) {
                 let fee = item.fee.unwrap_or(Amount::ZERO);
                 taking = sum([taking, item.denomination, fee]);
             }
         }
         Ok(taking)
+    }
+
+    /// The ids of `federation`'s exit items whose outcome is unknown: on
+    /// their way with no txid, while nothing follows them any more, neither
+    /// an open watch nor a call submitting them. Only their coin lands them.
+    fn lost_exits(&self, store: &Store, federation: &str) -> Result<HashSet<String>> {
+        let submitting = self.submitting.borrow();
+        let open: HashSet<String> = store
+            .sends()?
+            .into_iter()
+            .filter(|(watch, _)| watch.kind == WatchKind::Exit && watch.federation_id == federation)
+            .map(|(watch, _)| watch.id)
+            .collect();
+        Ok(store
+            .exit_items(Some(federation))?
+            .into_iter()
+            .filter(|item| {
+                item.state == ExitState::Withdrawing
+                    && item.txid.is_none()
+                    && item.intent.as_ref().is_some_and(|intent| {
+                        !open.contains(intent) && !submitting.contains_key(intent)
+                    })
+            })
+            .map(|item| item.id)
+            .collect())
     }
 
     /// The queued items of `federation` other than `item`, read with the
@@ -469,7 +491,7 @@ impl Core {
     /// scheduler sees for it.
     pub(super) fn queue_state(&self) -> Result<QueueState> {
         let waiting_for_saving = !self.saving_usable();
-        let (federation, settings, items, balance) = {
+        let (federation, settings, items, balance, lost) = {
             let store = self.store();
             let Some(federation) = store.active_federation()? else {
                 return Ok(QueueState {
@@ -488,7 +510,8 @@ impl Core {
                 .map_or(Amount::ZERO, |row| Amount {
                     msat: row.balance_msat,
                 });
-            (federation, store.settings()?, items, balance)
+            let lost = self.lost_exits(&store, &federation)?;
+            (federation, store.settings()?, items, balance, lost)
         };
         let for_spending = self.exit_fee_room(&federation, balance)?;
         let counting = self.counting(&federation, &items)?;
@@ -506,8 +529,12 @@ impl Core {
                     return QueueItem {
                         id: item.id.clone(),
                         denomination: item.denomination,
-                        status: QueueItemStatus::Withdrawing {
-                            txid: item.txid.clone(),
+                        status: if lost.contains(&item.id) {
+                            QueueItemStatus::OutcomeUnknown
+                        } else {
+                            QueueItemStatus::Withdrawing {
+                                txid: item.txid.clone(),
+                            }
                         },
                         anonymity_current: current,
                         anonymity_attainable: current,

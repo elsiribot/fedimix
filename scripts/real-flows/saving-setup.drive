@@ -31,8 +31,8 @@ expect Received
 expect unmixed
 expect-not depositing
 shot funded
-# Nothing moves to Saving until Phase 4, set up or not.
+# Saving can take exits now: the 0.001 above the target links to the queue.
 click Spending
-expect waiting for Saving
-expect-not moving to Saving
+expect 0.001 moving to Saving
+expect-not waiting for Saving
 shot spending

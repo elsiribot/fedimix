@@ -1,0 +1,94 @@
+# Exits on the real backend in minutes (`--exit-timing fast`), in a folder of
+# its own with Saving on this computer: money above the target queues as
+# 0.01, leaves early by hand and lands as an early exit; a second deposit's
+# 0.02 leaves on its own and lands with its anonymity set alone.
+expect-slow Join a federation
+type-env "Paste an invite code" FM_INVITE_CODE
+click Join
+expect-slow Devimint Federation
+action app.settings
+type-env "Server URL" FEDIMIX_CHAIN_URL
+apply Server URL
+wait 800
+# The real backend steers exits; cover traffic stays hidden.
+expect Anonymity target
+expect anon ~
+expect-not Budget (sat per month)
+# A small target, any estimate will do, and no grace after connecting. The
+# minimum time stays at its default for now, so the first item waits for the
+# early exit rather than leave on its own.
+type "Target (BTC)" 0.002
+type "Anonymity target" 1
+type "Grace minutes" 0
+wait 800
+shot settings
+click Back
+click Saving
+click Set up
+expect This computer
+click Set up
+expect-slow Saving is set up
+click Spending
+click Receive
+click On-chain
+expect-within 120 bcrt1
+save-text bcrt1 exits-deposit-1.txt
+# The script pays 0.0125 BTC to it and mines: 0.01 above the target, a margin
+# for the deposit fee, and room for the exit's fee.
+shot deposit-1
+close-dialog
+expect-within 300 0.01 moving to Saving
+shot moving-1
+click-containing moving to Saving
+expect Est. anonymity
+expect 0.01
+shot queue
+click Item actions
+click Exit now (lower privacy)
+expect-slow Exit now?
+expect this note leaves with an anonymity set of about
+expect Withdrawal fee:
+shot exit-dialog
+click Exit now
+# Saving shows the exit on its way, then the coin it lands as.
+click Back
+click Saving
+expect-within 60 +0.0100 BTC depositing
+shot depositing
+expect-gone-within 300 depositing
+expect 0.0100 BTC
+click 0.0100 BTC
+expect anon set
+expect early exit
+shot landed-early
+click Back
+click Spending
+click Receive
+click On-chain
+expect-within 120 bcrt1
+save-text bcrt1 exits-deposit-2.txt
+# The script pays 0.0205 BTC to it and mines: 0.02 above the target.
+shot deposit-2
+close-dialog
+expect-within 300 0.02 moving to Saving
+click-containing moving to Saving
+expect Est. anonymity
+shot queue-2
+click Back
+# Now items may leave on their own.
+action app.settings
+type "Minimum hours in pool" 0
+wait 800
+click Back
+click Saving
+# Nothing to press: the scheduler draws its time, and it lands by itself.
+expect-within 300 0.0300 BTC
+expect-not depositing
+click 0.0300 BTC
+click 0.0200 BTC
+expect Anonymity at exit
+expect-not early exit
+shot landed-automatic
+click Back
+expect early exit
+shot coins

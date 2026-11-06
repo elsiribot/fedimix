@@ -8,6 +8,9 @@
 //! - `click <label>`: activate the sensitive, mapped button, check button,
 //!   switch row or activatable row whose label (or a child label) equals
 //!   `<label>`; open dialogs are searched first. Polls up to 3 s.
+//! - `click-containing <text>`: activate the sensitive, mapped button whose
+//!   label contains `<text>`, for a label holding an amount the script cannot
+//!   know, such as one net of a federation's fee. Polls up to 3 s.
 //! - `type <title> <text>` (title optionally in double quotes): set an entry
 //!   or spin row by title.
 //! - `expect <text>`: wait up to 3 s for a mapped label or entry containing
@@ -65,6 +68,7 @@ const SHOT_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Click(String),
+    ClickContaining(String),
     Type { widget: String, text: String },
     TypeEnv { widget: String, var: String },
     SaveText { text: String, path: String },
@@ -115,6 +119,7 @@ fn parse_line(line: &str) -> Result<Step, String> {
     };
     Ok(match cmd {
         "click" => Step::Click(need("a label")?),
+        "click-containing" => Step::ClickContaining(need("text")?),
         "expect" => Step::Expect(need("text")?),
         "expect-slow" => Step::ExpectSlow(need("text")?),
         "expect-within" => {
@@ -205,6 +210,7 @@ impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Step::Click(l) => write!(f, "click {l}"),
+            Step::ClickContaining(t) => write!(f, "click-containing {t}"),
             Step::Type { widget, text } => write!(f, "type \"{widget}\" {text}"),
             // The name only: the value may be long, and is the caller's.
             Step::TypeEnv { widget, var } => write!(f, "type-env \"{widget}\" {var}"),
@@ -278,6 +284,12 @@ async fn run_step(env: &Env, step: &Step) -> Result<(), String> {
                 .await
                 .ok_or_else(|| format!("no sensitive visible control '{label}'"))?;
             // Let the click's async consequences (core calls, dialogs) settle.
+            glib::timeout_future(Duration::from_millis(150)).await;
+        }
+        Step::ClickContaining(text) => {
+            poll(|| click_containing(env, text).then_some(()))
+                .await
+                .ok_or_else(|| format!("no sensitive visible button containing '{text}'"))?;
             glib::timeout_future(Duration::from_millis(150)).await;
         }
         Step::Type { widget, text } => {
@@ -649,6 +661,21 @@ fn title_matches(w: &gtk::Widget, label: &str) -> bool {
         || label_texts(w).iter().any(|t| t == label)
 }
 
+/// Click the first live button whose own label contains `text`.
+fn click_containing(env: &Env, text: &str) -> bool {
+    for root in roots(env) {
+        for w in descendants(&root).iter().filter(|w| live(w)) {
+            if let Some(b) = w.downcast_ref::<gtk::Button>()
+                && b.label().is_some_and(|l| l.contains(text))
+            {
+                b.emit_clicked();
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Activate the first matching control. Controls win over bare rows so a
 /// button inside an activatable row is not shadowed by the row.
 fn click(env: &Env, label: &str) -> bool {
@@ -766,6 +793,7 @@ mod tests {
         let src = "\
 # a comment
 click Exit now (lower privacy)
+click-containing moving to Saving
 
 type \"Amount (BTC)\" 0.01
 type Target 0.1 extra words
@@ -797,6 +825,7 @@ action app.settings
             parse(src).unwrap(),
             vec![
                 Step::Click("Exit now (lower privacy)".into()),
+                Step::ClickContaining("moving to Saving".into()),
                 Step::Type {
                     widget: "Amount (BTC)".into(),
                     text: "0.01".into()

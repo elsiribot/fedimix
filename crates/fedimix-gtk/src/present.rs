@@ -234,15 +234,61 @@ pub fn backup_banner(balance: Amount, words_shown: bool) -> bool {
     balance > Amount::ZERO && !words_shown
 }
 
-/// Under a federation's name in Settings: what it holds, how it is doing, and
-/// its id, as a name is all a federation chooses for itself.
-pub fn federation_subtitle(f: &FederationInfo) -> String {
+/// The federation Settings marks "Most private": the one whose estimate is
+/// above every other's. One federation alone, a tie or nothing counted yet
+/// has none, as no choice would be more private than another.
+pub fn most_private(feds: &[FederationInfo]) -> Option<&str> {
+    let top = feds.iter().max_by_key(|f| f.anonymity_estimate)?;
+    let others_lower = feds
+        .iter()
+        .filter(|f| f.id != top.id)
+        .all(|f| f.anonymity_estimate < top.anonymity_estimate);
+    (feds.len() > 1 && top.anonymity_estimate > 0 && others_lower).then_some(top.id.as_str())
+}
+
+/// Under a federation's name in Settings: what it holds, how it is doing, its
+/// anonymity estimate, and its id, as a name is all a federation chooses for
+/// itself.
+pub fn federation_subtitle(f: &FederationInfo, most_private: bool) -> String {
     let status = match (&f.problem, f.online) {
         (Some(problem), _) => problem.as_str(),
         (None, true) => "Online",
         (None, false) => "Offline",
     };
-    format!("{} {DOT} {status}\n{}", format::btc(f.balance), f.id)
+    let marked = if most_private {
+        format!(" {DOT} Most private")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {DOT} {status} {DOT} anon ~{}{marked}\n{}",
+        format::btc(f.balance),
+        f.anonymity_estimate,
+        f.id
+    )
+}
+
+/// Under the Moving to Saving list: exits that may have left, said plainly,
+/// as nothing the user can do settles them yet.
+pub fn unknown_exits_note(q: &QueueState) -> Option<String> {
+    let unknown: Vec<&QueueItem> = q
+        .items
+        .iter()
+        .filter(|i| i.status == QueueItemStatus::OutcomeUnknown)
+        .collect();
+    match unknown.as_slice() {
+        [] => None,
+        [one] => Some(format!(
+            "Fedimix cannot tell whether the exit of {} was sent. If it was, it lands in \
+             Saving; if not, the money stays in Spending.",
+            format::btc_short(one.denomination)
+        )),
+        many => Some(format!(
+            "Fedimix cannot tell whether {} exits were sent. Each one that was lands in \
+             Saving; the money of the others stays in Spending.",
+            many.len()
+        )),
+    }
 }
 
 /// An invite as Settings offers it: a short form to read, the whole code to copy.
@@ -592,6 +638,7 @@ pub fn queue_row(item: &QueueItem, anonymity_target: u32) -> QueueRowView {
             format!("{cur} {DOT} {why}")
         }
         QueueItemStatus::Withdrawing { .. } => format!("{cur} {DOT} withdrawing"),
+        QueueItemStatus::OutcomeUnknown => format!("{cur} {DOT} outcome unknown"),
         QueueItemStatus::Landed => format!("{cur} {DOT} landed"),
     };
     QueueRowView {
@@ -608,6 +655,7 @@ pub fn exit_allowed(status: &QueueItemStatus) -> bool {
     !matches!(
         status,
         QueueItemStatus::Withdrawing { .. }
+            | QueueItemStatus::OutcomeUnknown
             | QueueItemStatus::Landed
             | QueueItemStatus::Deferred {
                 reason: DeferReason::Offline
@@ -745,11 +793,12 @@ pub fn operation_cancellable(state: &OperationState) -> bool {
     )
 }
 
-/// Body of the "Exit now?" dialog.
-pub fn exit_warning(preview: &ExitPreview) -> String {
+/// Body of the "Exit now?" dialog. `estimate` is the item's anonymity
+/// estimate now, which an early exit leaves with.
+pub fn exit_warning(preview: &ExitPreview, estimate: u32) -> String {
     format!(
-        "Leaving early lowers your privacy: this note will be withdrawn with a \
-         smaller anonymity set. Withdrawal fee: {}.",
+        "Leaving early lowers your privacy: this note leaves with an anonymity set of \
+         about {estimate}. Withdrawal fee: {}.",
         format::sats(preview.fee)
     )
 }
@@ -1599,7 +1648,7 @@ mod tests {
             in_flight_line(&s, Features::ALL),
             Some("+0.4200 BTC depositing \u{203a}".to_string())
         );
-        // Until Phase 4 nothing moves to Saving, so the line says nothing.
+        // Without a scheduler nothing moves to Saving, so the line says nothing.
         let saving_only = Features {
             saving: true,
             ..Features::NONE
@@ -1912,21 +1961,25 @@ mod tests {
         assert_eq!(demo.caption, None);
     }
 
-    /// Until Phase 4 has a scheduler nothing moves, whatever Saving's state.
+    /// The real backend's features: exits, no cover traffic. Money above
+    /// the target links to the queue once Saving can take it, and waits for
+    /// Saving until then.
     #[test]
-    fn moving_reads_as_waiting_without_a_scheduler() {
+    fn moving_links_with_a_scheduler() {
         let features = Features {
-            saving: true,
-            ..Features::NONE
+            cover: false,
+            ..Features::ALL
         };
         let over = SpendingState {
             features,
             ..spending(0.05, 0.42, 0.05, true)
         };
         let caption = spending_caption(&over);
-        assert_eq!(caption.queue_link, None);
-        assert!(caption.text.contains("waiting for Saving"), "{caption:?}");
-        assert!(!caption.text.contains("moving"), "{caption:?}");
+        assert_eq!(
+            caption.queue_link.as_deref(),
+            Some("0.05 for spending \u{b7} 0.42 moving to Saving \u{203a}")
+        );
+        assert!(!caption.text.contains("waiting"), "{caption:?}");
 
         let under = SpendingState {
             features,
@@ -1934,13 +1987,98 @@ mod tests {
             ..spending(0.01, 0.42, 0.05, true)
         };
         let caption = spending_caption(&under);
-        assert_eq!(caption.queue_link, None);
-        assert!(caption.text.contains("waiting for Saving"), "{caption:?}");
-        assert!(caption.shows_refill, "a refill needs no scheduler");
+        assert_eq!(
+            caption.queue_link.as_deref(),
+            Some("0.42 moving to Saving \u{203a}")
+        );
+        assert!(caption.shows_refill);
 
-        // With one, as in the demo, the link stands.
-        let caption = spending_caption(&spending(0.05, 0.42, 0.05, true));
-        assert!(caption.queue_link.is_some_and(|l| l.contains("moving")));
+        let no_saving = SpendingState {
+            features,
+            ..spending(0.05, 0.42, 0.05, false)
+        };
+        let caption = spending_caption(&no_saving);
+        assert_eq!(caption.queue_link, None);
+        assert!(
+            caption.text.contains("0.42 waiting for Saving"),
+            "{caption:?}"
+        );
+    }
+
+    #[test]
+    fn exit_warning_names_the_estimate() {
+        let preview = ExitPreview {
+            id: "p".into(),
+            item_id: "i".into(),
+            fee: sat(420),
+            expires_at: 0,
+        };
+        assert_eq!(
+            exit_warning(&preview, 9),
+            "Leaving early lowers your privacy: this note leaves with an anonymity set of \
+             about 9. Withdrawal fee: 420 sat."
+        );
+    }
+
+    #[test]
+    fn most_private_federation() {
+        let fed = |id: &str, estimate| FederationInfo {
+            id: id.into(),
+            anonymity_estimate: estimate,
+            ..federation_info()
+        };
+        let feds = [fed("a", 12), fed("b", 40), fed("c", 7)];
+        assert_eq!(most_private(&feds), Some("b"));
+        // A tie, nothing counted yet, or nothing to compare: no federation
+        // stands out.
+        assert_eq!(most_private(&[fed("a", 40), fed("b", 40)]), None);
+        assert_eq!(most_private(&[fed("a", 0), fed("b", 0)]), None);
+        assert_eq!(most_private(&[fed("a", 40)]), None);
+        assert_eq!(most_private(&[]), None);
+
+        assert_eq!(
+            federation_subtitle(&feds[1], true),
+            "0.0123 BTC \u{b7} Online \u{b7} anon ~40 \u{b7} Most private\nb"
+        );
+        assert_eq!(
+            federation_subtitle(&feds[0], false),
+            "0.0123 BTC \u{b7} Online \u{b7} anon ~12\na"
+        );
+    }
+
+    /// An exit that may have gone out stays on its way, and says it cannot
+    /// tell rather than look like one still withdrawing.
+    #[test]
+    fn an_exit_of_unknown_outcome_says_so() {
+        let item = qitem(QueueItemStatus::OutcomeUnknown, 5, 5);
+        assert_eq!(queue_row(&item, 50).detail, "5 \u{b7} outcome unknown");
+        assert!(!exit_allowed(&item.status));
+        let queue = |items| QueueState {
+            total: Amount::ZERO,
+            anonymity_estimate: 0,
+            typical_exit_secs: 0,
+            waiting_for_saving: false,
+            items,
+        };
+        assert_eq!(unknown_exits_note(&queue(vec![])), None);
+        assert_eq!(
+            unknown_exits_note(&queue(vec![
+                qitem(QueueItemStatus::Queued, 1, 1),
+                item.clone()
+            ]))
+            .as_deref(),
+            Some(
+                "Fedimix cannot tell whether the exit of 0.1 was sent. If it was, it lands in \
+                 Saving; if not, the money stays in Spending."
+            )
+        );
+        assert_eq!(
+            unknown_exits_note(&queue(vec![item.clone(), item])).as_deref(),
+            Some(
+                "Fedimix cannot tell whether 2 exits were sent. Each one that was lands in \
+                 Saving; the money of the others stays in Spending."
+            )
+        );
     }
 
     #[test]
@@ -2032,24 +2170,24 @@ mod tests {
     #[test]
     fn a_federation_row_says_what_it_holds_and_which_one_it_is() {
         assert_eq!(
-            federation_subtitle(&federation_info()),
-            "0.0123 BTC \u{b7} Online\nabc123"
+            federation_subtitle(&federation_info(), false),
+            "0.0123 BTC \u{b7} Online \u{b7} anon ~0\nabc123"
         );
         let offline = FederationInfo {
             online: false,
             ..federation_info()
         };
         assert_eq!(
-            federation_subtitle(&offline),
-            "0.0123 BTC \u{b7} Offline\nabc123"
+            federation_subtitle(&offline, false),
+            "0.0123 BTC \u{b7} Offline \u{b7} anon ~0\nabc123"
         );
         let broken = FederationInfo {
             problem: Some("It broke.".into()),
             ..offline
         };
         assert_eq!(
-            federation_subtitle(&broken),
-            "0.0123 BTC \u{b7} It broke.\nabc123"
+            federation_subtitle(&broken, false),
+            "0.0123 BTC \u{b7} It broke. \u{b7} anon ~0\nabc123"
         );
     }
 
@@ -2447,7 +2585,9 @@ mod tests {
         let rows: Vec<_> = q.items.iter().map(|i| queue_row(i, 50)).collect();
         assert!(rows.iter().all(|r| (0.0..=1.0).contains(&r.fraction)));
         let exit = core.prepare_exit(q.items[0].id.clone()).await.unwrap();
-        assert!(exit_warning(&exit).contains("Withdrawal fee: 420 sat"));
+        assert!(
+            exit_warning(&exit, q.items[0].anonymity_current).contains("Withdrawal fee: 420 sat")
+        );
         done(&events, core.exit_now(exit.id).await.unwrap()).await;
         let q = core.queue_state().await.unwrap();
         assert_eq!(q.items.len(), n - 1);

@@ -25,9 +25,10 @@ pub(super) fn spending_state(
         saving_ready,
         notes,
         history,
+        // Cover traffic is Phase 5.
         features: Features {
-            saving: true,
-            ..Features::NONE
+            cover: false,
+            ..Features::ALL
         },
     }
 }

@@ -6,10 +6,10 @@ expect +0.0019
 expect-not Join a federation
 expect-not Write down your recovery words
 shot reopened
-# Settings offers only what the real backend has.
+# Settings offers only what the real backend has: exits, no cover traffic.
 action app.settings
 expect Recovery words
-expect-not Anonymity target
+expect Anonymity target
 expect-not Budget (sat per month)
 expect Hardware wallet
 shot settings

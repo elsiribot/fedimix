@@ -10,7 +10,7 @@ close-dialog
 expect-within 180 0.0050 BTC
 action app.settings
 expect Saving wallet
-expect-not Anonymity target
+expect Anonymity target
 expect-not Budget (sat per month)
 type "Target (BTC)" 0.011
 wait 800

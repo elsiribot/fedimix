@@ -375,6 +375,11 @@ pub enum QueueItemStatus {
     Withdrawing {
         txid: Option<String>,
     },
+    /// An exit that may have taken its money: the federation stopped
+    /// reporting it, or Fedimix lost its record. It never goes out again by
+    /// itself; if it went out, its coin lands it in Saving, and if not, the
+    /// money stays in Spending.
+    OutcomeUnknown,
     Landed,
 }
 

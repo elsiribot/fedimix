@@ -573,6 +573,7 @@ impl Inner {
         }
         let mut group: Option<gtk::CheckButton> = None;
         let mut rows = Vec::new();
+        let most_private = present::most_private(feds);
         for fed in feds {
             let radio = gtk::CheckButton::new();
             match &group {
@@ -584,7 +585,10 @@ impl Inner {
                 // The name comes from the federation, so it is not markup.
                 .use_markup(false)
                 .title(&fed.name)
-                .subtitle(present::federation_subtitle(fed))
+                .subtitle(present::federation_subtitle(
+                    fed,
+                    most_private == Some(fed.id.as_str()),
+                ))
                 .activatable_widget(&radio)
                 .build();
             row.add_prefix(&radio);

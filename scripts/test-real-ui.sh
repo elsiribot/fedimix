@@ -3,10 +3,11 @@
 # from the invite, receive over Lightning from LND, restart, a second launch on
 # the same folder, a Lightning payment to a second wallet, Saving on this
 # computer (setup, a receive from bitcoind, a send whose change reaches
-# Spending, a refill), the testing build's Ledger stand-in declining to sign, and
-# the folder refusing another network. Needs the `integration` dev shell; see
-# `just test-real-ui`. Built with `fedimix-gtk/testing` for `--test-signer`; the
-# Saving flows on this computer do not use it.
+# Spending, a refill), the testing build's Ledger stand-in declining to sign,
+# exits to Saving (an early one and an automatic one), and the folder refusing
+# another network. Needs the `integration` dev shell; see `just test-real-ui`.
+# Built with `fedimix-gtk/testing` for `--test-signer` and `--exit-timing`; the
+# other Saving flows on this computer use neither.
 # Output: target/screenshots/real/<flow>-<shot>.png
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -179,12 +180,13 @@ pay_second_wallet() {
     return 1
 }
 
-# Pays `amount` BTC to the address the flow saved in `file`, and mines it.
+# Pays `amount` BTC to the address the flow saved in `file`, Saving's or a
+# federation deposit address, and mines it.
 fund_saving() {
     local file="$1" amount="$2"
     btc -named sendtoaddress address="$(cat "$work/$file")" amount="$amount" >/dev/null
     mine 1
-    echo "paid $amount BTC to Saving at $(cat "$work/$file")"
+    echo "paid $amount BTC to $(cat "$work/$file")"
 }
 
 on_shot_saving-setup() {
@@ -195,6 +197,13 @@ on_shot_saving-refill() {
 }
 on_shot_saving-test-signer() {
     if [[ "$1" == address ]]; then fund_saving ledger-address.txt 0.004; fi
+}
+# Spending's deposits, each above its 0.002 BTC target by one denomination.
+on_shot_exits() {
+    case "$1" in
+        deposit-1) fund_saving exits-deposit-1.txt 0.0125 ;;
+        deposit-2) fund_saving exits-deposit-2.txt 0.0205 ;;
+    esac
 }
 
 # The stand-in Ledger's key: the master key of a bitcoind wallet of its own,
@@ -217,6 +226,8 @@ saving_flows() {
     test_signer_key
     flow_dir="$work/ledger-wallet" flow_args="--test-signer $work/test-signer.key" \
         flow saving-test-signer 0 "DRIVE OK"
+    flow_dir="$work/exits-wallet" flow_args="--exit-timing fast" \
+        flow exits 0 "DRIVE OK"
 }
 
 inner() {
