@@ -55,6 +55,22 @@ impl RowAction {
     }
 }
 
+/// The header's network badge, and its tooltip: none on mainnet, where the
+/// coins are real. Every other network is one whose coins have no value.
+pub fn network_badge(network: Network) -> Option<(&'static str, &'static str)> {
+    match network {
+        Network::Bitcoin => None,
+        Network::Signet => Some((
+            "Signet",
+            "This wallet is on signet, a test network. Its coins have no value.",
+        )),
+        Network::Regtest => Some((
+            "Regtest",
+            "This wallet is on regtest, a local test network. Its coins have no value.",
+        )),
+    }
+}
+
 /// Under a stalled send. A new Saving send replaces it, as the core makes the
 /// next one spend the same coins.
 pub const STALLED_NOTE: &str = "No server holds this payment now, but it may still confirm. \
@@ -1085,6 +1101,18 @@ mod tests {
             None
         );
         assert_eq!(refill_wait_device(None), None);
+    }
+
+    #[test]
+    fn only_a_test_network_shows_a_badge() {
+        assert_eq!(network_badge(Network::Bitcoin), None);
+        let label = |network| network_badge(network).map(|(label, _)| label);
+        assert_eq!(label(Network::Signet), Some("Signet"));
+        assert_eq!(label(Network::Regtest), Some("Regtest"));
+        for network in [Network::Signet, Network::Regtest] {
+            let (_, tooltip) = network_badge(network).unwrap();
+            assert!(tooltip.ends_with("Its coins have no value."), "{tooltip}");
+        }
     }
 
     use super::*;

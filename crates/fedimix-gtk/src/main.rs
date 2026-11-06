@@ -151,7 +151,13 @@ fn main() -> gtk::glib::ExitCode {
             window.present();
             return;
         }
-        let new = window::FedimixWindow::new(app, bridge.clone(), args.page, send_lock_timeout);
+        let new = window::FedimixWindow::new(
+            app,
+            bridge.clone(),
+            args.page,
+            send_lock_timeout,
+            args.network,
+        );
         new.present();
         if let Some(steps) = drive.clone() {
             demo_drive::start(new.drive_env(app), steps);

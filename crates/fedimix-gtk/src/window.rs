@@ -16,7 +16,7 @@ use crate::ui::{
     about, coin_detail, coins_page, moving_page, notes_page, receive_dialog, refill_dialog,
     send_dialog, settings_page, setup_saving,
 };
-use fedimix_core::{Amount, Event, SendAmount, SendRequest, WalletKind};
+use fedimix_core::{Amount, Event, Network, SendAmount, SendRequest, WalletKind};
 
 const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 480;
@@ -39,6 +39,20 @@ impl Chrome {
             .set_title_widget(joined.then_some(&self.header_switcher));
         self.switcher_bar.set_visible(joined);
     }
+}
+
+/// A small label at the start of the header on a test network, beside the
+/// view switcher and in the narrow layout alike; `None` on mainnet.
+fn network_badge(network: Network) -> Option<gtk::Label> {
+    let (text, tooltip) = present::network_badge(network)?;
+    let label = gtk::Label::builder()
+        .label(text)
+        .tooltip_text(tooltip)
+        .valign(gtk::Align::Center)
+        .build();
+    label.add_css_class("network-badge");
+    label.add_css_class("caption-heading");
+    Some(label)
 }
 
 /// Main application window.
@@ -91,6 +105,7 @@ impl FedimixWindow {
         bridge: CoreBridge,
         start_page: Option<StartPage>,
         send_lock_timeout: Duration,
+        network: Network,
     ) -> Self {
         load_css();
 
@@ -128,6 +143,9 @@ impl FedimixWindow {
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&header_switcher));
         header.pack_end(&menu_button);
+        if let Some(badge) = network_badge(network) {
+            header.pack_start(&badge);
+        }
 
         // The tabs, or the Join page while there is no federation.
         let content = gtk::Stack::new();

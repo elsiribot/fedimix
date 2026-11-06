@@ -16,6 +16,7 @@ Phase 3 (Saving) is complete. `fedimix` runs Spending and Saving on the real bac
 
 ## Next
 Phase 4 (scheduler and anonymity estimate): plan `docs/superpowers/plans/2026-10-30-fedimix-phase-4.md`. Task 1 spike: sessions decode on both generations. Task 2 done: pure `scheduler` and `anonymity` modules with unit tests; nothing calls them yet. Next: Tasks 3-11.
+Demo fixes done: Saving's refill (or send) row turns final when Spending credits its deposit, no restart needed; the header shows "Regtest" or "Signet" off mainnet.
 
 ## Needs user
 - Hardware testing on each device kind: Ledger (policy `wpkh(@0/**)`, no hmac), BitBox02 pairing, Coldcard, Jade (its PIN step uses Blockstream's server outside any proxy).
