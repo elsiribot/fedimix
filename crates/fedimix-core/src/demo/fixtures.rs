@@ -256,6 +256,26 @@ fn funded_queue() -> Vec<QueueItem> {
     ]
 }
 
+/// A deposit above the target, split into denominations. The smallest has
+/// the most deposits after it, so it leaves first; the others catch up.
+fn exits() -> Fixture {
+    let moving = 0.28;
+    let for_spending = 0.05;
+    Fixture {
+        in_flight: Amount::ZERO,
+        spending_balance: btc(moving + for_spending),
+        for_spending: btc(for_spending),
+        moving: btc(moving),
+        queue: vec![
+            queue_item(1, 0.01, QueueItemStatus::Scheduled { at: BASE_TS }, 73, 73),
+            queue_item(2, 0.02, QueueItemStatus::Queued, 44, 64),
+            queue_item(3, 0.05, QueueItemStatus::Queued, 22, 52),
+            queue_item(4, 0.2, QueueItemStatus::Queued, 9, 41),
+        ],
+        ..funded()
+    }
+}
+
 fn deferred(reason: DeferReason) -> QueueItemStatus {
     QueueItemStatus::Deferred { reason }
 }
@@ -502,6 +522,7 @@ pub fn fixture(scenario: DemoScenario) -> Fixture {
             ..fixture(DemoScenario::NoSaving)
         },
         DemoScenario::ExitDeferred => exit_deferred(),
+        DemoScenario::Exits => exits(),
         DemoScenario::LongNames => long_names(),
         DemoScenario::SavingScanning => Fixture {
             device: Some(computer()),

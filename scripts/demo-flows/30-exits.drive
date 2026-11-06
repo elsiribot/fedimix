@@ -1,0 +1,33 @@
+# scenario: exits
+# step-ms: 2500
+# A deposit above the target, split into denominations, leaving one by one:
+# the queue with its estimates, a row withdrawing, Saving's in-flight line,
+# the exit landing with its privacy tag, then an early exit with its label.
+click Spending
+click 0.05 for spending · 0.28 moving to Saving ›
+expect scheduled
+shot queue
+expect-within 6 withdrawing
+shot withdrawing
+click Back
+click Saving
+expect +0.0100 BTC depositing
+shot depositing
+expect-gone-within 8 depositing
+click 1.2134 BTC
+expect anon set 73
+shot landed
+click Back
+click Spending
+click 0.27 moving to Saving ›
+shot queue-after
+click Item actions
+click Exit now (lower privacy)
+expect Withdrawal fee: 420 sat
+click Exit now
+expect-within 6 Moved to Saving
+click Back
+click Saving
+click 1.2334 BTC
+expect early exit
+shot early-exit

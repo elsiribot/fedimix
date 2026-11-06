@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,7 @@ use crate::backend::Backend;
 use crate::destination::{DestinationKind, parse_destination, requested_amount};
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, EventStream, Notice};
-use crate::scheduler::split;
+use crate::scheduler::{Booked, Fit, Origin, split};
 
 mod fixtures;
 use fixtures::BASE_TS;
@@ -31,6 +32,12 @@ const DEMO_RECOVERY_WORDS: &str = "demo demo demo demo demo demo demo demo demo 
 const TX_VBYTES: u64 = 140;
 const NOTIFY_DELAY: Duration = Duration::from_secs(2);
 const OPERATION_STEP: Duration = Duration::from_millis(300);
+/// `exits`: each stage of an automatic exit lasts this long.
+const EXITS_STEP: Duration = Duration::from_secs(4);
+/// How far an unexited item's anonymity estimate rises on each `exits` step.
+const ESTIMATE_RISE: u32 = 3;
+/// After an exit lands, the next one waits this many steps before it starts.
+const EXIT_SPACING_STEPS: u32 = 2;
 const PREVIEW_TTL: Duration = Duration::from_secs(600);
 /// `send-stuck`: a send held in Broadcasting, and the shortened wait.
 const STUCK_BROADCAST_HOLD: Duration = Duration::from_secs(4);
@@ -82,12 +89,15 @@ pub enum DemoScenario {
     /// Below target, with stalled, lost and contested Saving payments, and a
     /// device that refuses to sign.
     SavingStalled,
+    /// A deposit split into denominations, each exiting on its own clock.
+    Exits,
 }
 
 /// How fast the demo moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DemoTiming {
-    /// Time spent in each operation state.
+    /// Time spent in each operation state, and in each stage of an automatic
+    /// exit in the `exits` scenario.
     pub step: Duration,
     pub preview_ttl: Duration,
     /// Extra time an operation stays in Broadcasting, before it takes effect.
@@ -103,7 +113,10 @@ impl DemoTiming {
     pub fn for_scenario(scenario: DemoScenario) -> Self {
         let stuck = scenario == DemoScenario::SendStuck;
         DemoTiming {
-            step: OPERATION_STEP,
+            step: match scenario {
+                DemoScenario::Exits => EXITS_STEP,
+                _ => OPERATION_STEP,
+            },
             preview_ttl: match scenario {
                 DemoScenario::PreviewExpiry => Duration::from_secs(1),
                 _ => PREVIEW_TTL,
@@ -140,8 +153,9 @@ impl FromStr for DemoScenario {
             "saving-scanning" => Ok(Self::SavingScanning),
             "saving-broken" => Ok(Self::SavingBroken),
             "saving-stalled" => Ok(Self::SavingStalled),
+            "exits" => Ok(Self::Exits),
             other => Err(format!(
-                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, confirm-fails, long-history, recovering, saving-scanning, saving-broken, saving-stalled)"
+                "unknown scenario '{other}' (expected funded, below-target, no-saving, first-run, offline, exit-deferred, long-names, device-disconnected, preview-expiry, device-rejects, send-stuck, confirm-fails, long-history, recovering, saving-scanning, saving-broken, saving-stalled, exits)"
             )),
         }
     }
@@ -183,6 +197,10 @@ struct State {
     next_id: u64,
     /// Spending sends are refused at Confirm.
     confirm_fails: bool,
+    /// The queue item the `exits` scenario is taking out by itself.
+    auto_exit: Option<String>,
+    /// Steps the next automatic exit still waits (the spacing between exits).
+    auto_wait: u32,
 }
 
 /// Unconfirmed previews with their expiry.
@@ -414,7 +432,156 @@ impl State {
             cancelled: HashSet::new(),
             next_id: 1,
             confirm_fails: scenario == DemoScenario::ConfirmFails,
+            auto_exit: None,
+            auto_wait: 0,
         }
+    }
+
+    /// Queue items that can still leave or be dropped: not on their way.
+    fn movable(item: &QueueItem) -> bool {
+        !matches!(
+            item.status,
+            QueueItemStatus::Withdrawing { .. } | QueueItemStatus::Landed
+        )
+    }
+
+    /// What a Spending balance of `balance` makes of the queue (O1: the
+    /// whole balance is spendable, the queue gives way newest first).
+    fn fit_for(&self, balance: Amount) -> Fit {
+        let booked: Vec<Booked> = self
+            .queue
+            .iter()
+            .filter(|i| Self::movable(i))
+            .map(|i| Booked {
+                id: i.id.clone(),
+                denomination: i.denomination,
+                origin: Origin {
+                    session: 0,
+                    at: BASE_TS,
+                },
+            })
+            .collect();
+        let on_their_way = sum(self
+            .queue
+            .iter()
+            .filter(|i| !Self::movable(i))
+            .map(|i| i.denomination));
+        let cap = balance
+            .saturating_sub(self.settings.spending_target)
+            .saturating_sub(on_their_way);
+        crate::scheduler::fit(&booked, cap)
+    }
+
+    /// How much less the queue holds once `fit` is applied.
+    fn shrink_of(&self, fit: &Fit) -> Amount {
+        let removed = sum(self
+            .queue
+            .iter()
+            .filter(|i| fit.removed.contains(&i.id))
+            .map(|i| i.denomination));
+        removed.saturating_sub(sum(fit.regrow.iter().copied()))
+    }
+
+    /// Drop the removed items and split again what they freed.
+    fn apply_fit(&mut self, fit: Fit) -> bool {
+        let Some(newest) = fit
+            .removed
+            .first()
+            .and_then(|id| self.queue.iter().find(|i| i.id == *id))
+            .cloned()
+        else {
+            return false;
+        };
+        self.queue.retain(|i| !fit.removed.contains(&i.id));
+        for denomination in fit.regrow {
+            let id = self.fresh_id("queue");
+            self.queue.push(QueueItem {
+                id,
+                denomination,
+                status: QueueItemStatus::Queued,
+                anonymity_current: newest.anonymity_current,
+                anonymity_attainable: newest.anonymity_attainable,
+            });
+        }
+        if self
+            .auto_exit
+            .as_ref()
+            .is_some_and(|id| self.queue.iter().all(|i| i.id != *id))
+        {
+            self.auto_exit = None;
+        }
+        self.moving = sum(self.queue.iter().map(|i| i.denomination));
+        true
+    }
+
+    /// Put the first item that can leave on the clock, `steps` steps away.
+    fn schedule_next(&mut self, step: Duration, steps: u32) {
+        let at = now_secs() + step.as_secs().max(1) * u64::from(steps);
+        self.auto_exit = None;
+        if let Some(item) = self.queue.iter_mut().find(|i| {
+            matches!(
+                i.status,
+                QueueItemStatus::Queued
+                    | QueueItemStatus::Eligible
+                    | QueueItemStatus::Scheduled { .. }
+            )
+        }) {
+            item.status = QueueItemStatus::Scheduled { at };
+            self.auto_exit = Some(item.id.clone());
+        }
+    }
+
+    /// One step of the `exits` scenario: estimates rise, and the item on the
+    /// clock moves Scheduled, Withdrawing (no txid, then one), landed.
+    fn auto_tick(&mut self, step: Duration) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut changed = false;
+        for item in self.queue.iter_mut().filter(|i| Self::movable(i)) {
+            let next = (item.anonymity_current + ESTIMATE_RISE).min(item.anonymity_attainable);
+            changed |= next != item.anonymity_current;
+            item.anonymity_current = next;
+        }
+        if self.auto_wait > 0 {
+            self.auto_wait -= 1;
+        } else if let Some(pos) = self
+            .auto_exit
+            .as_ref()
+            .and_then(|id| self.queue.iter().position(|i| i.id == *id))
+        {
+            changed = true;
+            let denom = self.queue[pos].denomination;
+            match self.queue[pos].status.clone() {
+                QueueItemStatus::Scheduled { .. } => {
+                    self.queue[pos].status = QueueItemStatus::Withdrawing { txid: None };
+                    self.in_flight = sum([self.in_flight, denom].into_iter());
+                    events.push(Event::SavingChanged);
+                }
+                QueueItemStatus::Withdrawing { txid: None } => {
+                    let n = self.next_coin_index();
+                    self.queue[pos].status = QueueItemStatus::Withdrawing {
+                        txid: Some(format!("{n:064x}")),
+                    };
+                }
+                QueueItemStatus::Withdrawing { txid } => {
+                    let id = self.queue[pos].id.clone();
+                    if let Ok(landed) =
+                        self.land(&id, Amount::from_sat(ONCHAIN_FEE_SAT), false, txid)
+                    {
+                        events.extend(landed);
+                    }
+                    self.auto_wait = EXIT_SPACING_STEPS;
+                    self.schedule_next(step, EXIT_SPACING_STEPS + 1);
+                }
+                _ => self.schedule_next(step, 1),
+            }
+        } else {
+            self.schedule_next(step, 1);
+            changed = self.auto_exit.is_some();
+        }
+        if changed {
+            events.push(Event::QueueChanged);
+        }
+        events
     }
 
     /// The active federation with what Spending holds in it.
@@ -531,7 +698,11 @@ impl State {
             WalletKind::Spending => {
                 let total = with_fee(p.amount, p.fee);
                 self.spending_balance = self.spending_balance.saturating_sub(total);
-                self.for_spending = self.for_spending.saturating_sub(total);
+                let fit = self.fit_for(self.spending_balance);
+                if self.apply_fit(fit) {
+                    events.push(Event::QueueChanged);
+                }
+                self.for_spending = self.spending_balance.saturating_sub(self.moving);
                 let lightning = parse_destination(&p.destination)
                     .is_ok_and(|d| d.kind == DestinationKind::Lightning);
                 let kind = if lightning {
@@ -654,24 +825,38 @@ impl State {
     }
 
     fn apply_exit(&mut self, p: &ExitPreview) -> Result<Vec<Event>> {
+        self.land(&p.item_id, p.fee, true, None)
+    }
+
+    /// The item's output reaches Saving. A manual exit is flagged `early`.
+    fn land(
+        &mut self,
+        item_id: &str,
+        fee: Amount,
+        early: bool,
+        txid: Option<String>,
+    ) -> Result<Vec<Event>> {
         let pos = self
             .queue
             .iter()
-            .position(|i| i.id == p.item_id)
-            .ok_or_else(|| FedimixError::UnknownItem(p.item_id.clone()))?;
+            .position(|i| i.id == item_id)
+            .ok_or_else(|| FedimixError::UnknownItem(item_id.to_string()))?;
         let item = self.queue.remove(pos);
         let denom = item.denomination;
+        let estimate = item.anonymity_current;
         self.moving = self.moving.saturating_sub(denom);
-        self.spending_balance = self.spending_balance.saturating_sub(with_fee(denom, p.fee));
-        self.for_spending = self.for_spending.saturating_sub(p.fee);
+        self.spending_balance = self.spending_balance.saturating_sub(with_fee(denom, fee));
+        self.for_spending = self.for_spending.saturating_sub(fee);
         self.in_flight = self.in_flight.saturating_sub(denom);
         let n = self.next_coin_index();
         let source_federation = self.federation.as_ref().map(|f| f.name.clone());
         self.coins.push(Coin {
-            outpoint: fixtures::outpoint_for(n),
+            outpoint: txid.map_or_else(|| fixtures::outpoint_for(n), |t| format!("{t}:0")),
             amount: denom,
-            tag: PrivacyTag::EarlyExit {
-                estimate: item.anonymity_current,
+            tag: if early {
+                PrivacyTag::EarlyExit { estimate }
+            } else {
+                PrivacyTag::Anonymity { estimate }
             },
             received_at: BASE_TS,
             address: fixtures::address_for(n),
@@ -745,6 +930,9 @@ pub struct DemoBackend {
     senders: Senders,
     timing: DemoTiming,
     rejects: bool,
+    /// The `exits` scenario takes items out by itself.
+    auto_exits: bool,
+    ticker_started: AtomicBool,
 }
 
 impl DemoBackend {
@@ -753,15 +941,46 @@ impl DemoBackend {
     }
 
     pub fn with_timing(scenario: DemoScenario, timing: DemoTiming) -> Arc<Self> {
+        let mut state = State::new(scenario);
+        let auto_exits = scenario == DemoScenario::Exits;
+        if auto_exits {
+            state.schedule_next(timing.step, 1);
+        }
         Arc::new(DemoBackend {
-            state: Arc::new(Mutex::new(State::new(scenario))),
+            state: Arc::new(Mutex::new(state)),
             senders: Arc::new(StdMutex::new(Vec::new())),
             timing,
             rejects: matches!(
                 scenario,
                 DemoScenario::DeviceRejects | DemoScenario::SavingStalled
             ),
+            auto_exits,
+            ticker_started: AtomicBool::new(false),
         })
+    }
+
+    /// Start the clock of automatic exits on the first call from a runtime;
+    /// the front end builds the backend before its runtime context exists.
+    fn ensure_ticker(&self) {
+        if !self.auto_exits || self.ticker_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.ticker_started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        let senders = Arc::clone(&self.senders);
+        let step = self.timing.step;
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(step).await;
+                let events = state.lock().await.auto_tick(step);
+                for event in &events {
+                    broadcast(&senders, event);
+                }
+            }
+        });
     }
 
     fn emit(&self, event: Event) {
@@ -845,6 +1064,7 @@ impl Backend for DemoBackend {
     }
 
     async fn saving_state(&self) -> Result<SavingState> {
+        self.ensure_ticker();
         let st = self.state.lock().await;
         Ok(SavingState {
             device: st.device.clone(),
@@ -861,6 +1081,7 @@ impl Backend for DemoBackend {
     }
 
     async fn spending_state(&self) -> Result<SpendingState> {
+        self.ensure_ticker();
         let st = self.state.lock().await;
         Ok(SpendingState {
             federation: st.federation_info(),
@@ -877,6 +1098,7 @@ impl Backend for DemoBackend {
     }
 
     async fn queue_state(&self) -> Result<QueueState> {
+        self.ensure_ticker();
         let st = self.state.lock().await;
         Ok(QueueState {
             total: sum(st.queue.iter().map(|i| i.denomination)),
@@ -1095,6 +1317,16 @@ impl Backend for DemoBackend {
                 (amount, inputs, change)
             }
         };
+        let mut notes = Vec::new();
+        if wallet == WalletKind::Spending {
+            let balance_after = st.spending_balance.saturating_sub(with_fee(amount, fee));
+            let shrink = st.shrink_of(&st.fit_for(balance_after));
+            if shrink != Amount::ZERO {
+                notes.push(format!(
+                    "{shrink} of this comes from money moving to Saving."
+                ));
+            }
+        }
         let preview = SendPreview {
             id: st.fresh_id("send"),
             wallet,
@@ -1106,7 +1338,7 @@ impl Backend for DemoBackend {
                 .flatten(),
             inputs,
             change,
-            notes: Vec::new(),
+            notes,
             expires_at: self.preview_expiry(),
         };
         let held = (preview.expires_at, preview.clone());
@@ -1179,6 +1411,16 @@ impl Backend for DemoBackend {
         let st = &mut *guard;
         let (_, preview) = take_preview(&mut st.exits, &st.cancelled, &preview_id)?;
         st.check_online()?;
+        // Spending may have spent the fee since the quote.
+        if st.for_spending < preview.fee {
+            return Err(FedimixError::InsufficientFunds {
+                available: st.for_spending,
+                needed: preview.fee,
+            });
+        }
+        if st.auto_exit.as_deref() == Some(preview.item_id.as_str()) {
+            st.auto_exit = None;
+        }
         let item = st
             .queue
             .iter_mut()
@@ -1350,7 +1592,7 @@ mod tests {
     use crate::error::FedimixError;
     use crate::event::{Event, Notice};
 
-    const ALL: [DemoScenario; 17] = [
+    const ALL: [DemoScenario; 18] = [
         DemoScenario::Funded,
         DemoScenario::BelowTarget,
         DemoScenario::NoSaving,
@@ -1368,6 +1610,7 @@ mod tests {
         DemoScenario::SavingScanning,
         DemoScenario::SavingBroken,
         DemoScenario::SavingStalled,
+        DemoScenario::Exits,
     ];
 
     fn btc(v: f64) -> Amount {
@@ -2074,6 +2317,123 @@ mod tests {
         assert_eq!(fed.balance, sp.balance);
     }
 
+    #[tokio::test]
+    async fn a_demo_send_shrinks_the_queue_newest_first() {
+        let b = fast(DemoScenario::Funded);
+        let events = b.subscribe();
+        let p = b
+            .prepare_send(send(WalletKind::Spending, "bc1qabc", exact(0.01)))
+            .await
+            .unwrap();
+        // The newest 0.02 note goes; what it frees above the cap is split again.
+        assert_eq!(
+            p.notes,
+            vec!["0.011 BTC of this comes from money moving to Saving.".to_string()]
+        );
+        let op = b.confirm_send(p.id).await;
+        assert_eq!(settled(&events, op).await, OperationState::Done);
+        let q = b.queue_state().await.unwrap();
+        let ids: Vec<_> = q.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(&ids[..3], ["queue-1", "queue-2", "queue-3"]);
+        let denominations: Vec<_> = q.items.iter().map(|i| i.denomination).collect();
+        assert_eq!(denominations, [0.2, 0.1, 0.1, 0.005, 0.002, 0.002].map(btc));
+        let sp = b.spending_state().await.unwrap();
+        assert_eq!(sp.moving, q.total);
+        assert_eq!(sp.moving, btc(0.409));
+        assert_eq!(sp.for_spending.checked_add(sp.moving).unwrap(), sp.balance);
+    }
+
+    #[tokio::test]
+    async fn demo_exit_now_rechecks_the_fee() {
+        let b = fast(DemoScenario::Funded);
+        let p = b.prepare_exit("queue-1".to_string()).await.unwrap();
+        b.state.lock().await.for_spending = Amount::from_sat(100);
+        assert_eq!(
+            b.exit_now(p.id).await,
+            Err(FedimixError::InsufficientFunds {
+                available: Amount::from_sat(100),
+                needed: p.fee,
+            })
+        );
+        let q = b.queue_state().await.unwrap();
+        assert_eq!(q.items[0].status, QueueItemStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn the_exits_scenario_lands_an_unflagged_coin() {
+        let timing = DemoTiming {
+            step: Duration::from_millis(30),
+            ..FAST
+        };
+        let b = DemoBackend::with_timing(DemoScenario::Exits, timing);
+        let events = b.subscribe();
+        let first = b.queue_state().await.unwrap().items[0].clone();
+        assert!(matches!(first.status, QueueItemStatus::Scheduled { .. }));
+        assert_eq!(first.denomination, btc(0.01));
+        let mut seen = Vec::new();
+        let mut in_flight = Amount::ZERO;
+        let landed = loop {
+            let q = b.queue_state().await.unwrap();
+            if q.items.iter().all(|i| i.id != first.id) {
+                break q;
+            }
+            let status = q.items[0].status.clone();
+            if seen.last() != Some(&status) {
+                seen.push(status);
+            }
+            in_flight = in_flight.max(b.saving_state().await.unwrap().in_flight);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        assert!(matches!(seen[0], QueueItemStatus::Scheduled { .. }));
+        assert_eq!(seen[1], QueueItemStatus::Withdrawing { txid: None });
+        assert!(matches!(
+            seen[2],
+            QueueItemStatus::Withdrawing { txid: Some(_) }
+        ));
+        assert_eq!(in_flight, btc(0.01));
+        let s = b.saving_state().await.unwrap();
+        assert_eq!(s.in_flight, Amount::ZERO);
+        assert!(s.coins.iter().any(|c| c.amount == first.denomination
+            && c.source_federation.is_some()
+            && c.tag == PrivacyTag::Anonymity { estimate: 73 }
+            && c.confirmed));
+        let sp = b.spending_state().await.unwrap();
+        assert_eq!(sp.moving, landed.total);
+        assert_eq!(sp.for_spending.checked_add(sp.moving).unwrap(), sp.balance);
+        // The next item is counting down already, and the notice fired.
+        assert!(matches!(
+            landed.items[0].status,
+            QueueItemStatus::Scheduled { .. }
+        ));
+        let mut notice = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(50), events.next()).await
+        {
+            notice |= ev == Event::Notification(Notice::ExitLanded { amount: btc(0.01) });
+        }
+        assert!(notice);
+    }
+
+    #[tokio::test]
+    async fn estimates_rise_while_items_wait() {
+        let timing = DemoTiming {
+            step: Duration::from_millis(20),
+            ..FAST
+        };
+        let b = DemoBackend::with_timing(DemoScenario::Exits, timing);
+        let before = b.queue_state().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        let after = b.queue_state().await.unwrap();
+        let last = |q: &QueueState| q.items.last().unwrap().anonymity_current;
+        assert!(last(&after) > last(&before));
+        assert!(
+            after
+                .items
+                .iter()
+                .all(|i| i.anonymity_current <= i.anonymity_attainable)
+        );
+    }
+
     #[test]
     fn scenario_from_str_rejects_unknown() {
         assert_eq!(
@@ -2088,6 +2448,7 @@ mod tests {
             DemoScenario::from_str("long-history"),
             Ok(DemoScenario::LongHistory)
         );
+        assert_eq!(DemoScenario::from_str("exits"), Ok(DemoScenario::Exits));
         assert!(DemoScenario::from_str("bogus").is_err());
     }
 }
