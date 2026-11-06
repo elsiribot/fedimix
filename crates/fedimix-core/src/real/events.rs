@@ -133,6 +133,7 @@ async fn close_client(core: &Core, id: &str) -> Result<()> {
         live.online_since = None;
         (live.client.take(), std::mem::take(&mut live.online))
     };
+    core.forget_connection(id);
     if was_online {
         announce_online(core, id, false);
     }
@@ -303,6 +304,8 @@ fn forward_online(core: &Core, id: &str, online: bool) {
     if was_online == online {
         return;
     }
+    // Each reconnect starts the grace period again, and draws again.
+    core.forget_connection(id);
     if online && let Err(e) = core.store().set_online_at(id, (core.clock)()) {
         eprintln!("fedimix: saving when federation {id} was online: {e}");
     }

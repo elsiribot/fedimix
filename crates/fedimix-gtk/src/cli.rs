@@ -63,11 +63,18 @@ pub struct Args {
     /// with it. Only a build with the `testing` feature has it.
     #[cfg(feature = "testing")]
     pub test_signer: Option<PathBuf>,
+    /// `--exit-timing fast`: automatic exits in minutes rather than hours.
+    /// Only a build with the `testing` feature has it.
+    #[cfg(feature = "testing")]
+    pub fast_exits: bool,
 }
 
 /// Why `--test-signer` is refused in every other build.
 #[cfg(not(feature = "testing"))]
 const NO_TEST_SIGNER: &str = "--test-signer exists only in a build with the testing feature";
+/// Why `--exit-timing` is refused in every other build.
+#[cfg(not(feature = "testing"))]
+const NO_EXIT_TIMING: &str = "--exit-timing exists only in a build with the testing feature";
 
 /// Where `network` keeps its data unless `--data-dir` says otherwise.
 pub fn default_data_dir(
@@ -97,6 +104,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut network = None;
     #[cfg(feature = "testing")]
     let mut test_signer: Option<PathBuf> = None;
+    #[cfg(feature = "testing")]
+    let mut fast_exits = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--demo" => demo = true,
@@ -134,6 +143,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             #[cfg(not(feature = "testing"))]
             "--test-signer" => return Err(NO_TEST_SIGNER.to_string()),
+            #[cfg(feature = "testing")]
+            "--exit-timing" => {
+                let v = args.next().ok_or("--exit-timing needs fast or default")?;
+                fast_exits = match v.as_str() {
+                    "fast" => true,
+                    "default" => false,
+                    _ => return Err(format!("--exit-timing needs fast or default, got '{v}'")),
+                };
+            }
+            #[cfg(not(feature = "testing"))]
+            "--exit-timing" => return Err(NO_EXIT_TIMING.to_string()),
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -152,6 +172,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     if test_signer.is_some() && (demo || network.is_none_or(|n| n == Network::Bitcoin)) {
         return Err("--test-signer needs --network regtest or signet, without --demo".to_string());
     }
+    // Exits minutes apart give the privacy away, so never on real bitcoin.
+    #[cfg(feature = "testing")]
+    if fast_exits && (demo || network.is_none_or(|n| n == Network::Bitcoin)) {
+        return Err(
+            "--exit-timing fast needs --network regtest or signet, without --demo".to_string(),
+        );
+    }
     Ok(Args {
         demo,
         scenario: scenario.unwrap_or(DemoScenario::Funded),
@@ -162,6 +189,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         network: network.unwrap_or(Network::Bitcoin),
         #[cfg(feature = "testing")]
         test_signer,
+        #[cfg(feature = "testing")]
+        fast_exits,
     })
 }
 
@@ -314,6 +343,26 @@ mod tests {
         assert_eq!(
             args.unwrap_err(),
             "--test-signer exists only in a build with the testing feature"
+        );
+    }
+
+    /// As the test signer: fast exits exist only in a `testing` build, and
+    /// never on real bitcoin.
+    #[test]
+    fn exit_timing_needs_the_feature() {
+        let args = p(&["--network", "regtest", "--exit-timing", "fast"]);
+        #[cfg(feature = "testing")]
+        {
+            assert!(args.unwrap().fast_exits);
+            assert!(!p(&["--network", "regtest"]).unwrap().fast_exits);
+            assert!(p(&["--network", "regtest", "--exit-timing", "slow"]).is_err());
+            assert!(p(&["--exit-timing", "fast"]).is_err(), "not on bitcoin");
+            assert!(p(&["--demo", "--exit-timing", "fast"]).is_err());
+        }
+        #[cfg(not(feature = "testing"))]
+        assert_eq!(
+            args.unwrap_err(),
+            "--exit-timing exists only in a build with the testing feature"
         );
     }
 

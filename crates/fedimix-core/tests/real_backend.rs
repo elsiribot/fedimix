@@ -14,9 +14,10 @@ use bdk_wallet::bitcoin::{
 use bdk_wallet::chain::spk_client::{FullScanResponse, SyncResponse};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use fedimix_core::testing::{
-    BroadcastGoes, ChainClient, ChainFactory, DepositEvent, DepositSource, FakeChain, FakeClient,
-    FakeDevices, FakePort, FederationClient, SendHalt, SessionDeposit, Signer, SoftSigner,
-    WatchUpdate, halt_sends, item_estimate, real_backend, regtest_address, sync_saving_now,
+    BroadcastGoes, ChainClient, ChainFactory, DepositEvent, DepositSource, Draw, ExitTiming,
+    FakeChain, FakeClient, FakeDevices, FakePort, FederationClient, SendHalt, SessionDeposit,
+    Signer, SoftSigner, WatchUpdate, halt_sends, item_estimate, real_backend, real_backend_with,
+    regtest_address, sync_saving_now, tick_scheduler,
 };
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
@@ -3176,6 +3177,9 @@ struct SavingHarness {
     devices: Arc<FakeDevices>,
     /// What the backend asked the chain factory for, in order.
     asked: Arc<Mutex<Vec<ChainAsked>>>,
+    /// The harness clock, these draws and this exit clock in place of the
+    /// system clock, random draws and the default pace.
+    scheduled: Option<(Draw, ExitTiming)>,
 }
 
 fn chain_settings(url: &str) -> Settings {
@@ -3292,6 +3296,15 @@ impl SavingHarness {
             chain: Arc::new(FakeChain::new()),
             devices,
             asked: Arc::default(),
+            scheduled: None,
+        }
+    }
+
+    /// As [`Self::new`], on the harness clock with `draw` and `timing`.
+    fn scheduled(draw: Draw, timing: ExitTiming) -> Self {
+        Self {
+            scheduled: Some((draw, timing)),
+            ..Self::new()
         }
     }
 
@@ -3309,6 +3322,19 @@ impl SavingHarness {
                 .push((backend.clone(), proxy.map(str::to_string)));
             Ok(Arc::clone(&chain) as Arc<dyn ChainClient>)
         });
+        if let Some((draw, timing)) = &self.scheduled {
+            let time = Arc::clone(&self.harness.time);
+            return real_backend_with(
+                config,
+                self.harness.port.clone(),
+                factory,
+                self.devices.clone(),
+                Arc::new(move || time.load(Ordering::SeqCst)),
+                Arc::clone(draw),
+                *timing,
+            )
+            .await;
+        }
         fedimix_core::RealBackend::with_ports(
             config,
             self.harness.port.clone(),
@@ -8862,5 +8888,414 @@ async fn a_lost_database_with_a_submitted_exit_does_not_requeue() {
     );
     assert_eq!(saving.harness.first.withdraw_calls(), 1);
     port.set_recover_held(false);
+    backend.shutdown().await.unwrap();
+}
+
+// Automatic exits (Phase 4 Task 7).
+
+/// The default exit clock, syncing sessions every second. The scheduler's
+/// own ticks are an hour apart, so a test drives it with `tick_scheduler`;
+/// it still wakes on queue, settings and connection changes.
+const SCHEDULED: ExitTiming = ExitTiming {
+    session_poll_secs: 1,
+    tick_secs: 3_600,
+    ..ExitTiming::DEFAULT
+};
+
+/// Hands out `values` in order, then repeats the last.
+fn draws(values: &[f64]) -> Draw {
+    let values = Mutex::new(values.to_vec());
+    Arc::new(move || {
+        let mut values = values.lock().unwrap();
+        if values.len() > 1 {
+            values.remove(0)
+        } else {
+            values[0]
+        }
+    })
+}
+
+/// The scheduler's delay for `uniform` at a mean of `mean` seconds.
+fn delay(mean: u64, uniform: f64) -> u64 {
+    (-(1.0 - uniform).ln() * mean as f64).ceil() as u64
+}
+
+/// Exits may go as soon as the scheduler draws: no minimum time and no
+/// grace period.
+fn auto_settings(anonymity_target: u32) -> Settings {
+    Settings {
+        min_time_in_pool_secs: 0,
+        online_grace_secs: 0,
+        anonymity_target,
+        ..chain_settings(CHAIN_URL)
+    }
+}
+
+fn scheduled_at(at: u64) -> Option<fedimix_core::QueueItemStatus> {
+    Some(fedimix_core::QueueItemStatus::Scheduled { at })
+}
+
+fn deferred(reason: fedimix_core::DeferReason) -> Option<fedimix_core::QueueItemStatus> {
+    Some(fedimix_core::QueueItemStatus::Deferred { reason })
+}
+
+impl SavingHarness {
+    /// Saving on "This computer", joined with `balance` in Spending, and
+    /// `settings` in force once the queue reads `queue`. Until then the
+    /// default minimum time keeps every item queued.
+    async fn scheduling(&self, balance: Amount, settings: Settings, queue: &[Amount]) -> Real {
+        self.harness.first.set_balance(balance);
+        self.harness.first.set_withdraw_fee(EXIT_FEE);
+        let backend = self.joined_with(SOFTWARE).await;
+        wait_queue(&*backend, queue).await;
+        backend.set_settings(settings).await.unwrap();
+        backend
+    }
+
+    fn set_time(&self, at: u64) {
+        self.harness.time.store(at, Ordering::SeqCst);
+    }
+
+    fn now(&self) -> u64 {
+        self.harness.time.load(Ordering::SeqCst)
+    }
+}
+
+async fn tick(backend: &Real) {
+    tick_scheduler(backend).await.unwrap();
+}
+
+/// Ticks until `item` shows `status`: a tick can run before the change
+/// that the test waits for has reached the backend.
+async fn tick_until(backend: &Real, item: &str, status: Option<fedimix_core::QueueItemStatus>) {
+    wait_until("the item's status", || async {
+        tick(backend).await;
+        status_of(&**backend, item).await == status
+    })
+    .await;
+}
+
+/// Neither started nor submitted.
+async fn assert_not_exited(saving: &SavingHarness, backend: &Real, item: &str) {
+    assert!(
+        !matches!(
+            status_of(&**backend, item).await,
+            Some(fedimix_core::QueueItemStatus::Withdrawing { .. })
+        ),
+        "{:?}",
+        status_of(&**backend, item).await
+    );
+    assert_eq!(saving.harness.first.withdraw_calls(), 0);
+}
+
+async fn wait_withdrawals(saving: &SavingHarness, n: usize) {
+    wait_until("the withdrawals", || async {
+        saving.harness.first.withdrawn().len() == n
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_eligible_item_exits_at_its_drawn_time() {
+    let saving = SavingHarness::scheduled(draws(&[0.5]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(50), &[mbtc(10)])
+        .await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    // The item came in at session 0; 50 deposits of its size follow.
+    saving.harness.first.push_session(Vec::new());
+    saving.harness.first.push_session(
+        (0..50)
+            .map(|n| chain_deposit(1_000_000, &outpoint(n)))
+            .collect(),
+    );
+    wait_synced_to(&saving.harness, 2).await;
+    let start = saving.now();
+    tick_until(&backend, &item, scheduled_at(start + 7_486)).await;
+    let queue = backend.queue_state().await.unwrap();
+    assert_eq!(queue.items[0].anonymity_current, 50);
+
+    saving.set_time(start + 7_485);
+    tick(&backend).await;
+    assert_not_exited(&saving, &backend, &item).await;
+
+    saving.set_time(start + 7_486);
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
+    let quote = saving.harness.first.withdrawn().remove(0);
+    assert_eq!(quote.amount, mbtc(10));
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+    );
+    assert_eq!(exit_addresses_of(&saving.harness, &item), [quote.address]);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_redraws_the_delay() {
+    let saving = SavingHarness::scheduled(draws(&[0.5, 0.9]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(1), &[mbtc(10)])
+        .await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let start = saving.now();
+    tick_until(&backend, &item, scheduled_at(start + delay(10_800, 0.5))).await;
+
+    let backend = saving.reopened(backend).await;
+    wait_online(&*backend, true).await;
+    tick_until(&backend, &item, scheduled_at(start + delay(10_800, 0.9))).await;
+    assert_eq!(saving.harness.first.withdraw_calls(), 0);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_new_estimate_redraws_the_delay() {
+    let saving = SavingHarness::scheduled(draws(&[0.5, 0.9]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(50), &[mbtc(10)])
+        .await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let start = saving.now();
+    // No deposit after it: the longest mean wait.
+    tick_until(&backend, &item, scheduled_at(start + delay(2_592_000, 0.5))).await;
+
+    saving.set_time(start + 100);
+    saving.harness.first.push_session(Vec::new());
+    saving.harness.first.push_session(
+        (0..25)
+            .map(|n| chain_deposit(1_000_000, &outpoint(n)))
+            .collect(),
+    );
+    wait_synced_to(&saving.harness, 2).await;
+    // 25 of a target of 50: four times the short wait.
+    tick_until(
+        &backend,
+        &item,
+        scheduled_at(start + 100 + delay(43_200, 0.9)),
+    )
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_settings_change_redraws_the_schedule() {
+    let saving = SavingHarness::scheduled(draws(&[0.5, 0.9]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(1), &[mbtc(10)])
+        .await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let start = saving.now();
+    tick_until(&backend, &item, scheduled_at(start + delay(10_800, 0.5))).await;
+
+    saving.set_time(start + 60);
+    backend
+        .set_settings(Settings {
+            fee_guard_percent: 3,
+            ..auto_settings(1)
+        })
+        .await
+        .unwrap();
+    tick_until(
+        &backend,
+        &item,
+        scheduled_at(start + 60 + delay(10_800, 0.9)),
+    )
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+/// Review Focus 3: a connection that flaps every 300 s restarts the grace
+/// period each time; nothing exits in it, and the item says why.
+#[tokio::test]
+async fn no_exit_within_the_grace_period_after_start_or_reconnect() {
+    // A draw of 0 is due at once: only the grace period holds it back.
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    let settings = Settings {
+        online_grace_secs: 600,
+        ..auto_settings(1)
+    };
+    let backend = saving.scheduling(mbtc(60), settings, &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let client = &saving.harness.first;
+    let grace = deferred(fedimix_core::DeferReason::GracePeriod);
+    tick_until(&backend, &item, grace.clone()).await;
+    assert_not_exited(&saving, &backend, &item).await;
+
+    for _ in 0..12 {
+        saving.set_time(saving.now() + 300);
+        tick(&backend).await;
+        assert_eq!(status_of(&*backend, &item).await, grace);
+        assert_not_exited(&saving, &backend, &item).await;
+        client.set_online(false);
+        wait_online(&*backend, false).await;
+        client.set_online(true);
+        wait_online(&*backend, true).await;
+        tick_until(&backend, &item, grace.clone()).await;
+        assert_not_exited(&saving, &backend, &item).await;
+    }
+    assert_eq!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::GracePeriod),
+        "not by hand either"
+    );
+
+    // A steady connection: the grace period ends.
+    saving.set_time(saving.now() + 600);
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn fee_guard_defers_automatic_exits() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(1), &[mbtc(10)])
+        .await;
+    // Before the first quote: 5% of the denomination, above the 2% guard.
+    saving.harness.first.set_withdraw_fee(sat(50_000));
+    let item = item_of(&*backend, mbtc(10)).await;
+    let guarded = deferred(fedimix_core::DeferReason::FeeGuard);
+    tick_until(&backend, &item, guarded.clone()).await;
+    saving.set_time(saving.now() + 30 * 86_400);
+    tick(&backend).await;
+    assert_eq!(status_of(&*backend, &item).await, guarded);
+    assert_not_exited(&saving, &backend, &item).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_waits_when_spending_cannot_pay_the_fee() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    // No target: 1_000 sat for spending beside one 0.01 BTC item.
+    let settings = Settings {
+        spending_target: Amount::ZERO,
+        ..auto_settings(1)
+    };
+    saving.harness.first.set_balance(sat(1_001_000));
+    saving.harness.first.set_withdraw_fee(sat(1_500));
+    let backend = saving.joined_with(SOFTWARE).await;
+    backend.set_settings(settings).await.unwrap();
+    wait_queue(&*backend, &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let unaffordable = deferred(fedimix_core::DeferReason::FeeUnaffordable);
+    tick_until(&backend, &item, unaffordable.clone()).await;
+    saving.set_time(saving.now() + 86_400);
+    tick(&backend).await;
+    assert_eq!(status_of(&*backend, &item).await, unaffordable);
+    assert_not_exited(&saving, &backend, &item).await;
+
+    // Enough for the fee, too little for another item.
+    // The balance change wakes the scheduler, which may exit before this
+    // tick: either way, once.
+    saving.harness.first.set_balance(sat(1_002_000));
+    wait_until("the exit", || async {
+        tick(&backend).await;
+        saving.harness.first.withdrawn().len() == 1
+    })
+    .await;
+    assert_eq!(saving.harness.first.withdrawn()[0].fee, sat(1_500));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn two_items_never_exit_within_an_hour() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(80), auto_settings(1), &[mbtc(20), mbtc(10)])
+        .await;
+    let first = item_of(&*backend, mbtc(20)).await;
+    let second = item_of(&*backend, mbtc(10)).await;
+    let start = saving.now();
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
+    tick(&backend).await;
+    let (gone, left) = if saving.harness.first.withdrawn()[0].amount == mbtc(20) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert!(matches!(
+        status_of(&*backend, &gone).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { .. })
+    ));
+    // Redrawn from the hour's end.
+    tick_until(&backend, &left, scheduled_at(start + 3_600)).await;
+    saving.set_time(start + 3_599);
+    tick(&backend).await;
+    assert_eq!(saving.harness.first.withdraw_calls(), 1);
+    assert_eq!(
+        status_of(&*backend, &left).await,
+        scheduled_at(start + 3_600)
+    );
+
+    saving.set_time(start + 3_600);
+    tick(&backend).await;
+    wait_withdrawals(&saving, 2).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_automatic_exit_is_not_flagged_early() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(1), &[mbtc(10)])
+        .await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let events = backend.subscribe();
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
+    let id = rows(&*backend)
+        .await
+        .into_iter()
+        .find(|row| matches!(row.kind, HistoryKind::ToSaving { .. }))
+        .unwrap()
+        .id;
+    let op = operation_of(&saving.harness.first, &id).await;
+    let address = saving.harness.first.withdrawn()[0].address.clone();
+    let tx = payment(&address, 1_000_000, 7);
+    let txid = tx.compute_txid().to_string();
+    saving.harness.first.push_update(&op, exit_settled(&txid));
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(states.last(), Some(&OperationState::Done));
+
+    saving.chain.push_sync(confirmed(tx, 2));
+    sync_saving_now(&backend);
+    wait_event(
+        &events,
+        &Event::Notification(Notice::ExitLanded { amount: mbtc(10) }),
+    )
+    .await;
+    let state = backend.saving_state().await.unwrap();
+    let coin = state.coins.iter().find(|c| c.address == address).unwrap();
+    assert_eq!(coin.tag, PrivacyTag::Anonymity { estimate: 0 });
+    assert_eq!(status_of(&*backend, &item).await, None);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_pauses_the_scheduler() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    let client = &saving.harness.first;
+    client.set_balance(mbtc(60));
+    client.set_withdraw_fee(EXIT_FEE);
+    let backend = saving.joined_with(SOFTWARE).await;
+    wait_queue(&*backend, &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    client.set_online(false);
+    wait_online(&*backend, false).await;
+    backend.set_settings(auto_settings(1)).await.unwrap();
+    let offline = deferred(fedimix_core::DeferReason::Offline);
+    tick_until(&backend, &item, offline.clone()).await;
+    saving.set_time(saving.now() + 86_400);
+    tick(&backend).await;
+    assert_eq!(status_of(&*backend, &item).await, offline);
+    assert_not_exited(&saving, &backend, &item).await;
+
+    client.set_online(true);
+    wait_online(&*backend, true).await;
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
     backend.shutdown().await.unwrap();
 }

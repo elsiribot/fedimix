@@ -120,9 +120,17 @@ fn main() -> gtk::glib::ExitCode {
             network: args.network,
         };
         #[cfg(feature = "testing")]
-        let opened = match &args.test_signer {
-            Some(key_file) => bridge::open_with_test_signer(&runtime, config, key_file),
-            None => bridge::open_real(&runtime, config),
+        let opened = {
+            let timing = if args.fast_exits {
+                fedimix_core::testing::ExitTiming::FAST
+            } else {
+                fedimix_core::testing::ExitTiming::DEFAULT
+            };
+            match &args.test_signer {
+                Some(key_file) => bridge::open_with_test_signer(&runtime, config, key_file, timing),
+                None if args.fast_exits => bridge::open_with_timing(&runtime, config, timing),
+                None => bridge::open_real(&runtime, config),
+            }
         };
         #[cfg(not(feature = "testing"))]
         let opened = bridge::open_real(&runtime, config);

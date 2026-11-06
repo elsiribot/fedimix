@@ -465,11 +465,11 @@ impl Core {
         })
     }
 
-    /// The active federation's queue. Until automatic exits exist, an item
-    /// not on its way reads `Queued`.
+    /// The active federation's queue, each queued item with the status the
+    /// scheduler sees for it.
     pub(super) fn queue_state(&self) -> Result<QueueState> {
         let waiting_for_saving = !self.saving_usable();
-        let (federation, settings, items) = {
+        let (federation, settings, items, balance) = {
             let store = self.store();
             let Some(federation) = store.active_federation()? else {
                 return Ok(QueueState {
@@ -481,8 +481,16 @@ impl Core {
                 });
             };
             let items = store.exit_items(Some(&federation))?;
-            (federation, store.settings()?, items)
+            let balance = store
+                .federations()?
+                .into_iter()
+                .find(|row| row.id == federation)
+                .map_or(Amount::ZERO, |row| Amount {
+                    msat: row.balance_msat,
+                });
+            (federation, store.settings()?, items, balance)
         };
+        let for_spending = self.exit_fee_room(&federation, balance)?;
         let counting = self.counting(&federation, &items)?;
         let session_secs = self.session_secs(&federation);
         let now = (self.clock)();
@@ -525,7 +533,7 @@ impl Core {
                 QueueItem {
                     id: item.id.clone(),
                     denomination: item.denomination,
-                    status: QueueItemStatus::Queued,
+                    status: self.queued_status(item, &settings, for_spending),
                     anonymity_current: current,
                     anonymity_attainable: reachable,
                 }

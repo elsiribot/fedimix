@@ -15,9 +15,10 @@ use fedimint_core::PeerId;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
 use fedimix_core::testing::{
-    ChainFactory, DataDirLock, DepositEvent, DepositSource, FakeDevices, FederationClient,
-    FederationPort, FedimintPort, Seed, SendHalt, SoftSigner, Watch, WatchKind, WatchUpdate,
-    connect_chain, halt_sends, item_estimate, real_backend, sync_saving_now,
+    ChainFactory, DataDirLock, DepositEvent, DepositSource, ExitTiming, FakeDevices,
+    FederationClient, FederationPort, FedimintPort, Seed, SendHalt, SoftSigner, Watch, WatchKind,
+    WatchUpdate, connect_chain, halt_sends, item_estimate, real_backend, real_backend_with,
+    sync_saving_now,
 };
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
@@ -2582,5 +2583,94 @@ async fn exit_now_lands_in_saving_labelled() {
     .await;
     let spent = before.saturating_sub(after);
     assert!(spent <= shown, "spent {spent:?}, shown {shown:?}");
+    backend.shutdown().await.unwrap();
+}
+
+/// No minimum time, no grace period and an anonymity target of 1 on the
+/// fast exit clock: one 0.01 BTC item leaves by itself within minutes, and
+/// lands tagged with its estimate, not as an early exit.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn an_automatic_exit_lands() {
+    let wallet = SavingWallet::new();
+    let clock = Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    });
+    let backend = real_backend_with(
+        wallet.config.clone(),
+        wallet.port.clone(),
+        Arc::new(connect_chain),
+        wallet.devices.clone(),
+        clock,
+        Arc::new(rand::random::<f64>),
+        ExitTiming::FAST,
+    )
+    .await
+    .unwrap();
+    backend
+        .set_settings(Settings {
+            chain_backend: esplora(),
+            min_time_in_pool_secs: 0,
+            online_grace_secs: 0,
+            anonymity_target: 1,
+            ..Settings::for_network(Network::Regtest)
+        })
+        .await
+        .unwrap();
+    backend
+        .setup_saving(fedimix_core::SOFTWARE_DEVICE_ID.into())
+        .await
+        .unwrap();
+    backend.join_federation(invite()).await.unwrap();
+    wait_online(&backend).await;
+    // The first scan, so Saving can take an exit.
+    saving_address(&backend).await;
+
+    let events = backend.subscribe();
+    let deposit = address(&backend).await;
+    fund(&deposit.payload, 6_050_000);
+    mine_until_received(&backend, &events).await;
+
+    let landing = Duration::from_secs(300);
+    let state = tokio::time::timeout(landing, async {
+        loop {
+            sync_saving_now(&backend);
+            let state = backend.saving_state().await.unwrap();
+            let landed = state.coins.iter().any(|coin| {
+                coin.confirmed
+                    && coin.amount == EXIT_DENOMINATION
+                    && coin.source_federation.is_some()
+            });
+            if landed {
+                return state;
+            }
+            mine(1);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    })
+    .await
+    .expect("the automatic exit lands within 300 s");
+    let coin = state
+        .coins
+        .iter()
+        .find(|coin| coin.amount == EXIT_DENOMINATION && coin.source_federation.is_some())
+        .unwrap();
+    assert!(
+        matches!(coin.tag, PrivacyTag::Anonymity { .. }),
+        "{:?}",
+        coin.tag
+    );
+    let exits: Vec<HistoryItem> = backend
+        .history(WalletKind::Spending, None, 100)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|row| matches!(row.kind, HistoryKind::ToSaving { .. }))
+        .collect();
+    assert_eq!(exits.len(), 1, "one exit: {exits:?}");
     backend.shutdown().await.unwrap();
 }

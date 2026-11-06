@@ -60,6 +60,7 @@ pub fn open_with_test_signer(
     handle: &tokio::runtime::Handle,
     config: CoreConfig,
     key_file: &std::path::Path,
+    timing: fedimix_core::testing::ExitTiming,
 ) -> Result<Arc<RealBackend>, FedimixError> {
     let text = std::fs::read_to_string(key_file)
         .map_err(|e| FedimixError::Internal(format!("Cannot read {}: {e}.", key_file.display())))?;
@@ -67,8 +68,21 @@ pub fn open_with_test_signer(
     let key = lines.next().unwrap_or("").to_string();
     let rejects = lines.next().is_some_and(|line| line.trim() == "rejects");
     let task = handle.spawn(async move {
-        fedimix_core::testing::real_backend_with_test_signer(config, &key, rejects).await
+        fedimix_core::testing::real_backend_with_test_signer(config, &key, rejects, timing).await
     });
+    handle
+        .block_on(task)
+        .unwrap_or_else(|_| Err(FedimixError::Internal(PANIC_WHY.to_string())))
+}
+
+/// [`open_real`] on the `testing` build's given exit clock.
+#[cfg(feature = "testing")]
+pub fn open_with_timing(
+    handle: &tokio::runtime::Handle,
+    config: CoreConfig,
+    timing: fedimix_core::testing::ExitTiming,
+) -> Result<Arc<RealBackend>, FedimixError> {
+    let task = handle.spawn(RealBackend::open_with_timing(config, timing));
     handle
         .block_on(task)
         .unwrap_or_else(|_| Err(FedimixError::Internal(PANIC_WHY.to_string())))

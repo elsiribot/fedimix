@@ -825,12 +825,36 @@ impl Store {
         )
     }
 
+    /// When the latest exit of `federation` started that did not fail,
+    /// automatic or not: the next automatic one keeps its distance from it.
+    pub(crate) fn latest_exit_at(&self, federation_id: &str) -> Result<Option<Timestamp>> {
+        let rows = self.spending_rows_where(federation_id, "ToSaving", |kind| {
+            matches!(kind, HistoryKind::ToSaving { .. })
+        })?;
+        Ok(rows
+            .iter()
+            .filter(|row| row.status != HistoryStatus::Failed)
+            .map(|row| row.timestamp)
+            .max())
+    }
+
     /// Spending's rows of `kind`, whose JSON holds `name` quoted.
     fn spending_rows_of(
         &self,
         federation_id: &str,
         kind: &HistoryKind,
         name: &str,
+    ) -> Result<Vec<HistoryItem>> {
+        self.spending_rows_where(federation_id, name, |of| of == kind)
+    }
+
+    /// Spending's rows whose JSON holds `name` quoted and whose kind `wanted`
+    /// takes.
+    fn spending_rows_where(
+        &self,
+        federation_id: &str,
+        name: &str,
+        wanted: impl Fn(&HistoryKind) -> bool,
     ) -> Result<Vec<HistoryItem>> {
         let mut stmt = self
             .conn
@@ -853,7 +877,7 @@ impl Store {
         for json in rows {
             let json = json.map_err(db_err)?;
             match serde_json::from_str::<HistoryItem>(&json) {
-                Ok(item) if item.kind == *kind => out.push(item),
+                Ok(item) if wanted(&item.kind) => out.push(item),
                 Ok(_) => {}
                 Err(e) => eprintln!("fedimix: skipping a history row that does not parse: {e}"),
             }

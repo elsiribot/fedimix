@@ -13,6 +13,7 @@ mod receive;
 mod refill;
 mod saving;
 mod saving_send;
+mod scheduler;
 mod send;
 mod spending;
 
@@ -32,6 +33,11 @@ use self::events::{Events, left_open, supervise};
 pub use self::saving::sync_saving_now;
 use self::saving::{ChainTarget, SavingLive, supervise_saving};
 use self::saving_send::{HeldSaving, resume_signed};
+pub use self::scheduler::Draw;
+pub(crate) use self::scheduler::random_draw;
+use self::scheduler::{Schedule, run_scheduler};
+#[cfg(feature = "testing")]
+pub use self::scheduler::{run_scheduler_now, tick_scheduler};
 use self::send::{HeldSend, Submitting};
 #[cfg(feature = "testing")]
 pub use self::send::{SendHalt, halt_sends};
@@ -127,7 +133,7 @@ fn held<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn system_clock() -> Timestamp {
+pub(crate) fn system_clock() -> Timestamp {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
@@ -181,6 +187,15 @@ struct Core {
     clock: Clock,
     /// The exit clock's constants; the session sync polls at its pace.
     timing: ExitTiming,
+    /// Uniform draws in `[0, 1)` for the exit delays. Injected with the clock.
+    draw: Draw,
+    /// The drawn exit times and the cached fee quotes. Never held with
+    /// `store` or `state`.
+    schedule: Mutex<Schedule>,
+    /// Ends the scheduler's wait, so it ticks now.
+    scheduler_wake: Notify,
+    /// Held through a tick, so two never start the same exit.
+    scheduling: tokio::sync::Mutex<()>,
     store: Mutex<Store>,
     state: Mutex<State>,
     saving: Mutex<SavingLive>,
@@ -422,6 +437,7 @@ impl Core {
                 false
             });
         drop(store);
+        self.forget_draws();
         let grown = target < before.spending_target && self.tend_queues();
         self.events.emit(&Event::SettingsChanged);
         if fitted || grown {
@@ -494,7 +510,32 @@ impl RealBackend {
             chain_factory,
             devices,
             Arc::new(system_clock),
+            random_draw(),
             ExitTiming::DEFAULT,
+        )
+        .await
+    }
+
+    /// [`Self::open`] on the given exit clock, for a testing build's
+    /// `--exit-timing`.
+    #[cfg(feature = "testing")]
+    pub async fn open_with_timing(
+        config: CoreConfig,
+        timing: ExitTiming,
+    ) -> Result<Arc<RealBackend>> {
+        let dir = Path::new(&config.data_dir);
+        let port = Arc::new(FedimintPort::new(dir));
+        let devices = Arc::new(HwiPort::new(dir, config.network));
+        let chain_factory =
+            Arc::new(|backend: &ChainBackend, proxy: Option<&str>| connect_chain(backend, proxy));
+        Self::build(
+            config,
+            port,
+            chain_factory,
+            devices,
+            Arc::new(system_clock),
+            random_draw(),
+            timing,
         )
         .await
     }
@@ -513,6 +554,7 @@ impl RealBackend {
             chain_factory,
             devices,
             Arc::new(system_clock),
+            random_draw(),
             ExitTiming::DEFAULT,
         )
         .await
@@ -524,6 +566,7 @@ impl RealBackend {
         chain_factory: ChainFactory,
         devices: Arc<dyn DevicePort>,
         clock: Clock,
+        draw: Draw,
         timing: ExitTiming,
     ) -> Result<Arc<RealBackend>> {
         let dir = PathBuf::from(&config.data_dir);
@@ -561,6 +604,10 @@ impl RealBackend {
             seed_born_with_store,
             clock,
             timing,
+            draw,
+            schedule: Mutex::default(),
+            scheduler_wake: Notify::new(),
+            scheduling: tokio::sync::Mutex::default(),
             store: Mutex::new(store),
             state: Mutex::default(),
             saving: Mutex::new(saving),
@@ -591,6 +638,7 @@ impl RealBackend {
             }
             supervisors.push(tokio::spawn(supervise_saving(Arc::clone(&core), wallet)));
         }
+        supervisors.push(tokio::spawn(run_scheduler(Arc::clone(&core))));
         *core.supervisors.lock().await = supervisors;
         Ok(Arc::new(RealBackend { core }))
     }

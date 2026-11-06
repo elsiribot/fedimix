@@ -45,7 +45,8 @@ pub mod testing {
     };
     #[cfg(feature = "testing")]
     pub use crate::real::{
-        ChainFactory, Clock, SendHalt, halt_sends, item_estimate, sync_saving_now,
+        ChainFactory, Clock, Draw, SendHalt, halt_sends, item_estimate, run_scheduler_now,
+        sync_saving_now, tick_scheduler,
     };
     #[cfg(feature = "testing")]
     pub use crate::saving::{BroadcastGoes, FakeChain, FakeDevices, SoftSigner};
@@ -53,6 +54,7 @@ pub mod testing {
         ChainClient, DeviceAccount, DevicePort, HwiPort, Label, Labels, SavingWallet, SentRecord,
         Signer, SyncSummary, Tag, connect_chain,
     };
+    pub use crate::scheduler::ExitTiming;
     pub use crate::seed::{DataDirLock, Seed};
     pub use crate::store::{Watch, WatchKind};
 
@@ -64,12 +66,14 @@ pub mod testing {
 
     /// The production [`crate::RealBackend`], but with one device: a Ledger
     /// in the listing that signs with `xprv`, or declines when `rejects`, as
-    /// the core tests stand in for hardware. For the real UI flows only.
+    /// the core tests stand in for hardware, and exits on `timing`. For the
+    /// real UI flows only.
     #[cfg(feature = "testing")]
     pub async fn real_backend_with_test_signer(
         config: crate::CoreConfig,
         xprv: &str,
         rejects: bool,
+        timing: ExitTiming,
     ) -> crate::Result<std::sync::Arc<crate::RealBackend>> {
         let signer = SoftSigner::from_xprv(xprv)?;
         let signer = if rejects { signer.rejecting() } else { signer };
@@ -81,15 +85,33 @@ pub mod testing {
             std::sync::Arc::new(signer),
         );
         let port = std::sync::Arc::new(FedimintPort::new(std::path::Path::new(&config.data_dir)));
-        crate::RealBackend::with_ports(
+        crate::RealBackend::build(
             config,
             port,
             std::sync::Arc::new(|backend: &crate::ChainBackend, proxy: Option<&str>| {
                 connect_chain(backend, proxy)
             }),
             std::sync::Arc::new(devices),
+            std::sync::Arc::new(crate::real::system_clock),
+            crate::real::random_draw(),
+            timing,
         )
         .await
+    }
+
+    /// [`crate::RealBackend`] over every seam: `draw` gives the uniform
+    /// draws of the exit delays, and `timing` the exit clock.
+    #[cfg(feature = "testing")]
+    pub async fn real_backend_with(
+        config: crate::CoreConfig,
+        port: std::sync::Arc<dyn FederationPort>,
+        chain_factory: ChainFactory,
+        devices: std::sync::Arc<dyn DevicePort>,
+        clock: Clock,
+        draw: Draw,
+        timing: ExitTiming,
+    ) -> crate::Result<std::sync::Arc<crate::RealBackend>> {
+        crate::RealBackend::build(config, port, chain_factory, devices, clock, draw, timing).await
     }
 
     /// [`crate::RealBackend`] over `port`, reading the time from `clock`, with
@@ -109,7 +131,8 @@ pub mod testing {
             }),
             std::sync::Arc::new(FakeDevices::new()),
             clock,
-            crate::scheduler::ExitTiming::FAST,
+            crate::real::random_draw(),
+            ExitTiming::FAST,
         )
         .await
     }
