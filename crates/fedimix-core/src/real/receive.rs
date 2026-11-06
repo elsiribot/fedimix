@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use super::Core;
-use super::send::{is_send, resolve_intent};
+use super::exit::resolve_exit;
+use super::send::{is_outgoing, resolve_intent};
 use crate::api::*;
 use crate::error::{FedimixError, Result};
 use crate::event::{Event, Notice};
@@ -202,7 +203,9 @@ impl Core {
             == HistoryWrite::Changed {
                 was: HistoryStatus::Complete,
             };
-        if item.status == HistoryStatus::Complete && !was_complete {
+        // An exit tells the user when it lands in Saving, not here.
+        let exit = matches!(item.kind, HistoryKind::ToSaving { .. });
+        if item.status == HistoryStatus::Complete && !was_complete && !exit {
             let amount = item.amount;
             self.events.emit(&Event::Notification(if item.incoming {
                 Notice::DepositConfirmed { amount }
@@ -271,7 +274,10 @@ impl Core {
     /// Writes what `update` says about `watch`, and ends the watch if it is
     /// final. The row comes first, so a crash between the two replays.
     fn apply(&self, watch: &Watch, update: &WatchUpdate, session: Option<u64>) -> Result<()> {
-        if is_send(watch.kind) {
+        if watch.kind == WatchKind::Exit {
+            return self.apply_exit(watch, update);
+        }
+        if is_outgoing(watch.kind) {
             return self.apply_send(watch, update);
         }
         let federation = &watch.federation_id;
@@ -459,16 +465,24 @@ impl Watches {
         self.tasks.spawn(task);
     }
 
-    /// Settles what a crash left of sends with no operation. Runs each time the
-    /// federation comes online and on a slow timer while it stays online, so a
-    /// lookup that failed, or an operation id that could not be saved, is tried
-    /// again.
+    /// Settles what a crash left of sends and exits with no operation. Runs
+    /// each time the federation comes online and on a slow timer while it
+    /// stays online, so a lookup that failed, or an operation id that could
+    /// not be saved, is tried again.
     pub(super) fn resolve_unsent(&mut self, federation: &str) {
         for watch in self.core.unsent(federation) {
             let core = Arc::clone(&self.core);
             let client = Arc::clone(&self.client);
             self.tasks
                 .spawn(async move { resolve_intent(&core, &*client, &watch).await });
+        }
+        // Exits have a resolver of their own: one never sent goes back to
+        // the queue.
+        for watch in self.core.unsent_exits(federation) {
+            let core = Arc::clone(&self.core);
+            let client = Arc::clone(&self.client);
+            self.tasks
+                .spawn(async move { resolve_exit(&core, &*client, &watch).await });
         }
     }
 

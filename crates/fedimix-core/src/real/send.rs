@@ -28,10 +28,10 @@ pub(super) const PREVIEW_TTL: Timestamp = 600;
 /// How long `shutdown` waits for submissions, after closing clients took up to
 /// their own 10 s: up to 25 s in all, inside GTK's cap of 30 s.
 const SUBMISSION_GRACE: Duration = Duration::from_secs(15);
-const CAME_BACK: &str = "The payment failed and the money came back.";
+pub(super) const CAME_BACK: &str = "The payment failed and the money came back.";
 const NEVER_SENT: &str = "This payment was never sent, so no money left your wallet.";
 const LOST_RECORD: &str = "Fedimix lost its record of this payment and cannot tell whether it was sent. Check your balance before paying again.";
-const EXPIRED: &str = "The payment expired before it went through.";
+pub(super) const EXPIRED: &str = "The payment expired before it went through.";
 const NO_AMOUNT: &str = "This invoice has no amount, so it cannot be paid.";
 
 /// Where a test stops a send, as a crash there would.
@@ -53,10 +53,19 @@ pub fn halt_sends(backend: &super::RealBackend, halt: SendHalt) {
     *held(&backend.core.halt) = Some(halt);
 }
 
-/// A Spending send. An exit is no send: nothing here resolves or follows
-/// one.
+/// A Spending send. An exit is no send: the send resolver never takes one
+/// up, and its queue rules leave exits alone.
 pub(super) fn is_send(kind: WatchKind) -> bool {
     matches!(kind, WatchKind::LnSend | WatchKind::Withdraw)
+}
+
+/// Money leaving Spending under an intent: a send or an exit. Followed by
+/// its operation once that is known.
+pub(super) fn is_outgoing(kind: WatchKind) -> bool {
+    matches!(
+        kind,
+        WatchKind::LnSend | WatchKind::Withdraw | WatchKind::Exit
+    )
 }
 
 /// What an outgoing watch reports as.
@@ -350,7 +359,7 @@ impl Core {
         drop(reservation);
     }
 
-    fn follow_operation(&self, watch: &Watch, operation: &str) -> Result<()> {
+    pub(super) fn follow_operation(&self, watch: &Watch, operation: &str) -> Result<()> {
         self.store().set_operation(&watch.id, operation)?;
         self.start_watching(watch.clone());
         Ok(())
@@ -368,7 +377,7 @@ impl Core {
         self.finish_row(watch, |row| HistoryItem { status, ..row }, state)
     }
 
-    fn finish_row(
+    pub(super) fn finish_row(
         &self,
         watch: &Watch,
         finished: impl FnOnce(HistoryItem) -> HistoryItem,
@@ -428,14 +437,10 @@ impl Core {
         self.finish_send(watch, status, state)
     }
 
-    /// What to ask the client to follow for `watch`: for a send its operation,
-    /// and `None` while it has none.
+    /// What to ask the client to follow for `watch`: for a send or an exit
+    /// its operation, and `None` while it has none.
     pub(super) fn followed(&self, watch: &Watch) -> Option<Watch> {
-        // An exit is no send, and is never followed as one.
-        if watch.kind == WatchKind::Exit {
-            return None;
-        }
-        if !is_send(watch.kind) {
+        if !is_outgoing(watch.kind) {
             return Some(watch.clone());
         }
         let operation = self.store().operation_of(&watch.id);
@@ -456,11 +461,21 @@ impl Core {
         for watch in self.unsent(federation) {
             self.finish_send(&watch, HistoryStatus::Failed, failed_with(LOST_RECORD))?;
         }
-        Ok(())
+        self.finish_lost_exits(federation)
     }
 
     /// The sends of `federation` with no operation that no call is working on.
     pub(super) fn unsent(&self, federation: &str) -> Vec<Watch> {
+        self.unsent_where(federation, is_send)
+    }
+
+    /// The watches of `federation` of a kind `wanted` takes, with no operation,
+    /// that no call is working on.
+    pub(super) fn unsent_where(
+        &self,
+        federation: &str,
+        wanted: fn(WatchKind) -> bool,
+    ) -> Vec<Watch> {
         let sends = match self.store().sends() {
             Ok(sends) => sends,
             Err(e) => {
@@ -473,7 +488,7 @@ impl Core {
             .into_iter()
             .filter(|(watch, operation)| {
                 operation.is_none()
-                    && is_send(watch.kind)
+                    && wanted(watch.kind)
                     && watch.federation_id == federation
                     && !submitting.contains_key(&watch.id)
             })

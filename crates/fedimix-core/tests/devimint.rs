@@ -2446,3 +2446,141 @@ async fn another_wallets_deposit_raises_the_estimate() {
     client.shutdown().await.unwrap();
     backend.shutdown().await.unwrap();
 }
+
+// Exits to Saving.
+
+/// 0.01 BTC, one denomination.
+const EXIT_DENOMINATION: Amount = Amount {
+    msat: 1_000_000_000,
+};
+
+/// Waits, mining a block a second and syncing Saving, until `check` holds.
+async fn mine_until_saving(
+    backend: &RealBackend,
+    check: impl Fn(&fedimix_core::SavingState) -> bool,
+) -> fedimix_core::SavingState {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            sync_saving_now(backend);
+            let state = backend.saving_state().await.unwrap();
+            if check(&state) {
+                return state;
+            }
+            mine(1);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("Saving reaches the state")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn exit_now_lands_in_saving_labelled() {
+    let wallet = SavingWallet::new();
+    let backend = wallet
+        .ready_with(esplora(), fedimix_core::SOFTWARE_DEVICE_ID)
+        .await;
+    backend
+        .set_settings(Settings {
+            chain_backend: esplora(),
+            online_grace_secs: 0,
+            ..Settings::for_network(Network::Regtest)
+        })
+        .await
+        .unwrap();
+    // The first scan, so Saving can take an exit.
+    saving_address(&backend).await;
+
+    // 0.06 BTC and a margin for the deposit fee: one 0.01 BTC item above the
+    // 0.05 BTC target, and less than 0.001 BTC left over.
+    let events = backend.subscribe();
+    let deposit = address(&backend).await;
+    fund(&deposit.payload, 6_050_000);
+    mine_until_received(&backend, &events).await;
+    let before = wait_balance(&backend, |balance| balance >= Amount::from_sat(6_000_000)).await;
+    let item = tokio::time::timeout(PATIENCE, async {
+        loop {
+            let queue = backend.queue_state().await.unwrap();
+            if let [item] = queue.items.as_slice()
+                && item.denomination == EXIT_DENOMINATION
+            {
+                return item.id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("one 0.01 BTC item is queued");
+
+    let preview = backend.prepare_exit(item.clone()).await.unwrap();
+    assert!(preview.fee > Amount::ZERO);
+    let id = backend.exit_now(preview.id.clone()).await.unwrap();
+    let (state, history_id) = final_state(&events, &id).await;
+    assert_eq!(state, OperationState::Done);
+    assert_eq!(history_id, Some(id.clone()));
+    let row = final_row(&backend, &id).await;
+    assert_eq!(row.status, HistoryStatus::Complete);
+    assert_eq!(
+        row.kind,
+        HistoryKind::ToSaving {
+            denomination: EXIT_DENOMINATION
+        }
+    );
+    let txid = row
+        .txid
+        .clone()
+        .expect("a settled exit names its transaction");
+
+    let state = mine_until_saving(&backend, |state| {
+        state
+            .coins
+            .iter()
+            .any(|coin| coin.confirmed && coin.outpoint.starts_with(&txid))
+    })
+    .await;
+    let coin = state
+        .coins
+        .iter()
+        .find(|coin| coin.outpoint.starts_with(&txid))
+        .unwrap();
+    assert_eq!(coin.amount, EXIT_DENOMINATION, "exactly the denomination");
+    assert!(
+        matches!(coin.tag, PrivacyTag::EarlyExit { .. }),
+        "{:?}",
+        coin.tag
+    );
+    assert!(coin.source_federation.is_some());
+    let history = state
+        .history
+        .iter()
+        .find(|row| row.txid.as_deref() == Some(txid.as_str()))
+        .expect("Saving's row of the exit");
+    assert_eq!(
+        history.kind,
+        HistoryKind::FromSpending {
+            denomination: EXIT_DENOMINATION
+        }
+    );
+    tokio::time::timeout(PATIENCE, async {
+        while !backend.queue_state().await.unwrap().items.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the exit lands and leaves the queue");
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        Amount::ZERO
+    );
+
+    // Debited by the denomination plus at most the fee shown.
+    let shown = EXIT_DENOMINATION.checked_add(preview.fee).unwrap();
+    let after = wait_balance(&backend, |now| {
+        before.saturating_sub(now) >= EXIT_DENOMINATION
+    })
+    .await;
+    let spent = before.saturating_sub(after);
+    assert!(spent <= shown, "spent {spent:?}, shown {shown:?}");
+    backend.shutdown().await.unwrap();
+}

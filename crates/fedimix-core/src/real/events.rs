@@ -130,6 +130,7 @@ async fn close_client(core: &Core, id: &str) -> Result<()> {
         let live = state.live.entry(id.to_string()).or_default();
         live.notes.clear();
         live.sessions_seen = None;
+        live.online_since = None;
         (live.client.take(), std::mem::take(&mut live.online))
     };
     if was_online {
@@ -293,7 +294,11 @@ fn forward_online(core: &Core, id: &str, online: bool) {
     let was_online = {
         let mut state = core.state();
         let live = state.live.entry(id.to_string()).or_default();
-        std::mem::replace(&mut live.online, online)
+        let was_online = std::mem::replace(&mut live.online, online);
+        if was_online != online {
+            live.online_since = online.then(|| (core.clock)());
+        }
+        was_online
     };
     if was_online == online {
         return;

@@ -1224,10 +1224,6 @@ impl Store {
     /// withdrawing to its address, the address's label, the Spending row and
     /// the watch, in one write. Refused for an item not queued, or an address
     /// any exit was ever given.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exits are made from Phase 4 Task 6 on")
-    )]
     pub(crate) fn begin_exit(&self, start: &ExitStart) -> Result<()> {
         let tx = begin(&self.conn)?;
         let denomination: Option<(i64, String)> = tx
@@ -1282,10 +1278,6 @@ impl Store {
     }
 
     /// The item whose exit has the intent `intent`, while it has one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exits are made from Phase 4 Task 6 on")
-    )]
     pub(crate) fn exit_by_intent(&self, intent: &str) -> Result<Option<ExitItem>> {
         Ok(self
             .exits_where("intent = ?1", &[&intent])?
@@ -1294,10 +1286,6 @@ impl Store {
     }
 
     /// The federation signed the withdrawal as `txid`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exits are made from Phase 4 Task 6 on")
-    )]
     pub(crate) fn exit_settled(&self, item_id: &str, txid: &str) -> Result<()> {
         self.conn
             .execute(
@@ -1310,10 +1298,6 @@ impl Store {
 
     /// A failed exit goes back to the queue with its origin. Its address
     /// keeps its label in `exit_addresses`. Only a withdrawing item moves.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exits are made from Phase 4 Task 6 on")
-    )]
     pub(crate) fn requeue_exit(&self, item_id: &str) -> Result<()> {
         self.conn
             .execute(
@@ -1329,10 +1313,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "exits are made from Phase 4 Task 6 on")
-    )]
     pub(crate) fn exit_landed(&self, item_id: &str) -> Result<()> {
         self.conn
             .execute(

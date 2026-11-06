@@ -13,7 +13,7 @@ use crate::api::*;
 use crate::error::Result;
 use crate::event::Event;
 use crate::scheduler::{self, Booked, Origin};
-use crate::store::{ExitItem, ExitState, Store};
+use crate::store::{ExitItem, ExitState, Store, WatchKind};
 
 /// How many sessions must pass on a connection before their length counts
 /// as measured.
@@ -201,9 +201,58 @@ impl Core {
         Ok(unresolved)
     }
 
+    /// What `federation`'s exits with no operation, which no call is
+    /// submitting, may still take: a crash between an exit's start and its
+    /// submission leaves such an exit, whose money the balance may still
+    /// hold until the resolver settles it. The queue must not grow onto it.
+    fn unresolved_exits(&self, store: &Store, federation: &str) -> Result<Amount> {
+        let submitting = self.submitting.borrow();
+        let mut taking = Amount::ZERO;
+        for (watch, operation) in store.sends()? {
+            if watch.kind != WatchKind::Exit
+                || watch.federation_id != federation
+                || operation.is_some()
+                || submitting.contains_key(&watch.id)
+            {
+                continue;
+            }
+            if let Some(item) = store.exit_by_intent(&watch.id)? {
+                let fee = item.fee.unwrap_or(Amount::ZERO);
+                taking = sum([taking, item.denomination, fee]);
+            }
+        }
+        Ok(taking)
+    }
+
+    /// The queued items of `federation` other than `item`, read with the
+    /// store held: what an exit of `item` must leave in the balance.
+    pub(super) fn queued_beside(
+        &self,
+        store: &Store,
+        federation: &str,
+        item: &str,
+    ) -> Result<Amount> {
+        let items = store.exit_items(Some(federation))?;
+        Ok(sum(items
+            .iter()
+            .filter(|other| other.state == ExitState::Queued && other.id != item)
+            .map(|other| other.denomination)))
+    }
+
+    /// What of `balance` is for spending: neither queued nor taken by a
+    /// submission. An exit's fee comes from it.
+    pub(super) fn exit_fee_room(&self, federation: &str, balance: Amount) -> Result<Amount> {
+        let store = self.store();
+        let queued = queued_sum(&store.exit_items(Some(federation))?);
+        Ok(balance
+            .saturating_sub(self.reserved(&store, federation))
+            .saturating_sub(queued))
+    }
+
     /// Books the whole denominations above the target of `federation`'s
     /// stored balance, and keeps the queue within that balance. Money a
-    /// submission is about to take is not booked. While a send is unfinished
+    /// submission is about to take is not booked, nor what an exit cut off
+    /// before its submission may still take. While a send is unfinished
     /// the queue keeps to what it leaves above the target, so a send whose fit
     /// was cut off still takes its money from the queue. New items start where
     /// the latest deposit came in, else at `session_count` and now. Everything
@@ -231,7 +280,10 @@ impl Core {
         if queued > cap {
             return fit_in(&store, federation, cap, now);
         }
-        let grown = scheduler::grow(queued, balance.saturating_sub(reserved), target);
+        let free = balance
+            .saturating_sub(reserved)
+            .saturating_sub(self.unresolved_exits(&store, federation)?);
+        let grown = scheduler::grow(queued, free, target);
         if grown.is_empty() {
             return Ok(false);
         }

@@ -436,12 +436,15 @@ impl Core {
         Ok(())
     }
 
-    /// 10 s while an operation runs or money is on its way in.
+    /// 10 s while an operation runs or money is on its way in, exits included.
     fn sync_interval(&self, wallet: &SavingWallet) -> Duration {
         let operating = self
             .running_sends()
             .is_ok_and(|running| !running.is_empty());
-        if operating || wallet.in_flight() > Amount::ZERO {
+        let exiting = self
+            .exits_in_flight()
+            .is_ok_and(|exiting| exiting > Amount::ZERO);
+        if operating || exiting || wallet.in_flight() > Amount::ZERO {
             ACTIVE_SYNC_INTERVAL
         } else {
             SYNC_INTERVAL
@@ -524,6 +527,11 @@ pub(super) async fn supervise_saving(core: Arc<Core>, wallet: Arc<SavingWallet>)
                         _ = target.changed() => continue 'connect,
                         tended = core.tend_signed(&wallet, &*chain) => tended,
                     };
+                    // Labels are read by address, so a coin that came in
+                    // during this sync is labelled already; it may land an exit.
+                    if let Err(e) = core.land_exits(&wallet) {
+                        eprintln!("fedimix: landing exits in Saving: {e}");
+                    }
                     core.note_chain(true, None, summary.changed || tended);
                 }
                 Err(e) => {

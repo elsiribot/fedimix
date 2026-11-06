@@ -7,6 +7,7 @@
 
 mod anonymity;
 mod events;
+mod exit;
 mod queue;
 mod receive;
 mod refill;
@@ -49,7 +50,6 @@ use crate::store::{FederationRow, SignedState, Store, Watch};
 
 const DB_FILE: &str = "fedimix.db";
 const SHUTTING_DOWN: &str = "Fedimix is shutting down.";
-const SAVING_NOT_SET_UP: &str = "Saving arrives in a later version.";
 const PROXY_SET: &str =
     "With a proxy set, Fedimix stays offline. Clear the proxy in Settings to connect.";
 const SATS_SUPPLY: u64 = 2_100_000_000_000_000;
@@ -99,6 +99,9 @@ struct Live {
     recovering: bool,
     /// The session counts read on this connection, which time a session.
     sessions_seen: Option<queue::SessionsSeen>,
+    /// When the federation last came online, while it stays online: the
+    /// grace period runs from here.
+    online_since: Option<Timestamp>,
 }
 
 /// A preview is consumed under this lock, so it pays at most once.
@@ -107,6 +110,7 @@ struct State {
     live: HashMap<String, Live>,
     previews: HashMap<String, HeldSend>,
     saving_previews: HashMap<String, HeldSaving>,
+    exit_previews: HashMap<String, exit::HeldExit>,
 }
 
 enum Reached {
@@ -139,10 +143,6 @@ fn problem_of(error: &FedimixError) -> Option<String> {
         }
         other => Some(other.to_string()),
     }
-}
-
-fn saving_not_set_up() -> FedimixError {
-    FedimixError::NotSetUp(SAVING_NOT_SET_UP.into())
 }
 
 /// The ranges the Settings page offers.
@@ -722,18 +722,19 @@ impl Backend for RealBackend {
         self.core.confirm_refill(&preview_id)
     }
 
-    async fn prepare_exit(&self, _item_id: String) -> Result<ExitPreview> {
-        Err(saving_not_set_up())
+    async fn prepare_exit(&self, item_id: String) -> Result<ExitPreview> {
+        self.core.prepare_exit(&item_id).await
     }
 
-    async fn exit_now(&self, _preview_id: String) -> Result<OperationId> {
-        Err(saving_not_set_up())
+    async fn exit_now(&self, preview_id: String) -> Result<OperationId> {
+        self.core.exit_now(&preview_id).await
     }
 
     async fn discard_preview(&self, preview_id: String) -> Result<()> {
         let mut state = self.core.state();
         state.previews.remove(&preview_id);
         state.saving_previews.remove(&preview_id);
+        state.exit_previews.remove(&preview_id);
         Ok(())
     }
 

@@ -130,6 +130,9 @@ pub struct FakeClient {
     /// While set, `pay_invoice` hangs before it submits anything.
     pay_held: watch::Sender<bool>,
     pay_calls: AtomicU32,
+    /// While set, `withdraw` hangs before it submits anything.
+    withdraw_held: watch::Sender<bool>,
+    withdraw_calls: AtomicU32,
 }
 
 impl FakeClient {
@@ -175,6 +178,8 @@ impl FakeClient {
             invoice_calls: AtomicU32::new(0),
             pay_held: watch::Sender::new(false),
             pay_calls: AtomicU32::new(0),
+            withdraw_held: watch::Sender::new(false),
+            withdraw_calls: AtomicU32::new(0),
         })
     }
 
@@ -288,6 +293,14 @@ impl FakeClient {
     }
 
     /// Calls of `pay_invoice`, also those still hanging.
+    pub fn set_withdraw_held(&self, held: bool) {
+        self.withdraw_held.send_replace(held);
+    }
+
+    pub fn withdraw_calls(&self) -> u32 {
+        self.withdraw_calls.load(Ordering::SeqCst)
+    }
+
     pub fn pay_calls(&self) -> u32 {
         self.pay_calls.load(Ordering::SeqCst)
     }
@@ -530,6 +543,9 @@ impl FederationClient for FakeClient {
     }
 
     async fn withdraw(&self, quote: &WithdrawQuote, intent: &str) -> Result<String> {
+        self.withdraw_calls.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.withdraw_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         Self::take_error(&self.withdraw_errors)?;
         self.debit(quote.amount, quote.fee)?;
         self.withdrawn.lock().unwrap().push(quote.clone());

@@ -568,6 +568,15 @@ impl SavingWallet {
         Ok(address.address.to_string())
     }
 
+    /// The address [`Self::next_receive_address`] would hand out next, without
+    /// handing it out: for a quote, which must use up no address.
+    pub fn peek_receive_address(&self) -> Result<String> {
+        let inner = self.lock();
+        let index = inner.wallet.next_derivation_index(KeychainKind::External);
+        let address = inner.wallet.peek_address(KeychainKind::External, index);
+        Ok(address.address.to_string())
+    }
+
     /// What a send may pick from: [`Self::spendable_coins`] less what a stored
     /// transaction has signed away.
     pub(crate) fn usable_coins(&self, labels: &Labels, locked: &HashSet<OutPoint>) -> Vec<Coin> {

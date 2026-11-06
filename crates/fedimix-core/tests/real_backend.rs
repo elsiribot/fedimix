@@ -487,9 +487,6 @@ async fn events_fire_on_balance_and_online_changes() {
 async fn saving_methods_report_not_set_up() {
     let harness = Harness::new();
     let backend = harness.open().await.unwrap();
-    let not_set_up = Err::<(), _>(FedimixError::NotSetUp(
-        "Saving arrives in a later version.".into(),
-    ));
     assert_eq!(
         backend.setup_saving("device".into()).await,
         Err(FedimixError::DeviceNotConnected("hardware wallet".into()))
@@ -508,9 +505,12 @@ async fn saving_methods_report_not_set_up() {
     );
     assert_eq!(
         backend.prepare_exit("i".into()).await.map(|_| ()),
-        not_set_up
+        Err(FedimixError::UnknownItem("i".into()))
     );
-    assert_eq!(backend.exit_now("p".into()).await.map(|_| ()), not_set_up);
+    assert_eq!(
+        backend.exit_now("p".into()).await.map(|_| ()),
+        Err(FedimixError::UnknownItem("p".into()))
+    );
     // No device, but the software wallet is always there.
     let found = backend.detect_devices().await.unwrap().devices;
     let kinds: Vec<_> = found.iter().map(|d| d.kind).collect();
@@ -8176,6 +8176,614 @@ async fn a_send_cut_off_before_its_fit_shrinks_the_queue_after_restart() {
             mbtc(2),
         ],
     )
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+// Exits to Saving.
+
+const EXIT_FEE: Amount = Amount { msat: 2_000_000 };
+const EXIT_NEVER_SENT: &str = "This exit was never sent, so no money left Spending.";
+const EXIT_REFUSED: &str = "The federation refused the withdrawal.";
+
+/// The chain server set and no grace period, so an exit can go at once.
+fn exit_settings() -> Settings {
+    Settings {
+        online_grace_secs: 0,
+        ..chain_settings(CHAIN_URL)
+    }
+}
+
+fn exit_txid(n: u8) -> String {
+    format!("{n:02x}").repeat(32)
+}
+
+fn exit_settled(txid: &str) -> WatchUpdate {
+    WatchUpdate::Settled {
+        amount: mbtc(10),
+        fee: EXIT_FEE,
+        txid: Some(txid.to_string()),
+    }
+}
+
+impl SavingHarness {
+    /// Saving on "This computer", joined, with `balance` in Spending at the
+    /// default target and no grace period, once the queue reads `queue`.
+    async fn exiting(&self, balance: Amount, queue: &[Amount]) -> Real {
+        self.harness.first.set_balance(balance);
+        self.harness.first.set_withdraw_fee(EXIT_FEE);
+        let backend = self.joined_with(SOFTWARE).await;
+        backend.set_settings(exit_settings()).await.unwrap();
+        wait_queue(&*backend, queue).await;
+        backend
+    }
+
+    /// Shut down and opened again on the same folder, not yet online.
+    async fn reopened(&self, backend: Real) -> Real {
+        backend.shutdown().await.unwrap();
+        drop(backend);
+        self.open().await.unwrap()
+    }
+}
+
+/// The id of the first queued item of `denomination`.
+async fn item_of(backend: &dyn Backend, denomination: Amount) -> String {
+    let queue = backend.queue_state().await.unwrap();
+    let item = queue
+        .items
+        .into_iter()
+        .find(|item| item.denomination == denomination);
+    item.expect("an item of that denomination").id
+}
+
+async fn status_of(backend: &dyn Backend, item: &str) -> Option<fedimix_core::QueueItemStatus> {
+    let queue = backend.queue_state().await.unwrap();
+    queue
+        .items
+        .into_iter()
+        .find(|shown| shown.id == item)
+        .map(|shown| shown.status)
+}
+
+/// Every address an exit of `item` was ever given, oldest first.
+fn exit_addresses_of(harness: &Harness, item: &str) -> Vec<String> {
+    let conn = raw_store(harness);
+    let mut stmt = conn
+        .prepare("SELECT address FROM exit_addresses WHERE item_id = ?1 ORDER BY rowid")
+        .unwrap();
+    stmt.query_map([item], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|address| address.unwrap())
+        .collect()
+}
+
+/// Previews and confirms an exit of `item`: the preview, and the exit's id.
+async fn exit_item(backend: &Real, item: &str) -> (fedimix_core::ExitPreview, String) {
+    let preview = backend.prepare_exit(item.into()).await.unwrap();
+    let id = backend.exit_now(preview.id.clone()).await.unwrap();
+    (preview, id)
+}
+
+async fn wait_operation_on_disk(harness: &Harness, id: &str, operation: &str) {
+    wait_until("the operation id on disk", || async {
+        raw_store(harness)
+            .query_row("SELECT operation FROM watches WHERE id = ?1", [id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .unwrap()
+            .as_deref()
+            == Some(operation)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn exit_now_pays_a_fresh_saving_address() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let given = backend.receive(on_chain()).await.unwrap().payload;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let preview = backend.prepare_exit(item.clone()).await.unwrap();
+    assert_eq!(preview.item_id, item);
+    assert_eq!(preview.fee, EXIT_FEE);
+    assert_eq!(
+        saving.harness.first.withdraw_calls(),
+        0,
+        "a preview pays nothing"
+    );
+    // Handed out after the preview: the exit must not take it.
+    let after_preview = backend.receive(on_chain()).await.unwrap().payload;
+    let id = backend.exit_now(preview.id).await.unwrap();
+    wait_until("the withdrawal", || async {
+        saving.harness.first.withdrawn().len() == 1
+    })
+    .await;
+    let quote = saving.harness.first.withdrawn().remove(0);
+    assert_eq!(quote.amount, mbtc(10), "exactly the denomination");
+    assert_eq!(quote.fee, EXIT_FEE);
+    assert_ne!(quote.address, given);
+    assert_ne!(quote.address, after_preview);
+    let next = backend.receive(on_chain()).await.unwrap().payload;
+    assert_ne!(
+        next, quote.address,
+        "the exit's address is never handed out"
+    );
+    assert_eq!(exit_addresses_of(&saving.harness, &item), [quote.address]);
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+    );
+    let row = row_of(&rows(&*backend).await, &id);
+    assert_eq!(
+        row.kind,
+        HistoryKind::ToSaving {
+            denomination: mbtc(10)
+        }
+    );
+    assert_eq!(row.amount, mbtc(10));
+    assert_eq!(row.fee, Some(EXIT_FEE));
+    assert!(!row.incoming);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_exit_reports_as_an_exit() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let events = backend.subscribe();
+    let (_, id) = exit_item(&backend, &item).await;
+    wait_event(
+        &events,
+        &Event::Operation {
+            id: id.clone(),
+            kind: OperationKind::Exit,
+            state: OperationState::Broadcasting,
+            history_id: None,
+        },
+    )
+    .await;
+    let op = operation_of(&saving.harness.first, &id).await;
+    wait_operation_on_disk(&saving.harness, &id, &op).await;
+    let running = vec![RunningOperation {
+        id: id.clone(),
+        kind: OperationKind::Exit,
+        state: OperationState::Broadcasting,
+    }];
+    assert_eq!(backend.operations().await.unwrap(), running);
+
+    let backend = saving.reopened(backend).await;
+    assert_eq!(backend.operations().await.unwrap(), running);
+    let events = backend.subscribe();
+    let txid = exit_txid(1);
+    saving.harness.first.push_update(&op, exit_settled(&txid));
+    let (states, history_id) = run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(states, [OperationState::Done]);
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, &id).txid, Some(txid.clone()));
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: Some(txid) }),
+        "on its way until it lands in Saving"
+    );
+    assert!(
+        !drain(&events)
+            .await
+            .iter()
+            .any(|event| matches!(event, Event::Notification(Notice::SendConfirmed { .. }))),
+        "an exit is no send"
+    );
+    assert!(backend.operations().await.unwrap().is_empty());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_now_shows_the_fee_and_ignores_the_fee_guard() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    // 5% of the denomination, above the 2% guard.
+    let fee = sat(50_000);
+    saving.harness.first.set_withdraw_fee(fee);
+    let item = item_of(&*backend, mbtc(10)).await;
+    let (preview, _) = exit_item(&backend, &item).await;
+    assert_eq!(preview.fee, fee);
+    wait_until("the withdrawal", || async {
+        saving.harness.first.withdrawn().len() == 1
+    })
+    .await;
+    assert_eq!(saving.harness.first.withdrawn()[0].fee, fee);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_now_is_refused_in_the_grace_period() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let preview = backend.prepare_exit(item.clone()).await.unwrap();
+    // The default grace period: the federation came online moments ago.
+    backend
+        .set_settings(chain_settings(CHAIN_URL))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.exit_now(preview.id).await,
+        Err(FedimixError::GracePeriod)
+    );
+    assert_eq!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::GracePeriod)
+    );
+    assert_eq!(saving.harness.first.withdraw_calls(), 0);
+    assert!(exit_addresses_of(&saving.harness, &item).is_empty());
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Queued)
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_now_is_refused_without_saving_or_federation() {
+    let saving = SavingHarness::new();
+    saving.harness.first.set_balance(mbtc(60));
+    let backend = saving.with_server().await;
+    backend.set_settings(exit_settings()).await.unwrap();
+    backend.join_federation(INVITE.into()).await.unwrap();
+    wait_queue(&*backend, &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    assert_eq!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::NotSetUp(SET_UP_FIRST.into()))
+    );
+    assert!(matches!(
+        backend.prepare_exit("no such item".into()).await,
+        Err(FedimixError::UnknownItem(_))
+    ));
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(SOFTWARE.into()).await.unwrap();
+    wait_chain(&*backend, true).await;
+    saving.harness.first.set_online(false);
+    wait_online(&*backend, false).await;
+    assert_eq!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::Offline)
+    );
+    saving.harness.first.set_online(true);
+    wait_online(&*backend, true).await;
+    // For spending is 0.05 BTC: a fee above it cannot be paid.
+    saving.harness.first.set_withdraw_fee(mbtc(51));
+    assert!(matches!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::InsufficientFunds { .. })
+    ));
+    saving.harness.first.set_withdraw_fee(EXIT_FEE);
+    exit_item(&backend, &item).await;
+    // Withdrawing is no longer an item that can exit.
+    assert!(matches!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::UnknownItem(_))
+    ));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_now_never_charges_more_than_shown() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let preview = backend.prepare_exit(item.clone()).await.unwrap();
+    saving.harness.first.set_withdraw_fee(sat(2_001));
+    assert_eq!(
+        backend.exit_now(preview.id).await,
+        Err(FedimixError::PreviewExpired)
+    );
+    assert_eq!(saving.harness.first.withdraw_calls(), 0);
+    assert!(exit_addresses_of(&saving.harness, &item).is_empty());
+    assert!(
+        !rows(&*backend)
+            .await
+            .iter()
+            .any(|row| matches!(row.kind, HistoryKind::ToSaving { .. })),
+        "no row for an exit that never started"
+    );
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Queued)
+    );
+
+    let preview = backend.prepare_exit(item.clone()).await.unwrap();
+    assert_eq!(preview.fee, sat(2_001));
+    saving.harness.first.set_withdraw_fee(sat(1_000));
+    let id = backend.exit_now(preview.id).await.unwrap();
+    wait_until("the withdrawal", || async {
+        saving.harness.first.withdrawn().len() == 1
+    })
+    .await;
+    assert_eq!(saving.harness.first.withdrawn()[0].fee, sat(1_000));
+    assert_eq!(row_of(&rows(&*backend).await, &id).fee, Some(sat(1_000)));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_exit_lands_labelled_as_early() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    // Someone else's deposit after the item's origin. Written to the store,
+    // as this harness syncs sessions at the default pace.
+    let origin = origins(&saving.harness)[0].1;
+    raw_store(&saving.harness)
+        .execute(
+            "INSERT INTO anon_deposits
+                (federation_id, session, position, source, amount_msat, reference)
+             VALUES (?1, ?2, 0, 'on_chain', 2000000000, ?3)",
+            rusqlite::params![FIRST_FEDERATION, origin as i64 + 1, outpoint(1)],
+        )
+        .unwrap();
+    let estimate = item_estimate(&backend, FIRST_FEDERATION, origin, mbtc(10)).unwrap();
+    assert_eq!(estimate, 1);
+
+    let events = backend.subscribe();
+    let (_, id) = exit_item(&backend, &item).await;
+    let op = operation_of(&saving.harness.first, &id).await;
+    let address = saving.harness.first.withdrawn()[0].address.clone();
+    let tx = payment(&address, 1_000_000, 5);
+    let txid = tx.compute_txid().to_string();
+    saving.harness.first.push_update(&op, exit_settled(&txid));
+    run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        mbtc(10),
+        "on its way until it confirms"
+    );
+
+    saving.chain.push_sync(confirmed(tx, 2));
+    sync_saving_now(&backend);
+    wait_event(
+        &events,
+        &Event::Notification(Notice::ExitLanded { amount: mbtc(10) }),
+    )
+    .await;
+    let state = backend.saving_state().await.unwrap();
+    let coin = state.coins.iter().find(|c| c.address == address).unwrap();
+    assert_eq!(coin.tag, PrivacyTag::EarlyExit { estimate });
+    let name = backend.federations().await.unwrap().remove(0).name;
+    assert_eq!(coin.source_federation, Some(name));
+    assert_eq!(state.in_flight, Amount::ZERO);
+    let row = state
+        .history
+        .iter()
+        .find(|row| row.txid.as_deref() == Some(txid.as_str()))
+        .unwrap();
+    assert_eq!(
+        row.kind,
+        HistoryKind::FromSpending {
+            denomination: mbtc(10)
+        }
+    );
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        None,
+        "landed items leave"
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_exit_requeues_and_never_reuses_its_address() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let client = &saving.harness.first;
+    let queued = Some(fedimix_core::QueueItemStatus::Queued);
+
+    // Refused at submission.
+    client.fail_next_withdraw(FedimixError::Internal(EXIT_REFUSED.into()));
+    let events = backend.subscribe();
+    let (_, first) = exit_item(&backend, &item).await;
+    let (states, _) = run_of_kind(&events, &first, OperationKind::Exit).await;
+    assert_eq!(states.last(), Some(&failed_with(EXIT_REFUSED)));
+    wait_status(&*backend, &first, HistoryStatus::Failed).await;
+    assert_eq!(status_of(&*backend, &item).await, queued);
+
+    // Failed once submitted.
+    let (_, second) = exit_item(&backend, &item).await;
+    let op = operation_of(client, &second).await;
+    client.push_update(
+        &op,
+        WatchUpdate::Failed {
+            reason: EXIT_REFUSED.into(),
+        },
+    );
+    let (states, _) = run_of_kind(&events, &second, OperationKind::Exit).await;
+    assert_eq!(states.last(), Some(&failed_with(EXIT_REFUSED)));
+    wait_status(&*backend, &second, HistoryStatus::Failed).await;
+    assert_eq!(status_of(&*backend, &item).await, queued);
+
+    exit_item(&backend, &item).await;
+    wait_until("the third withdrawal", || async {
+        client.withdrawn().len() == 2
+    })
+    .await;
+    let addresses = exit_addresses_of(&saving.harness, &item);
+    assert_eq!(
+        addresses.len(),
+        3,
+        "each try kept its address: {addresses:?}"
+    );
+    let distinct: std::collections::HashSet<_> = addresses.iter().collect();
+    assert_eq!(distinct.len(), 3, "{addresses:?}");
+    let paid: Vec<_> = client.withdrawn().into_iter().map(|q| q.address).collect();
+    assert_eq!(paid, addresses[1..]);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn killed_before_submit_requeues_with_a_new_address() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    halt_sends(&backend, SendHalt::BeforeSubmit);
+    let (_, id) = exit_item(&backend, &item).await;
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+    );
+    let first = exit_addresses_of(&saving.harness, &item);
+    assert_eq!(first.len(), 1);
+
+    let backend = saving.reopened(backend).await;
+    let events = backend.subscribe();
+    let (states, history_id) = run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(states, [failed_with(EXIT_NEVER_SENT)]);
+    assert_eq!(history_id, Some(id.clone()));
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Queued)
+    );
+    assert_eq!(
+        saving.harness.first.withdraw_calls(),
+        0,
+        "nothing exits by itself"
+    );
+
+    exit_item(&backend, &item).await;
+    wait_until("the withdrawal", || async {
+        saving.harness.first.withdrawn().len() == 1
+    })
+    .await;
+    let address = saving.harness.first.withdrawn()[0].address.clone();
+    assert_ne!(address, first[0]);
+    assert_eq!(
+        exit_addresses_of(&saving.harness, &item),
+        [first[0].clone(), address]
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn killed_after_submit_resumes_the_exit() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    halt_sends(&backend, SendHalt::AfterSubmit);
+    let (_, id) = exit_item(&backend, &item).await;
+    let op = operation_of(&saving.harness.first, &id).await;
+
+    let backend = saving.reopened(backend).await;
+    let events = backend.subscribe();
+    let txid = exit_txid(2);
+    saving.harness.first.push_update(&op, exit_settled(&txid));
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(states, [OperationState::Done]);
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(
+        saving.harness.first.withdrawn().len(),
+        1,
+        "exactly one withdrawal"
+    );
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: Some(txid) })
+    );
+    assert_eq!(exit_addresses_of(&saving.harness, &item).len(), 1);
+    backend.shutdown().await.unwrap();
+}
+
+/// Review Focus 1: a send confirmed while an exit of the same federation is
+/// being submitted cannot take the exit's money, and its fit leaves the exit.
+#[tokio::test]
+async fn a_send_and_an_exit_never_overdraw() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(80), &[mbtc(20), mbtc(10)]).await;
+    let client = &saving.harness.first;
+    client.add_invoice(INVOICE, mbtc(20));
+    let exiting = item_of(&*backend, mbtc(10)).await;
+    client.set_withdraw_held(true);
+    let (_, exit) = exit_item(&backend, &exiting).await;
+    wait_until("the exit's submission", || async {
+        client.withdraw_calls() == 1
+    })
+    .await;
+
+    let whole = backend
+        .prepare_send(to(ADDRESS, SendAmount::Max))
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend.confirm_send(whole.id).await,
+        Err(FedimixError::InsufficientFunds { .. })
+    ));
+
+    let pay = backend.prepare_send(pay_request()).await.unwrap();
+    backend.confirm_send(pay.id).await.unwrap();
+    wait_until("the fit", || async {
+        queue_ids(&*backend).await == [exiting.clone()]
+    })
+    .await;
+    assert_eq!(
+        status_of(&*backend, &exiting).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+    );
+
+    client.set_withdraw_held(false);
+    operation_of(client, &exit).await;
+    assert_eq!(client.withdrawn().len(), 1);
+    assert_eq!(client.paid(), [INVOICE]);
+    let left = mbtc(80)
+        .checked_sub(mbtc(30))
+        .and_then(|left| left.checked_sub(EXIT_FEE))
+        .and_then(|left| left.checked_sub(sat(10)))
+        .unwrap();
+    wait_balance(&*backend, left).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// Review Focus 4: a coin that arrives while a sync hangs is labelled once
+/// the sync ends, as labels are read by address.
+#[tokio::test]
+async fn a_coin_landing_during_a_scan_is_labelled_after_it() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let events = backend.subscribe();
+    let (_, id) = exit_item(&backend, &item).await;
+    let op = operation_of(&saving.harness.first, &id).await;
+    let address = saving.harness.first.withdrawn()[0].address.clone();
+    let tx = payment(&address, 1_000_000, 6);
+    saving
+        .harness
+        .first
+        .push_update(&op, exit_settled(&tx.compute_txid().to_string()));
+    run_of_kind(&events, &id, OperationKind::Exit).await;
+
+    saving.chain.set_stalled(true);
+    saving.chain.push_sync(confirmed(tx, 2));
+    sync_saving_now(&backend);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        matches!(
+            status_of(&*backend, &item).await,
+            Some(fedimix_core::QueueItemStatus::Withdrawing { .. })
+        ),
+        "not landed while the sync hangs"
+    );
+    saving.chain.set_stalled(false);
+    wait_until("the labelled coin", || async {
+        sync_saving_now(&backend);
+        let state = backend.saving_state().await.unwrap();
+        state
+            .coins
+            .iter()
+            .any(|c| c.address == address && matches!(c.tag, PrivacyTag::EarlyExit { .. }))
+    })
+    .await;
+    wait_until("the landing", || async {
+        status_of(&*backend, &item).await.is_none()
+    })
     .await;
     backend.shutdown().await.unwrap();
 }
