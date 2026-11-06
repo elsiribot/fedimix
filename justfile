@@ -41,6 +41,10 @@ demo-live *args:
 record-demo:
     scripts/record-demo.sh
 
+# Record the Phase 4 exits story on the demo backend (simulated) to ~/fedimix-demo/phase4 (video and screenshots)
+record-exits-demo:
+    scripts/record-exits-demo.sh
+
 # Build the release package and run the flake checks (clippy, fmt, tests)
 build-nix:
     nix build

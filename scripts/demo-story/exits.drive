@@ -1,0 +1,53 @@
+# scripts/record-exits-demo.sh: the Phase 4 exits story on the DEMO backend
+# (scenario exits, 12 s per exit stage), paced for a viewer. Same steps as
+# scripts/demo-flows/30-exits.drive, with waits so each screen can be read.
+# `shot NN-name` is a screenshot; `shot _rec` starts the recording.
+
+expect Spending
+shot _rec
+wait 1500
+shot 01-saving-before
+click Spending
+wait 1000
+shot 01b-spending-queue-link
+click 0.05 for spending · 0.28 moving to Saving ›
+expect scheduled
+wait 4500
+shot 02-queue
+expect-within 20 withdrawing
+wait 4500
+shot 03-withdrawing
+click Back
+click Saving
+expect +0.0100 BTC depositing
+wait 3500
+shot 04-saving-depositing
+expect-gone-within 35 depositing
+wait 3000
+click 1.2134 BTC
+expect anon set 73
+wait 5500
+shot 05-landed-privacy-tags
+click Back
+click Spending
+click 0.27 moving to Saving ›
+wait 5000
+shot 06-queue-after
+click Item actions
+wait 2500
+shot 07-exit-now-menu
+click Exit now (lower privacy)
+expect Withdrawal fee: 420 sat
+wait 4500
+shot 08-exit-now-confirm
+click Exit now
+expect-within 15 Moved to Saving
+wait 3500
+click Back
+click Saving
+wait 3000
+click 1.2334 BTC
+expect early exit
+wait 3000
+shot 09-early-exit-label
+wait 6000

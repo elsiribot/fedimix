@@ -84,7 +84,11 @@ join_segments() {
         [[ -s "$seg" ]] && echo "file '$seg'" >> "$list"
     done
     [[ -s "$list" ]] || die "no video segments were recorded"
-    ffmpeg -loglevel error -y -f concat -safe 0 -i "$list" \
+    # wf-recorder writes limited-range frames but tags them full range (yuvj420p):
+    # re-tag the stream, or the video comes out about 8% too dark.
+    ffmpeg -loglevel error -y -f concat -safe 0 -i "$list" -c:v copy \
+        -bsf:v h264_metadata=video_full_range_flag=0 "$demo_work/joined.mp4"
+    ffmpeg -loglevel error -y -i "$demo_work/joined.mp4" \
         -c:v libx264 -pix_fmt yuv420p -r 30 -movflags +faststart "$video"
     local secs
     secs=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video")
