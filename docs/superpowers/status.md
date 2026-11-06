@@ -15,7 +15,7 @@ Phase 3 (Saving) is complete. `fedimix` runs Spending and Saving on the real bac
 - Real pointer input, dark theme, accessibility, a real desktop (sway only).
 
 ## Next
-Phase 4 (scheduler and anonymity estimate): plan `docs/superpowers/plans/2026-10-30-fedimix-phase-4.md`. Task 1 spike: sessions decode on both generations. Task 2 done: pure `scheduler` and `anonymity` modules with unit tests; nothing calls them yet. Next: Tasks 3-11.
+Phase 4 (scheduler and anonymity estimate): plan `docs/superpowers/plans/2026-10-30-fedimix-phase-4.md`. Task 1 spike: sessions decode on both generations. Task 2 done: pure `scheduler` and `anonymity` modules with unit tests; nothing calls them yet. Task 3 done: schema 10 stores the exit queue, exit addresses and session deposits; Saving coins at an exit address are tagged by it and read "From Spending"; Lightning receives keep their session. Nothing writes the queue yet. Next: Tasks 4-11.
 Demo fixes done: Saving's refill (or send) row turns final when Spending credits its deposit, no restart needed; the header shows "Regtest" or "Signet" off mainnet.
 
 ## Needs user
