@@ -308,7 +308,8 @@ impl Core {
         };
         let target = store.settings()?.spending_target;
         let reserved = self.reserved(&store, federation);
-        let cap = match self.unresolved_sends(&store, federation)? {
+        let unresolved = self.unresolved_sends(&store, federation)?;
+        let cap = match unresolved {
             Some(unresolved) => balance.saturating_sub(unresolved).saturating_sub(target),
             None => balance,
         };
@@ -316,8 +317,11 @@ impl Core {
         if queued > cap {
             return fit_in(&store, federation, cap, now);
         }
+        // The same unresolved sends as the cap, or the growth would undo
+        // the fit on every tend.
         let free = balance
             .saturating_sub(reserved)
+            .saturating_sub(unresolved.unwrap_or(Amount::ZERO))
             .saturating_sub(self.unresolved_exits(&store, federation)?);
         let grown = scheduler::grow(queued, free, target);
         if grown.is_empty() {

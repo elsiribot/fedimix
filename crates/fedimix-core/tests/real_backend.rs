@@ -9487,3 +9487,52 @@ async fn exit_fee_quotes_never_show_a_saving_address() {
     );
     backend.shutdown().await.unwrap();
 }
+
+/// Final review I2: while a send has no operation, the queue's growth and
+/// its fit must agree, or each tend undoes the last and the app spins.
+#[tokio::test]
+async fn the_queue_settles_while_a_send_is_unresolved() {
+    let harness = Harness::new();
+    let backend = queued_470(&harness).await;
+    halt_sends(&backend, SendHalt::AfterRow);
+    let preview = backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(mbtc(30))))
+        .await
+        .unwrap();
+    backend.confirm_send(preview.id).await.unwrap();
+    // The lookup that would settle the intent fails, so it stays unresolved.
+    harness.first.fail_next_find(FedimixError::Offline);
+    let backend = restarted(&harness, backend).await;
+    let settled = [
+        mbtc(200),
+        mbtc(100),
+        mbtc(50),
+        mbtc(20),
+        mbtc(10),
+        mbtc(5),
+        mbtc(2),
+        mbtc(2),
+    ];
+    wait_queue(&*backend, &settled).await;
+    let ids = queue_ids(&*backend).await;
+
+    let events = backend.subscribe();
+    tick_scheduler(&backend).await.unwrap();
+    let mut changes = 0;
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(quiet, events.next()).await {
+        if event == Event::QueueChanged {
+            changes += 1;
+        }
+    }
+    assert!(
+        changes <= 2,
+        "{changes} queue changes with nothing changing"
+    );
+    assert_eq!(
+        queue_ids(&*backend).await,
+        ids,
+        "the same items, not new ones"
+    );
+    backend.shutdown().await.unwrap();
+}
