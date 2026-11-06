@@ -79,7 +79,7 @@ impl Core {
     }
 
     /// The first session synced and the next one to sync, once one was.
-    fn synced_range(&self, federation: &str) -> Result<Option<(u64, u64)>> {
+    pub(super) fn synced_range(&self, federation: &str) -> Result<Option<(u64, u64)>> {
         let store = self.store();
         let Some(cursor) = store.session_cursor(federation)? else {
             return Ok(None);
@@ -166,6 +166,7 @@ impl Core {
     async fn sync_sessions(&self, client: &dyn FederationClient, federation: &str) -> Result<()> {
         let next = self.next_session(client, federation).await?;
         let count = client.session_count().await?;
+        self.note_session_count(federation, count);
         if next >= count {
             return Ok(());
         }

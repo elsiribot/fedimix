@@ -18,8 +18,9 @@ shot settings-end
 # Regtest names no chain server, and Settings saves nothing until one is set.
 type-env "Server URL" FEDIMIX_CHAIN_URL
 apply Server URL
-# Above the target, what is left waits for a Saving that is not set up.
-type "Target (BTC)" 0.001
+# Above the target, whole thousandths wait for a Saving that is not set up:
+# 0.001 of 0.0019, which stays queued past the 0.0005 payment that follows.
+type "Target (BTC)" 0.0002
 wait 800
 click Back
 expect waiting for Saving

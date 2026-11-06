@@ -285,6 +285,7 @@ pub struct Coin {
 pub struct SavingState {
     pub device: Option<DeviceInfo>,
     pub balance: Amount,
+    /// Exits on their way from Spending, until their coin has a confirmation.
     pub in_flight: Amount,
     pub coins: Vec<Coin>,
     pub history: Vec<HistoryItem>,

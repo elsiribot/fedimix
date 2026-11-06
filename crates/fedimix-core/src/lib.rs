@@ -13,7 +13,6 @@ mod federation;
 pub mod handle;
 mod real;
 mod saving;
-#[expect(dead_code, reason = "the real backend uses it from Phase 4 Task 5 on")]
 mod scheduler;
 mod seed;
 mod store;

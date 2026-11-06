@@ -3,22 +3,18 @@
 
 use crate::api::*;
 
-/// `(for_spending, moving)`: the balance up to the target stays, the rest
-/// heads for Saving.
-fn split(balance: Amount, target: Amount) -> (Amount, Amount) {
-    (balance.min(target), balance.saturating_sub(target))
-}
-
+/// `moving` is what the queue holds; the rest of the balance is for spending.
 pub(super) fn spending_state(
     federation: Option<FederationInfo>,
     total_balance: Amount,
     target: Amount,
+    moving: Amount,
     saving_ready: bool,
     notes: Vec<NoteBucket>,
     history: Vec<HistoryItem>,
 ) -> SpendingState {
     let balance = federation.as_ref().map_or(Amount::ZERO, |f| f.balance);
-    let (for_spending, moving) = split(balance, target);
+    let for_spending = balance.saturating_sub(moving);
     SpendingState {
         federation,
         balance,
@@ -33,16 +29,5 @@ pub(super) fn spending_state(
             saving: true,
             ..Features::NONE
         },
-    }
-}
-
-/// Nothing queues until Saving exists; `moving` waits in Spending.
-pub(super) fn queue_state() -> QueueState {
-    QueueState {
-        total: Amount::ZERO,
-        anonymity_estimate: 0,
-        typical_exit_secs: 0,
-        waiting_for_saving: true,
-        items: Vec::new(),
     }
 }

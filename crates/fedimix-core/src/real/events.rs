@@ -129,6 +129,7 @@ async fn close_client(core: &Core, id: &str) -> Result<()> {
         let mut state = core.state();
         let live = state.live.entry(id.to_string()).or_default();
         live.notes.clear();
+        live.sessions_seen = None;
         (live.client.take(), std::mem::take(&mut live.online))
     };
     if was_online {
@@ -243,6 +244,9 @@ async fn forward_balance(
             false
         }
     };
+    if tend_queue(core, client.as_ref(), id, balance).await {
+        core.events.emit(&Event::QueueChanged);
+    }
     if !changed && !notes_changed {
         return;
     }
@@ -254,6 +258,26 @@ async fn forward_balance(
     } else {
         Event::FederationChanged
     });
+}
+
+/// Fits the queue to a new balance, with the session count read once: new
+/// items start there if no deposit names its session. When the count cannot
+/// be read, the last one known stands in for it.
+async fn tend_queue(core: &Core, client: &dyn FederationClient, id: &str, balance: Amount) -> bool {
+    let count = match client.session_count().await {
+        Ok(count) => Some(count),
+        Err(e) => {
+            eprintln!("fedimix: reading the session count of {id}: {e}");
+            core.known_session_count(id)
+        }
+    };
+    let Some(count) = count else {
+        return false;
+    };
+    core.tend_queue(id, balance, count).unwrap_or_else(|e| {
+        eprintln!("fedimix: queueing the money of federation {id} above the target: {e}");
+        false
+    })
 }
 
 fn forward_online(core: &Core, id: &str, online: bool) {

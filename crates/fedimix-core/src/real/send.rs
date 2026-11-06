@@ -50,8 +50,27 @@ pub fn halt_sends(backend: &super::RealBackend, halt: SendHalt) {
     *held(&backend.core.halt) = Some(halt);
 }
 
+/// A Spending send. An exit is no send: nothing here resolves or follows
+/// one.
 pub(super) fn is_send(kind: WatchKind) -> bool {
     matches!(kind, WatchKind::LnSend | WatchKind::Withdraw)
+}
+
+/// What an outgoing watch reports as.
+pub(super) fn operation_kind(kind: WatchKind) -> OperationKind {
+    match kind {
+        WatchKind::Exit => OperationKind::Exit,
+        _ => OperationKind::Send,
+    }
+}
+
+fn moving_note(shrink: Amount) -> Vec<String> {
+    if shrink == Amount::ZERO {
+        return Vec::new();
+    }
+    vec![format!(
+        "{shrink} of this comes from money moving to Saving."
+    )]
 }
 
 /// The whole quote: paying takes it back.
@@ -171,6 +190,7 @@ impl Core {
         if needed > available || quote.amount() == Amount::ZERO {
             return Err(insufficient(available, needed));
         }
+        let notes = moving_note(self.queue_shrink_for(&federation, needed, available)?);
         let preview = SendPreview {
             id: fresh_id("preview"),
             wallet: WalletKind::Spending,
@@ -180,7 +200,7 @@ impl Core {
             federation: Some(federation.clone()),
             inputs: Vec::new(),
             change: ChangeDestination::None,
-            notes: Vec::new(),
+            notes,
             expires_at: (self.clock)() + PREVIEW_TTL,
         };
         let held = HeldSend {
@@ -273,6 +293,10 @@ impl Core {
             created_at: now,
         };
         self.store().add_tracked(&item, &watch)?;
+        // O1: the send may take queued money, and the queue gives way.
+        if let Err(e) = self.fit_queue_after_send(&federation, available) {
+            eprintln!("fedimix: fitting the queue after send {intent}: {e}");
+        }
         self.announce(&federation, &item, &HistoryWrite::Added);
         self.report(&intent, OperationState::Broadcasting, None);
         // A task of its own: a caller that goes away must not cut a payment off.
@@ -352,7 +376,7 @@ impl Core {
             self.record(federation, &finished(row))?;
         }
         self.store().finish_watch(&watch.id)?;
-        self.report(&watch.id, state, history_id);
+        self.report_as(&watch.id, operation_kind(watch.kind), state, history_id);
         Ok(())
     }
 
@@ -400,6 +424,10 @@ impl Core {
     /// What to ask the client to follow for `watch`: for a send its operation,
     /// and `None` while it has none.
     pub(super) fn followed(&self, watch: &Watch) -> Option<Watch> {
+        // An exit is no send, and is never followed as one.
+        if watch.kind == WatchKind::Exit {
+            return None;
+        }
         if !is_send(watch.kind) {
             return Some(watch.clone());
         }
@@ -438,6 +466,7 @@ impl Core {
             .into_iter()
             .filter(|(watch, operation)| {
                 operation.is_none()
+                    && is_send(watch.kind)
                     && watch.federation_id == federation
                     && !submitting.contains_key(&watch.id)
             })
@@ -450,8 +479,8 @@ impl Core {
         let mut running: Vec<_> = sends
             .into_iter()
             .map(|(watch, _)| RunningOperation {
+                kind: operation_kind(watch.kind),
                 id: watch.id,
-                kind: OperationKind::Send,
                 state: OperationState::Broadcasting,
             })
             .collect();

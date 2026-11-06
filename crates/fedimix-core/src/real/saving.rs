@@ -190,7 +190,7 @@ impl Core {
         let mut state = SavingState {
             device,
             balance: Amount::ZERO,
-            in_flight: Amount::ZERO,
+            in_flight: self.exits_in_flight()?,
             coins: Vec::new(),
             history: Vec::new(),
             chain_online,
@@ -204,7 +204,6 @@ impl Core {
             state.held_back = held_back_of(&wallet, &labels, &self.locked_outpoints()?);
             let snapshot = wallet.snapshot(&labels);
             state.balance = snapshot.balance;
-            state.in_flight = snapshot.in_flight;
             state.coins = snapshot.coins;
             self.name_sources(&mut state.coins)?;
             state.history = snapshot.history;

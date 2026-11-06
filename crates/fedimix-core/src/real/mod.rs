@@ -7,6 +7,7 @@
 
 mod anonymity;
 mod events;
+mod queue;
 mod receive;
 mod refill;
 mod saving;
@@ -96,6 +97,8 @@ struct Live {
     new_watches: Option<mpsc::UnboundedSender<Watch>>,
     /// The client's data is being rebuilt from the federation.
     recovering: bool,
+    /// The session counts read on this connection, which time a session.
+    sessions_seen: Option<queue::SessionsSeen>,
 }
 
 /// A preview is consumed under this lock, so it pays at most once.
@@ -387,7 +390,8 @@ impl Core {
         self.ensure_running()?;
         // Under the store's lock, so the gate ends up matching the last write.
         let store = self.store();
-        let shown = store.settings()?.recovery_words_shown;
+        let before = store.settings()?;
+        let shown = before.recovery_words_shown;
         store.set_settings(&Settings {
             recovery_words_shown: settings.recovery_words_shown || shown,
             ..settings.clone()
@@ -409,8 +413,20 @@ impl Core {
             *gate = next;
             changed
         });
+        // The settings are written: a failure here only waits for the next
+        // change to the queue.
+        let target = settings.spending_target;
+        let fitted = target > before.spending_target
+            && self.fit_queues_to(&store, target).unwrap_or_else(|e| {
+                eprintln!("fedimix: fitting the queue to the new target: {e}");
+                false
+            });
         drop(store);
+        let grown = target < before.spending_target && self.tend_queues();
         self.events.emit(&Event::SettingsChanged);
+        if fitted || grown {
+            self.events.emit(&Event::QueueChanged);
+        }
         Ok(())
     }
 
@@ -617,6 +633,7 @@ impl Backend for RealBackend {
                 None,
                 total_balance,
                 target,
+                Amount::ZERO,
                 saving_ready,
                 Vec::new(),
                 Vec::new(),
@@ -633,10 +650,12 @@ impl Backend for RealBackend {
             None,
             SNAPSHOT_HISTORY,
         )?;
+        let moving = core.queued_total(&row.id)?;
         Ok(spending::spending_state(
             Some(federation),
             total_balance,
             target,
+            moving,
             saving_ready,
             notes,
             history,
@@ -644,7 +663,7 @@ impl Backend for RealBackend {
     }
 
     async fn queue_state(&self) -> Result<QueueState> {
-        Ok(spending::queue_state())
+        self.core.queue_state()
     }
 
     async fn settings(&self) -> Result<Settings> {

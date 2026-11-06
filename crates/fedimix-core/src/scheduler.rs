@@ -136,6 +136,10 @@ pub(crate) fn mean_wait_secs(estimate: u32, target: u32, timing: &ExitTiming) ->
 /// The exponential quantile `ceil(-ln(1 - uniform) × mean)`, for `uniform` in
 /// `[0, 1)`. Outside it: exactly 1 gives `u64::MAX` (0 with a mean of 0), and
 /// above 1 or NaN gives 0. A mean of 0 always gives 0.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "automatic exits use it from Phase 4 Task 7 on")
+)]
 pub(crate) fn draw_delay(mean_secs: u64, uniform: f64) -> u64 {
     let delay = (-(1.0 - uniform).ln() * mean_secs as f64).ceil();
     // `as` saturates, and maps NaN to 0.
@@ -144,6 +148,10 @@ pub(crate) fn draw_delay(mean_secs: u64, uniform: f64) -> u64 {
 
 /// What `readiness` decides from.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "automatic exits use it from Phase 4 Task 7 on")
+)]
 pub(crate) struct Conditions {
     pub now: Timestamp,
     /// Saving is set up, open and done with its first scan.
@@ -160,6 +168,10 @@ pub(crate) struct Conditions {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "automatic exits use it from Phase 4 Task 7 on")
+)]
 pub(crate) enum Readiness {
     Waiting(QueueItemStatus),
     /// Free to leave once its drawn delay has passed.
@@ -169,6 +181,10 @@ pub(crate) enum Readiness {
 /// The status of a queued item, first match wins: Saving not usable or the
 /// money too new, then offline or unquoted, the grace period, the fee guard,
 /// and a fee Spending cannot pay.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "automatic exits use it from Phase 4 Task 7 on")
+)]
 pub(crate) fn readiness(origin_at: Timestamp, denomination: Amount, c: &Conditions) -> Readiness {
     let s = &c.settings;
     if !c.saving_usable || c.now.saturating_sub(origin_at) < s.min_time_in_pool_secs {
@@ -196,6 +212,10 @@ pub(crate) fn readiness(origin_at: Timestamp, denomination: Amount, c: &Conditio
 }
 
 /// The earliest time the next automatic exit of a federation may go.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "automatic exits use it from Phase 4 Task 7 on")
+)]
 pub(crate) fn not_before(
     last_automatic_exit: Option<Timestamp>,
     timing: &ExitTiming,

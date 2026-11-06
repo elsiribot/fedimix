@@ -314,18 +314,20 @@ async fn spending_state_splits_at_target() {
     let harness = Harness::new();
     harness.first.set_balance(Amount::from_sat(7_000_000));
     let backend = harness.joined().await;
-    wait_balance(&*backend, Amount::from_sat(7_000_000)).await;
+    wait_queue(&*backend, &[Amount::from_sat(2_000_000)]).await;
     let state = backend.spending_state().await.unwrap();
     assert_eq!(state.target, Amount::from_sat(5_000_000));
     assert_eq!(state.for_spending, Amount::from_sat(5_000_000));
     assert_eq!(state.moving, Amount::from_sat(2_000_000));
     assert!(!state.saving_ready);
 
+    // Only a send or a higher target shrinks the queue: money that leaves
+    // otherwise comes from the part for spending.
     harness.first.set_balance(Amount::from_sat(3_000_000));
     wait_balance(&*backend, Amount::from_sat(3_000_000)).await;
     let state = backend.spending_state().await.unwrap();
-    assert_eq!(state.for_spending, Amount::from_sat(3_000_000));
-    assert_eq!(state.moving, Amount::ZERO);
+    assert_eq!(state.for_spending, Amount::from_sat(1_000_000));
+    assert_eq!(state.moving, Amount::from_sat(2_000_000));
     backend.shutdown().await.unwrap();
 }
 
@@ -334,10 +336,10 @@ async fn queue_waits_for_saving() {
     let harness = Harness::new();
     harness.first.set_balance(Amount::from_sat(7_000_000));
     let backend = harness.joined().await;
-    wait_balance(&*backend, Amount::from_sat(7_000_000)).await;
+    wait_queue(&*backend, &[Amount::from_sat(2_000_000)]).await;
     let queue = backend.queue_state().await.unwrap();
     assert!(queue.waiting_for_saving);
-    assert!(queue.items.is_empty());
+    assert_eq!(queue.items[0].status, fedimix_core::QueueItemStatus::Queued);
     backend.shutdown().await.unwrap();
 }
 
@@ -7682,5 +7684,373 @@ async fn an_undecodable_session_stalls_counting_but_not_exits() {
         item_estimate(&backend, FIRST_FEDERATION, 0, SMALLEST).unwrap(),
         5
     );
+    backend.shutdown().await.unwrap();
+}
+
+// The denomination queue (Phase 4 Task 5).
+
+/// `n` thousandths of a bitcoin.
+fn mbtc(n: u64) -> Amount {
+    Amount::from_sat(n * 100_000)
+}
+
+async fn queue_of(backend: &dyn Backend) -> Vec<Amount> {
+    let queue = backend.queue_state().await.unwrap();
+    queue.items.iter().map(|item| item.denomination).collect()
+}
+
+async fn queue_ids(backend: &dyn Backend) -> Vec<String> {
+    let queue = backend.queue_state().await.unwrap();
+    queue.items.into_iter().map(|item| item.id).collect()
+}
+
+async fn wait_queue(backend: &dyn Backend, expected: &[Amount]) {
+    wait_until("the queue", || async {
+        queue_of(backend).await == expected
+    })
+    .await;
+}
+
+/// The id, origin session and origin time of each item of the first
+/// federation, oldest first.
+fn origins(harness: &Harness) -> Vec<(String, u64, u64)> {
+    let conn = raw_store(harness);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, origin_session, origin_at FROM exit_items
+             WHERE federation_id = ?1 ORDER BY seq",
+        )
+        .unwrap();
+    stmt.query_map([FIRST_FEDERATION], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            u64::try_from(r.get::<_, i64>(1)?).unwrap(),
+            u64::try_from(r.get::<_, i64>(2)?).unwrap(),
+        ))
+    })
+    .unwrap()
+    .map(|row| row.unwrap())
+    .collect()
+}
+
+/// 0.47 BTC at the default target of 0.05 BTC.
+async fn queued_470(harness: &Harness) -> Arc<fedimix_core::RealBackend> {
+    harness.first.set_balance(mbtc(470));
+    let backend = harness.joined().await;
+    wait_queue(&*backend, &[mbtc(200), mbtc(200), mbtc(20)]).await;
+    backend
+}
+
+#[tokio::test]
+async fn deposits_above_target_are_queued_in_denominations() {
+    let harness = Harness::new();
+    let backend = queued_470(&harness).await;
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.balance, mbtc(470));
+    assert_eq!(state.moving, mbtc(420));
+    assert_eq!(state.for_spending, mbtc(50));
+    let queue = backend.queue_state().await.unwrap();
+    assert_eq!(queue.total, mbtc(420));
+    assert!(
+        queue
+            .items
+            .iter()
+            .all(|item| item.status == fedimix_core::QueueItemStatus::Queued),
+        "{:?}",
+        queue.items
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_remainder_below_the_smallest_stays_in_spending() {
+    let harness = Harness::new();
+    harness.first.set_balance(sat(5_150_000));
+    let backend = harness.joined().await;
+    wait_queue(&*backend, &[mbtc(1)]).await;
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.moving, mbtc(1));
+    assert_eq!(state.for_spending, sat(5_050_000));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn refill_overshoot_rejoins_the_queue() {
+    let saving = SavingHarness::new();
+    let client = &saving.harness.first;
+    client.set_session_count(Ok(42));
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 300_000, 0).await;
+    let tx = saving.refilled(&backend).await;
+    let txid = tx.compute_txid().to_string();
+    let gross = sat(tx.output[0].value.to_sat());
+    let net = gross.checked_sub(sat(DEPOSIT_FEE)).unwrap();
+    let watch = client.last_deposit().unwrap();
+    client.push_update(
+        &watch,
+        WatchUpdate::Settled {
+            amount: net,
+            fee: sat(DEPOSIT_FEE),
+            txid: Some(txid.clone()),
+        },
+    );
+    wait_status(&*backend, &watch, HistoryStatus::Complete).await;
+    let row = row_of(&rows(&*backend).await, &watch);
+    assert_eq!(row.session, Some(42));
+    // Later sessions have passed when Spending shows the money.
+    client.set_session_count(Ok(50));
+    client.set_balance(net);
+    // About 0.0027 BTC above the target of 30k sat.
+    wait_queue(&*backend, &[mbtc(2)]).await;
+    let stored = origins(&saving.harness);
+    assert_eq!(stored.len(), 1);
+    assert_eq!((stored[0].1, stored[0].2), (42, row.timestamp));
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_send_takes_from_the_queue_newest_first() {
+    let harness = Harness::new();
+    let backend = queued_470(&harness).await;
+    let before = queue_ids(&*backend).await;
+    let preview = backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(mbtc(30))))
+        .await
+        .unwrap();
+    backend.confirm_send(preview.id).await.unwrap();
+    // 0.47 - 0.03 - 300 sat leaves room for 0.389997 BTC above the target:
+    // the 0.02 and the newer 0.2 give way, and what they freed is split again.
+    let expected = [
+        mbtc(200),
+        mbtc(100),
+        mbtc(50),
+        mbtc(20),
+        mbtc(10),
+        mbtc(5),
+        mbtc(2),
+        mbtc(2),
+    ];
+    wait_queue(&*backend, &expected).await;
+    let after = queue_ids(&*backend).await;
+    assert_eq!(after[0], before[0], "the oldest item stays");
+    assert!(!after.contains(&before[1]) && !after.contains(&before[2]));
+    let balance = sat(47_000_000 - 3_000_000 - 300);
+    wait_balance(&*backend, balance).await;
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.moving, mbtc(389));
+    assert_eq!(state.for_spending, balance.checked_sub(mbtc(389)).unwrap());
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_review_says_when_a_send_takes_from_the_queue() {
+    let harness = Harness::new();
+    // 0.0009 BTC above the queue and the target: a small send fits there.
+    harness.first.set_balance(sat(47_090_000));
+    let backend = harness.joined().await;
+    wait_queue(&*backend, &[mbtc(200), mbtc(200), mbtc(20)]).await;
+    let small = backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(sat(500))))
+        .await
+        .unwrap();
+    assert_eq!(small.notes, Vec::<String>::new());
+
+    harness.first.set_balance(mbtc(470));
+    wait_balance(&*backend, mbtc(470)).await;
+    let preview = backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(mbtc(10))))
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.notes,
+        ["0.011 BTC of this comes from money moving to Saving.".to_string()]
+    );
+    // A review changes nothing.
+    assert_eq!(queue_of(&*backend).await, [mbtc(200), mbtc(200), mbtc(20)]);
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn raising_the_target_shrinks_the_queue() {
+    let harness = Harness::new();
+    let backend = queued_470(&harness).await;
+    let first = queue_ids(&*backend).await.remove(0);
+    let settings = backend.settings().await.unwrap();
+    backend
+        .set_settings(Settings {
+            spending_target: mbtc(100),
+            ..settings
+        })
+        .await
+        .unwrap();
+    wait_queue(&*backend, &[mbtc(200), mbtc(100), mbtc(50), mbtc(20)]).await;
+    assert_eq!(queue_ids(&*backend).await[0], first);
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.moving, mbtc(370));
+    assert_eq!(state.for_spending, mbtc(100));
+
+    // A lower target books what now lies above it, with no balance change.
+    let settings = backend.settings().await.unwrap();
+    backend
+        .set_settings(Settings {
+            spending_target: mbtc(50),
+            ..settings
+        })
+        .await
+        .unwrap();
+    wait_queue(
+        &*backend,
+        &[mbtc(200), mbtc(100), mbtc(50), mbtc(20), mbtc(50)],
+    )
+    .await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_follows_the_active_federation() {
+    let harness = Harness::new();
+    harness.second.set_balance(mbtc(60));
+    let backend = queued_470(&harness).await;
+    let second = backend.join_federation(SECOND_INVITE.into()).await.unwrap();
+    // The first federation stays active.
+    assert_eq!(queue_of(&*backend).await, [mbtc(200), mbtc(200), mbtc(20)]);
+    backend.set_active_federation(second.id).await.unwrap();
+    wait_queue(&*backend, &[mbtc(10)]).await;
+    let state = backend.spending_state().await.unwrap();
+    assert_eq!(state.moving, mbtc(10));
+    assert_eq!(state.for_spending, mbtc(50));
+    backend.shutdown().await.unwrap();
+}
+
+async fn assert_waiting(backend: &dyn Backend, waiting: bool) {
+    let queue = backend.queue_state().await.unwrap();
+    assert_eq!(queue.waiting_for_saving, waiting);
+    assert_eq!(queue.items.len(), 3);
+    assert!(
+        queue
+            .items
+            .iter()
+            .all(|item| item.status == fedimix_core::QueueItemStatus::Queued),
+        "{:?}",
+        queue.items
+    );
+}
+
+/// Review Focus 4: Saving not set up, scanning, or unable to open.
+#[tokio::test]
+async fn without_saving_the_queue_waits() {
+    let saving = SavingHarness::new();
+    saving.harness.first.set_balance(mbtc(470));
+    let backend = saving.with_server().await;
+    backend.join_federation(INVITE.into()).await.unwrap();
+    wait_queue(&*backend, &[mbtc(200), mbtc(200), mbtc(20)]).await;
+    assert_waiting(&*backend, true).await;
+
+    saving.chain.set_stalled(true);
+    saving.chain.push_full_scan(first_scan(1));
+    backend.setup_saving(DEVICE.into()).await.unwrap();
+    assert!(backend.saving_state().await.unwrap().scanning);
+    assert_waiting(&*backend, true).await;
+    saving.chain.set_stalled(false);
+    wait_chain(&*backend, true).await;
+    assert_waiting(&*backend, false).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    raw_store(&saving.harness)
+        .execute(
+            "UPDATE saving_device SET xpub = 'not a key' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    let backend = saving.open().await.unwrap();
+    assert!(!backend.saving_state().await.unwrap().wallet_open);
+    assert_waiting(&*backend, true).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn in_flight_counts_exits_until_they_confirm() {
+    let saving = SavingHarness::new();
+    saving.harness.first.set_balance(mbtc(470));
+    let backend = saving.joined().await;
+    wait_queue(&*backend, &[mbtc(200), mbtc(200), mbtc(20)]).await;
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        Amount::ZERO
+    );
+    let raw = raw_store(&saving.harness);
+    raw.execute(
+        "INSERT INTO exit_items (id, federation_id, denomination_msat, origin_session,
+            origin_at, created_at, state, intent, address)
+         VALUES ('leaving', ?1, 1000000000, 0, 0, 0, 'withdrawing', 'exit-leaving', 'address')",
+        [FIRST_FEDERATION],
+    )
+    .unwrap();
+    assert_eq!(backend.saving_state().await.unwrap().in_flight, mbtc(10));
+    let queue = backend.queue_state().await.unwrap();
+    let leaving = queue
+        .items
+        .iter()
+        .find(|item| item.id == "leaving")
+        .unwrap();
+    assert_eq!(
+        leaving.status,
+        fedimix_core::QueueItemStatus::Withdrawing { txid: None }
+    );
+    // Only what is still queued is moving: an exit on its way has left.
+    assert_eq!(queue.total, mbtc(420));
+    assert_eq!(backend.spending_state().await.unwrap().moving, mbtc(420));
+
+    raw.execute(
+        "UPDATE exit_items SET state = 'landed' WHERE id = 'leaving'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        Amount::ZERO
+    );
+    assert_eq!(queue_of(&*backend).await, [mbtc(200), mbtc(200), mbtc(20)]);
+    backend.shutdown().await.unwrap();
+}
+
+/// `in_flight` is exits only now; what cannot be sent still counts coins
+/// received and not yet confirmed.
+#[tokio::test]
+async fn held_back_still_counts_unconfirmed_receives() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    saving.fund(&backend, 100_000, 0).await;
+    let info = backend.receive(on_chain()).await.unwrap();
+    let tx = payment(&info.payload, 40_000, 7);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    saving.chain.push_sync(in_mempool(tx, now, 2));
+    wait_until("the unconfirmed coin held back", || async {
+        sync_saving_now(&backend);
+        backend.saving_state().await.unwrap().held_back == sat(40_000)
+    })
+    .await;
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        Amount::ZERO
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_survives_restart() {
+    let harness = Harness::new();
+    let backend = queued_470(&harness).await;
+    let before = origins(&harness);
+    let backend = restarted(&harness, backend).await;
+    wait_online(&*backend, true).await;
+    // One more thousandth: the queue grows by one item and keeps the rest.
+    harness.first.set_balance(mbtc(471));
+    wait_queue(&*backend, &[mbtc(200), mbtc(200), mbtc(20), mbtc(1)]).await;
+    assert_eq!(origins(&harness)[..3], before[..]);
     backend.shutdown().await.unwrap();
 }
