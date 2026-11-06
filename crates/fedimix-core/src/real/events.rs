@@ -194,7 +194,14 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
     loop {
         tokio::select! {
             balance = balances.next() => match balance {
-                Some(balance) => forward_balance(&core, &client, &id, balance).await,
+                Some(balance) => {
+                    forward_balance(&core, &client, &id, balance).await;
+                    watches.spawn(tend_after_balance(
+                        Arc::clone(&core),
+                        Arc::clone(&client),
+                        id.clone(),
+                    ));
+                }
                 None => return,
             },
             status = online.next() => match status {
@@ -244,9 +251,6 @@ async fn forward_balance(
             false
         }
     };
-    if tend_queue(core, client.as_ref(), id, balance).await {
-        core.events.emit(&Event::QueueChanged);
-    }
     if !changed && !notes_changed {
         return;
     }
@@ -260,24 +264,29 @@ async fn forward_balance(
     });
 }
 
-/// Fits the queue to a new balance, with the session count read once: new
-/// items start there if no deposit names its session. When the count cannot
-/// be read, the last one known stands in for it.
-async fn tend_queue(core: &Core, client: &dyn FederationClient, id: &str, balance: Amount) -> bool {
-    let count = match client.session_count().await {
-        Ok(count) => Some(count),
-        Err(e) => {
-            eprintln!("fedimix: reading the session count of {id}: {e}");
-            core.known_session_count(id)
-        }
+/// Fits the queue to the stored balance, as a task of the connection's, so a
+/// federation slow to answer never holds up its events. New items start at
+/// the session count last read, which is asked for only when none was; a
+/// count that cannot be read leaves the queue to the next balance change.
+async fn tend_after_balance(core: Arc<Core>, client: Arc<dyn FederationClient>, id: String) {
+    let count = match core.known_session_count(&id) {
+        Some(count) => count,
+        None => match client.session_count().await {
+            Ok(count) => {
+                core.note_session_count(&id, count);
+                count
+            }
+            Err(e) => {
+                eprintln!("fedimix: reading the session count of {id}: {e}");
+                return;
+            }
+        },
     };
-    let Some(count) = count else {
-        return false;
-    };
-    core.tend_queue(id, balance, count).unwrap_or_else(|e| {
-        eprintln!("fedimix: queueing the money of federation {id} above the target: {e}");
-        false
-    })
+    match core.tend_queue(&id, count) {
+        Ok(true) => core.events.emit(&Event::QueueChanged),
+        Ok(false) => {}
+        Err(e) => eprintln!("fedimix: queueing the money of federation {id} above the target: {e}"),
+    }
 }
 
 fn forward_online(core: &Core, id: &str, online: bool) {

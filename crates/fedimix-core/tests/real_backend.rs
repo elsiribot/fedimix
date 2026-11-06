@@ -8115,3 +8115,67 @@ async fn a_receive_with_no_session_spares_windows_that_ended_before_it() {
     wait_federation_estimate(&*backend, 0).await;
     backend.shutdown().await.unwrap();
 }
+
+/// I1: tending the queue never holds up the connection. With the session
+/// count hanging, balance changes still arrive, and the queue fills once the
+/// count answers.
+#[tokio::test]
+async fn a_federation_slow_to_count_sessions_delays_no_balance_event() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    harness.first.set_session_count_held(true);
+    harness.first.set_balance(mbtc(470));
+    let backend = harness.open().await.unwrap();
+    let events = backend.subscribe();
+    wait_online(&*backend, true).await;
+    wait_balance(&*backend, mbtc(470)).await;
+    harness.first.set_balance(mbtc(471));
+    wait_event(
+        &events,
+        &Event::BalanceChanged {
+            wallet: WalletKind::Spending,
+            balance: mbtc(471),
+        },
+    )
+    .await;
+    assert_eq!(queue_of(&*backend).await, Vec::<Amount>::new());
+    harness.first.set_session_count_held(false);
+    wait_queue(&*backend, &[mbtc(200), mbtc(200), mbtc(20), mbtc(1)]).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// I3: a send whose row was written but whose fit never ran (a crash between
+/// the two) still takes its money from the queue after a restart, while it is
+/// unresolved.
+#[tokio::test]
+async fn a_send_cut_off_before_its_fit_shrinks_the_queue_after_restart() {
+    let harness = Harness::new();
+    let backend = queued_470(&harness).await;
+    halt_sends(&backend, SendHalt::AfterRow);
+    let preview = backend
+        .prepare_send(to(ADDRESS, SendAmount::Exact(mbtc(30))))
+        .await
+        .unwrap();
+    backend.confirm_send(preview.id).await.unwrap();
+    assert_eq!(queue_of(&*backend).await, [mbtc(200), mbtc(200), mbtc(20)]);
+    // The lookup that would settle the intent fails, so it stays unresolved.
+    harness.first.fail_next_find(FedimixError::Offline);
+    let backend = restarted(&harness, backend).await;
+    wait_queue(
+        &*backend,
+        &[
+            mbtc(200),
+            mbtc(100),
+            mbtc(50),
+            mbtc(20),
+            mbtc(10),
+            mbtc(5),
+            mbtc(2),
+            mbtc(2),
+        ],
+    )
+    .await;
+    backend.shutdown().await.unwrap();
+}

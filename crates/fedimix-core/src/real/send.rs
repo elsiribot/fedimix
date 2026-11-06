@@ -40,6 +40,9 @@ const NO_AMOUNT: &str = "This invoice has no amount, so it cannot be paid.";
 pub enum SendHalt {
     /// The row is written and nothing is submitted.
     BeforeSubmit,
+    /// The row is written and nothing after it runs: the queue is not fitted
+    /// and nothing is submitted.
+    AfterRow,
     /// The payment is submitted and its operation id is not written.
     AfterSubmit,
 }
@@ -293,6 +296,10 @@ impl Core {
             created_at: now,
         };
         self.store().add_tracked(&item, &watch)?;
+        #[cfg(feature = "testing")]
+        if *held(&self.halt) == Some(SendHalt::AfterRow) {
+            return Ok(intent);
+        }
         // O1: the send may take queued money, and the queue gives way.
         if let Err(e) = self.fit_queue_after_send(&federation, available) {
             eprintln!("fedimix: fitting the queue after send {intent}: {e}");

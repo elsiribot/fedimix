@@ -119,6 +119,8 @@ pub struct FakeClient {
     panic_next_stream: AtomicBool,
     /// While set, `balance` hangs, as a client too busy to answer does.
     balance_held: watch::Sender<bool>,
+    /// While set, `session_count` hangs, as a federation slow to answer does.
+    session_count_held: watch::Sender<bool>,
     balance_reads: AtomicU32,
     /// While set, `shutdown` hangs, as it does for a payment in flight.
     close_held: watch::Sender<bool>,
@@ -166,6 +168,7 @@ impl FakeClient {
             shutdowns: AtomicU32::new(0),
             panic_next_stream: AtomicBool::new(false),
             balance_held: watch::Sender::new(false),
+            session_count_held: watch::Sender::new(false),
             balance_reads: AtomicU32::new(0),
             close_held: watch::Sender::new(false),
             invoice_held: watch::Sender::new(false),
@@ -308,6 +311,10 @@ impl FakeClient {
         self.panic_next_stream.store(true, Ordering::SeqCst);
     }
 
+    pub fn set_session_count_held(&self, held: bool) {
+        self.session_count_held.send_replace(held);
+    }
+
     pub fn set_balance_held(&self, held: bool) {
         self.balance_held.send_replace(held);
     }
@@ -415,6 +422,8 @@ impl FederationClient for FakeClient {
     }
 
     async fn session_count(&self) -> Result<u64> {
+        let mut held = self.session_count_held.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
         self.session_count.lock().unwrap().clone()
     }
 

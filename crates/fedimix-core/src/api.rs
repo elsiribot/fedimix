@@ -400,6 +400,8 @@ pub struct QueueItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueueState {
+    /// The queued items only, as `SpendingState.moving`: an exit on its way
+    /// has left Spending, so items can sum to more than this.
     pub total: Amount,
     pub anonymity_estimate: u32,
     pub typical_exit_secs: u64,

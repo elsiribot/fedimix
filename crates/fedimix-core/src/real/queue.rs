@@ -5,7 +5,7 @@
 //! of its lock, so two changes never book the same money.
 
 use super::Core;
-use super::send::fresh_id;
+use super::send::{fresh_id, is_send};
 use crate::anonymity::{
     self, DEFAULT_SESSION_SECS, FEDERATION_WINDOW_SESSIONS, Own, SessionDeposit,
 };
@@ -164,8 +164,12 @@ impl Core {
     }
 
     /// What the payments being submitted from `federation` will take, which
-    /// its balance may not show yet.
-    fn reserved(&self, federation: &str) -> Amount {
+    /// its balance may not show yet. Read with the store held, as `held`
+    /// shows: a send reserves before it writes its row and fits the queue
+    /// under that lock, so a change made under it sees the send whole or not
+    /// at all.
+    fn reserved(&self, held: &Store, federation: &str) -> Amount {
+        let _ = held;
         let submitting = self.submitting.borrow();
         sum(submitting
             .values()
@@ -173,23 +177,59 @@ impl Core {
             .map(|(_, taken)| *taken))
     }
 
-    /// Books the whole denominations above the target, and keeps the queue
-    /// within `balance`. Money a submission is about to take is not booked.
-    /// New items start where the latest deposit came in, else at
-    /// `session_count` and now. Whether the queue changed.
-    pub(super) fn tend_queue(
-        &self,
-        federation: &str,
-        balance: Amount,
-        session_count: u64,
-    ) -> Result<bool> {
-        let reserved = self.reserved(federation);
+    /// `None` when `federation` has no send left unfinished. Otherwise what
+    /// those of them that have no operation and that no call is submitting
+    /// will take: a crash between a send's row and its fit leaves such a
+    /// send, which counts until the resolver settles it.
+    fn unresolved_sends(&self, store: &Store, federation: &str) -> Result<Option<Amount>> {
+        let submitting = self.submitting.borrow();
+        let mut unresolved = None;
+        for (watch, operation) in store.sends()? {
+            if !is_send(watch.kind) || watch.federation_id != federation {
+                continue;
+            }
+            let mut taking = unresolved.unwrap_or(Amount::ZERO);
+            if operation.is_none()
+                && !submitting.contains_key(&watch.id)
+                && let Some(row) =
+                    store.history_item(WalletKind::Spending, Some(federation), &watch.id)?
+            {
+                taking = sum([taking, row.amount, row.fee.unwrap_or(Amount::ZERO)]);
+            }
+            unresolved = Some(taking);
+        }
+        Ok(unresolved)
+    }
+
+    /// Books the whole denominations above the target of `federation`'s
+    /// stored balance, and keeps the queue within that balance. Money a
+    /// submission is about to take is not booked. While a send is unfinished
+    /// the queue keeps to what it leaves above the target, so a send whose fit
+    /// was cut off still takes its money from the queue. New items start where
+    /// the latest deposit came in, else at `session_count` and now. Everything
+    /// is read under one hold of the store's lock. Whether the queue changed.
+    pub(super) fn tend_queue(&self, federation: &str, session_count: u64) -> Result<bool> {
         let now = (self.clock)();
         let store = self.store();
+        let Some(row) = store
+            .federations()?
+            .into_iter()
+            .find(|row| row.id == federation)
+        else {
+            return Ok(false);
+        };
+        let balance = Amount {
+            msat: row.balance_msat,
+        };
         let target = store.settings()?.spending_target;
+        let reserved = self.reserved(&store, federation);
+        let cap = match self.unresolved_sends(&store, federation)? {
+            Some(unresolved) => balance.saturating_sub(unresolved).saturating_sub(target),
+            None => balance,
+        };
         let queued = queued_sum(&store.exit_items(Some(federation))?);
-        if queued > balance {
-            return fit_in(&store, federation, balance, now);
+        if queued > cap {
+            return fit_in(&store, federation, cap, now);
         }
         let grown = scheduler::grow(queued, balance.saturating_sub(reserved), target);
         if grown.is_empty() {
@@ -216,11 +256,10 @@ impl Core {
         debit: Amount,
         balance: Amount,
     ) -> Result<Amount> {
-        let reserved = self.reserved(federation);
         let store = self.store();
         let target = store.settings()?.spending_target;
         let cap = balance
-            .saturating_sub(reserved)
+            .saturating_sub(self.reserved(&store, federation))
             .saturating_sub(debit)
             .saturating_sub(target);
         let items = store.exit_items(Some(federation))?;
@@ -232,22 +271,23 @@ impl Core {
         Ok(removed.saturating_sub(sum(fit.regrow.iter().copied())))
     }
 
-    /// Shrinks the queue of `federation` to at most `cap`, newest first.
-    pub(super) fn fit_queue(&self, federation: &str, cap: Amount) -> Result<()> {
+    /// After a send's row is written: the queue of `federation` shrinks,
+    /// newest first, to what stays above the target once `balance` pays every
+    /// submission, this send's included.
+    pub(super) fn fit_queue_after_send(&self, federation: &str, balance: Amount) -> Result<()> {
         let now = (self.clock)();
-        if fit_in(&self.store(), federation, cap, now)? {
+        let changed = {
+            let store = self.store();
+            let target = store.settings()?.spending_target;
+            let cap = balance
+                .saturating_sub(self.reserved(&store, federation))
+                .saturating_sub(target);
+            fit_in(&store, federation, cap, now)?
+        };
+        if changed {
             self.events.emit(&Event::QueueChanged);
         }
         Ok(())
-    }
-
-    /// After a send's row is written: the queue keeps what stays above the
-    /// target once `balance` pays every submission, this send's included.
-    pub(super) fn fit_queue_after_send(&self, federation: &str, balance: Amount) -> Result<()> {
-        let reserved = self.reserved(federation);
-        let target = self.store().settings()?.spending_target;
-        let cap = balance.saturating_sub(reserved).saturating_sub(target);
-        self.fit_queue(federation, cap)
     }
 
     /// A higher target: every federation's queue gives way to it. Whether
@@ -260,7 +300,7 @@ impl Core {
                 msat: row.balance_msat,
             };
             let cap = balance
-                .saturating_sub(self.reserved(&row.id))
+                .saturating_sub(self.reserved(store, &row.id))
                 .saturating_sub(target);
             changed |= fit_in(store, &row.id, cap, now)?;
         }
@@ -283,10 +323,7 @@ impl Core {
             let Some(count) = self.known_session_count(&row.id) else {
                 continue;
             };
-            let balance = Amount {
-                msat: row.balance_msat,
-            };
-            match self.tend_queue(&row.id, balance, count) {
+            match self.tend_queue(&row.id, count) {
                 Ok(tended) => changed |= tended,
                 Err(e) => eprintln!("fedimix: filling the queue of federation {}: {e}", row.id),
             }
@@ -294,16 +331,16 @@ impl Core {
         changed
     }
 
-    /// The session count last read on this connection, else the next session
-    /// to sync.
+    /// The session count last read on this connection. The sync cursor is no
+    /// stand-in: it can lag far behind, and too old an origin would overstate
+    /// a new item's anonymity.
     pub(super) fn known_session_count(&self, federation: &str) -> Option<u64> {
-        let seen = self
-            .state()
+        let state = self.state();
+        let seen = state
             .live
             .get(federation)
             .and_then(|live| live.sessions_seen);
         seen.map(|seen| seen.last.1)
-            .or_else(|| self.store().session_cursor(federation).ok().flatten())
     }
 
     /// The exits on their way to Saving, of every federation.
@@ -441,7 +478,71 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
+    use crate::config::CoreConfig;
+    use crate::federation::fake::FakePort;
+
+    /// I2: a tend blocked on the store while a send reserves its money must
+    /// see that reservation once it runs, and book none of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tend_sees_a_reservation_made_while_it_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let port = Arc::new(FakePort::default());
+        let client = port.add_federation("fed1one", "one", Network::Regtest);
+        client.set_balance(Amount::from_sat(47_000_000));
+        let config = CoreConfig {
+            data_dir: dir.path().to_str().unwrap().to_string(),
+            network: Network::Regtest,
+        };
+        let backend = crate::testing::real_backend(config, port, Arc::new(|| 1_000))
+            .await
+            .unwrap();
+        let info = crate::Backend::join_federation(&*backend, "fed1one".into())
+            .await
+            .unwrap();
+        let core = Arc::clone(&backend.core);
+        let full = Amount::from_sat(42_000_000);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while core.queued_total(&info.id).unwrap() != full {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // The tend starts while the store is held, and the send reserves
+        // before it is let go.
+        let (tending, reservation) = {
+            let store = core.store();
+            store
+                .set_federation_balance(&info.id, Amount::from_sat(50_100_000).msat)
+                .unwrap();
+            let tending = {
+                let core = Arc::clone(&core);
+                let id = info.id.clone();
+                std::thread::spawn(move || core.tend_queue(&id, 0).unwrap())
+            };
+            std::thread::sleep(Duration::from_millis(100));
+            let reservation = core
+                .reserve(
+                    &info.id,
+                    "send-x",
+                    Amount::from_sat(3_100_000),
+                    Amount::from_sat(50_100_000),
+                )
+                .unwrap();
+            (tending, reservation)
+        };
+        assert!(!tending.join().unwrap(), "nothing above the target is free");
+        assert_eq!(core.queued_total(&info.id).unwrap(), full);
+        drop(reservation);
+        crate::Backend::shutdown(&*backend).await.unwrap();
+    }
 
     #[test]
     fn a_session_length_counts_once_ten_sessions_passed() {
