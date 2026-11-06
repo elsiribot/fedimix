@@ -134,7 +134,8 @@ pub(crate) fn mean_wait_secs(estimate: u32, target: u32, timing: &ExitTiming) ->
 }
 
 /// The exponential quantile `ceil(-ln(1 - uniform) × mean)`, for `uniform` in
-/// `[0, 1)`; a value outside saturates (1 or more gives `u64::MAX`).
+/// `[0, 1)`. Outside it: exactly 1 gives `u64::MAX` (0 with a mean of 0), and
+/// above 1 or NaN gives 0. A mean of 0 always gives 0.
 pub(crate) fn draw_delay(mean_secs: u64, uniform: f64) -> u64 {
     let delay = (-(1.0 - uniform).ln() * mean_secs as f64).ceil();
     // `as` saturates, and maps NaN to 0.
@@ -335,6 +336,23 @@ mod tests {
     }
 
     #[test]
+    fn delay_near_one_stays_finite() {
+        assert_eq!(draw_delay(10_800, 1.0 - 2f64.powi(-20)), 149_720);
+        // The largest `f64` below 1, the most `gen::<f64>()` can return.
+        assert_eq!(draw_delay(10_800, 1.0 - f64::EPSILON / 2.0), 396_758);
+        assert_eq!(draw_delay(10_800, 1.0), u64::MAX);
+        assert_eq!(draw_delay(10_800, 1.5), 0);
+    }
+
+    #[test]
+    fn a_mean_of_zero_draws_no_delay() {
+        assert_eq!(draw_delay(0, 0.0), 0);
+        assert_eq!(draw_delay(0, 0.5), 0);
+        assert_eq!(draw_delay(0, 1.0 - f64::EPSILON / 2.0), 0);
+        assert_eq!(draw_delay(0, 1.0), 0);
+    }
+
+    #[test]
     fn delays_average_their_mean() {
         let mut rng = StdRng::seed_from_u64(7);
         let draws = 10_000;
@@ -402,7 +420,12 @@ mod tests {
             fee: Some(Amount::from_sat(2_000)),
             ..base.clone()
         };
-        assert_ne!(check(old, &at_guard), deferred(DeferReason::FeeGuard));
+        assert_eq!(check(old, &at_guard), Readiness::Ready);
+        let unstarted = Conditions {
+            online_since: None,
+            ..base.clone()
+        };
+        assert_eq!(check(old, &unstarted), deferred(DeferReason::GracePeriod));
         let poor = Conditions {
             for_spending: Amount::from_sat(1_000),
             fee: Some(Amount::from_sat(1_500)),
@@ -421,6 +444,8 @@ mod tests {
     #[test]
     fn attainable_adds_the_deposits_expected_meanwhile() {
         assert_eq!(attainable(10, 0.2, 3_600, 180), 14);
+        // 0.25 × 2 sessions = 0.5 more, rounded half away from zero.
+        assert_eq!(attainable(10, 0.25, 360, 180), 11);
     }
 
     #[test]
