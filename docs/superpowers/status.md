@@ -32,4 +32,5 @@ Next: Phase 5 (cover traffic).
 - SOCKS5 for federation traffic: fedimint 0.13 has none.
 - An unknown exit outcome cannot be cleared from the app yet (its row reads "outcome unknown").
 - The anon estimate has not been seen above 0 in a real run; the outcome mapping in onchain.rs is untested.
+- v1 fee quotes use one fixed stand-in address, so guardians can tell a quote is from Fedimix (not whose); a random throwaway address per quote would hide that.
 - The wait formula and spacing values; whether the active federation should follow the largest estimate; whether to count LNv1 receives.
