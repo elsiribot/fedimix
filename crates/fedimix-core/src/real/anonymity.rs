@@ -27,6 +27,10 @@ fn sync_start_name(federation: &str) -> String {
     format!("anon-start:{federation}")
 }
 
+/// How many sessions of a backlog are synced between two events, so a long
+/// one shows progress.
+const SESSIONS_PER_EVENT: u64 = 100;
+
 fn next_backoff(backoff: Duration) -> Duration {
     (backoff * 2).min(MAX_BACKOFF)
 }
@@ -37,9 +41,23 @@ fn is_outpoint(id: &str) -> bool {
 }
 
 impl Core {
-    /// This wallet's deposits at `federation`, which no estimate counts: on
-    /// chain by outpoint (v2 rows) or txid (v1 rows), Lightning by session and
-    /// contract amount, which is what a settled receive's row holds.
+    /// This wallet's deposits at `federation`, which no estimate counts.
+    ///
+    /// On chain by outpoint (v2 rows) or txid (v1 rows). A txid also leaves
+    /// out anyone else's deposit in the same funding transaction, which errs
+    /// low.
+    ///
+    /// Lightning from the moment the invoice is made: its contract can land in
+    /// a session before the receive settles. A settled receive is placed in
+    /// the session count read when it settled, by its contract amount. A
+    /// receive seen late (after a restart, say) is placed in a later session
+    /// than the one that accepted it, so a window that starts between the two
+    /// subtracts it without holding it: the count errs low, never high. One
+    /// with no session (pending, or its count could not be read) is
+    /// subtracted from every window that ends after it was made, by the
+    /// amount on its row, which for a pending one is the invoice's (above the
+    /// contract): low again. All windows end at the newest synced session, and
+    /// the time that session was written stands for when it ended.
     pub(super) fn own_deposits(&self, federation: &str) -> Result<Own> {
         let store = self.store();
         let mut own = Own::default();
@@ -50,11 +68,22 @@ impl Core {
                 own.txids.insert(txid);
             }
         }
+        // With nothing synced there is no window; until a sync writes its
+        // time, every receive counts as made before the window ended.
+        let window_end = store.session_synced_at(federation)?;
         for row in store.lightning_receive_rows(federation)? {
-            if row.status == HistoryStatus::Complete
-                && let Some(session) = row.session
-            {
-                own.lightning.push((session, row.amount));
+            if matches!(
+                row.status,
+                HistoryStatus::Expired | HistoryStatus::Failed | HistoryStatus::Refunded
+            ) {
+                continue;
+            }
+            match row.session {
+                Some(session) => own.lightning.push((session, row.amount)),
+                None if window_end.is_none_or(|end| row.timestamp <= end) => {
+                    own.lightning_unplaced.push(row.amount);
+                }
+                None => {}
             }
         }
         Ok(own)
@@ -162,7 +191,8 @@ impl Core {
     }
 
     /// Fetches and stores every completed session not yet synced, in order,
-    /// and stops at the first that fails. Tells subscribers once at the end.
+    /// and stops at the first that fails. Tells subscribers at the end, and
+    /// every [`SESSIONS_PER_EVENT`] sessions of a long backlog.
     async fn sync_sessions(&self, client: &dyn FederationClient, federation: &str) -> Result<()> {
         let next = self.next_session(client, federation).await?;
         let count = client.session_count().await?;
@@ -170,9 +200,9 @@ impl Core {
         if next >= count {
             return Ok(());
         }
-        let before = self.federation_estimate(federation);
+        let mut before = self.federation_estimate(federation);
         let mut synced = Ok(());
-        let mut stored = false;
+        let mut stored = 0u64;
         for session in next..count {
             let fetched = match client.session_deposits(session).await {
                 Ok(Some(deposits)) => deposits,
@@ -182,19 +212,31 @@ impl Core {
                     break;
                 }
             };
-            if let Err(e) = self.store().add_session(federation, session, &fetched) {
+            let at = (self.clock)();
+            if let Err(e) = self.store().add_session(federation, session, &fetched, at) {
                 synced = Err(e);
                 break;
             }
-            stored = true;
-        }
-        if stored {
-            self.events.emit(&Event::QueueChanged);
-            if self.federation_estimate(federation) != before {
-                self.events.emit(&Event::FederationChanged);
+            stored += 1;
+            if stored.is_multiple_of(SESSIONS_PER_EVENT) {
+                before = self.announce_sessions(federation, before);
             }
         }
+        if !stored.is_multiple_of(SESSIONS_PER_EVENT) {
+            self.announce_sessions(federation, before);
+        }
         synced
+    }
+
+    /// Tells subscribers that sessions were synced, and whether the federation
+    /// estimate moved from `before`. Returns the estimate now.
+    fn announce_sessions(&self, federation: &str, before: u32) -> u32 {
+        self.events.emit(&Event::QueueChanged);
+        let now = self.federation_estimate(federation);
+        if now != before {
+            self.events.emit(&Event::FederationChanged);
+        }
+        now
     }
 }
 

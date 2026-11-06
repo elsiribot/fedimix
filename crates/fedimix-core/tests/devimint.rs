@@ -2301,17 +2301,37 @@ async fn session_deposits_see_a_deposit_and_a_lightning_receive() {
     let client = wallet.join().await;
     let first = client.session_count().await.unwrap();
     let (txid, outpoint) = deposit_to(&*client, 100_000).await;
+    // No session before this can hold our contract: the invoice is made after.
+    let before_receive = client.session_count().await.unwrap();
     let id = pay_with_lnd(&*client, Amount::from_sat(5_000)).await;
     let update = until_final(client.watch(watch(&id, WatchKind::LnReceive))).await;
-    assert!(matches!(update, WatchUpdate::Settled { .. }), "{update:?}");
+    // A receive reports its contract amount.
+    let WatchUpdate::Settled {
+        amount: contract, ..
+    } = update
+    else {
+        panic!("{update:?}");
+    };
+    assert!(
+        contract >= Amount::from_sat(4_900) && contract <= Amount::from_sat(5_000),
+        "{contract:?}"
+    );
     let open = client.session_count().await.unwrap();
     sessions_reach(&*client, open + 1).await;
     let count = client.session_count().await.unwrap();
 
     let mut found = Vec::new();
+    let mut baseline = 0;
     for session in first..count {
         let deposits = client.session_deposits(session).await.unwrap();
-        found.extend(deposits.expect("a counted session is complete"));
+        let deposits = deposits.expect("a counted session is complete");
+        if session < before_receive {
+            baseline += deposits
+                .iter()
+                .filter(|d| d.source == DepositSource::Lightning && d.amount == contract)
+                .count();
+        }
+        found.extend(deposits);
     }
     assert_eq!(client.session_deposits(count + 5).await.unwrap(), None);
     let ours: Vec<_> = found
@@ -2327,17 +2347,13 @@ async fn session_deposits_see_a_deposit_and_a_lightning_receive() {
     if let Some(outpoint) = outpoint {
         assert_eq!(ours[0].reference.as_ref(), Some(&outpoint));
     }
-    let received: Vec<_> = found
+    let received = found
         .iter()
-        .filter(|d| {
-            d.source == DepositSource::Lightning
-                && d.amount >= Amount::from_sat(4_900)
-                && d.amount <= Amount::from_sat(5_000)
-        })
-        .collect();
-    // The sessions are shared: other receives of the same size can land in
-    // them too, so ours is one of those found.
-    assert!(!received.is_empty(), "{found:?}");
+        .filter(|d| d.source == DepositSource::Lightning && d.amount == contract)
+        .count();
+    // The sessions are shared, and other receives of the same size can land
+    // in them, so ours shows as a rise over what was there before it.
+    assert!(received > baseline, "{baseline} before, {found:?}");
     client.shutdown().await.unwrap();
 }
 

@@ -8054,3 +8054,64 @@ async fn queue_survives_restart() {
     assert_eq!(origins(&harness)[..3], before[..]);
     backend.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_repeated_outpoint_counts_once() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    let deposit = chain_deposit(200_000, &outpoint(1));
+    harness
+        .first
+        .push_session(vec![deposit.clone(), deposit.clone()]);
+    harness.first.push_session(vec![deposit]);
+    harness
+        .first
+        .push_session(vec![chain_deposit(200_000, &outpoint(2))]);
+    wait_synced_to(&harness, 3).await;
+    wait_federation_estimate(&*backend, 2).await;
+    assert_eq!(
+        item_estimate(&backend, FIRST_FEDERATION, 0, SMALLEST).unwrap(),
+        1
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pending_lightning_receive_is_ours_at_once() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    backend.receive(invoice_request(200_000)).await.unwrap();
+    // Its contract lands before the receive settles, so before it has a session.
+    harness
+        .first
+        .push_session(vec![lightning_deposit(200_000), lightning_deposit(200_000)]);
+    wait_synced_to(&harness, 1).await;
+    wait_federation_estimate(&*backend, 1).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_receive_with_no_session_spares_windows_that_ended_before_it() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    harness.first.push_session(vec![lightning_deposit(200_000)]);
+    wait_synced_to(&harness, 1).await;
+    wait_federation_estimate(&*backend, 1).await;
+
+    // Asked for after that session was synced: the window ending there keeps
+    // someone else's receive.
+    harness.time.store(2_000, Ordering::SeqCst);
+    backend.receive(invoice_request(200_000)).await.unwrap();
+    assert_eq!(federation_estimate(&*backend).await, 1);
+    assert_eq!(
+        item_estimate(&backend, FIRST_FEDERATION, 0, SMALLEST).unwrap(),
+        0
+    );
+
+    // A window ending later may hold its contract, so it is left out there.
+    harness.time.store(3_000, Ordering::SeqCst);
+    harness.first.push_session(Vec::new());
+    wait_synced_to(&harness, 2).await;
+    wait_federation_estimate(&*backend, 0).await;
+    backend.shutdown().await.unwrap();
+}

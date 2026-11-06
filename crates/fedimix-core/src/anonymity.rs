@@ -35,6 +35,10 @@ pub(crate) struct Own {
     /// `(session, amount)` of each Lightning receive; these are subtracted by
     /// count, as a session's receives carry no reference.
     pub lightning: Vec<(u64, Amount)>,
+    /// Lightning receives with no session yet (or none that could be read):
+    /// each is subtracted from every window, so the count errs low. The
+    /// caller leaves out those made after the window ended.
+    pub lightning_unplaced: Vec<Amount>,
 }
 
 impl Own {
@@ -49,7 +53,8 @@ impl Own {
 }
 
 /// Deposits of at least `denomination` in sessions within `sessions`, own
-/// on-chain ones left out and own Lightning ones subtracted, never below 0.
+/// on-chain ones left out and own Lightning ones subtracted, never below 0. An
+/// outpoint is counted once, however often sessions name it.
 fn count(
     deposits: &[(u64, SessionDeposit)],
     sessions: impl Fn(u64) -> bool,
@@ -59,21 +64,33 @@ fn count(
     let counts = |session: u64, amount: Amount| sessions(session) && amount >= denomination;
     let mut on_chain = 0u64;
     let mut lightning = 0u64;
+    let mut seen = HashSet::new();
     for (session, deposit) in deposits {
         if !counts(*session, deposit.amount) {
             continue;
         }
         match deposit.source {
-            DepositSource::OnChain if !own.has_on_chain(deposit) => on_chain += 1,
+            DepositSource::OnChain
+                if !own.has_on_chain(deposit)
+                    && deposit.reference.as_ref().is_none_or(|r| seen.insert(r)) =>
+            {
+                on_chain += 1;
+            }
             DepositSource::OnChain => {}
             DepositSource::Lightning => lightning += 1,
         }
     }
-    let own_lightning = own
+    let placed = own
         .lightning
         .iter()
         .filter(|(session, amount)| counts(*session, *amount))
-        .count() as u64;
+        .count();
+    let unplaced = own
+        .lightning_unplaced
+        .iter()
+        .filter(|amount| **amount >= denomination)
+        .count();
+    let own_lightning = (placed + unplaced) as u64;
     on_chain + lightning.saturating_sub(own_lightning)
 }
 
@@ -177,20 +194,46 @@ mod tests {
             outpoints: ["dd:0".to_string()].into(),
             txids: ["cc".to_string()].into(),
             lightning: vec![(14, d), (14, d), (13, d)],
+            ..Own::default()
         };
         assert_eq!(estimate(&fixture(), 9, d, &everything), 0);
     }
 
     #[test]
+    fn a_repeated_outpoint_counts_once() {
+        let mut deposits = fixture();
+        deposits.push((13, on_chain(20_000, "cc")));
+        deposits.push((14, on_chain(20_000, "dd")));
+        assert_eq!(estimate(&deposits, 9, ubtc(10_000), &Own::default()), 3);
+        let rate = per_session(&deposits, 14, 5, ubtc(10_000), &Own::default());
+        assert!((rate - 0.6).abs() < 1e-9, "rate {rate}");
+    }
+
+    #[test]
+    fn an_own_receive_with_no_session_is_left_out_of_every_window() {
+        let d = ubtc(10_000);
+        let own = Own {
+            lightning_unplaced: vec![d, ubtc(500)],
+            ..Own::default()
+        };
+        assert_eq!(estimate(&fixture(), 9, d, &own), 2);
+        assert_eq!(estimate(&fixture(), 13, d, &own), 0);
+        let rate = per_session(&fixture(), 14, 5, d, &own);
+        assert!((rate - 0.4).abs() < 1e-9, "rate {rate}");
+    }
+
+    #[test]
     fn per_session_uses_the_recent_window() {
-        let deposits: Vec<_> = (0..600).map(|s| (s, on_chain(1_000, "ee"))).collect();
+        let deposits: Vec<_> = (0..600)
+            .map(|s| (s, on_chain(1_000, &format!("{s:x}"))))
+            .collect();
         let rate = per_session(&deposits, 599, 600, ubtc(1_000), &Own::default());
         assert!((rate - 1.0).abs() < 1e-9, "rate {rate}");
         // Only the newest 480 sessions count: one deposit per four sessions in
         // them, and every older session full.
         let sparse: Vec<_> = (0..600)
             .filter(|s| *s < 120 || s % 4 == 0)
-            .map(|s| (s, on_chain(1_000, "ee")))
+            .map(|s| (s, on_chain(1_000, &format!("{s:x}"))))
             .collect();
         let rate = per_session(&sparse, 599, 600, ubtc(1_000), &Own::default());
         assert!((rate - 0.25).abs() < 1e-9, "rate {rate}");

@@ -375,6 +375,11 @@ fn session_cursor_name(federation: &str) -> String {
     format!("anon:{federation}")
 }
 
+/// When the newest synced session of `federation` was written.
+fn session_synced_at_name(federation: &str) -> String {
+    format!("anon-at:{federation}")
+}
+
 /// How far a signed transaction has come. `Signed` is an operation still
 /// running: no server is known to have it. `Seen` went out and may yet be lost,
 /// so its coins stay signed away. `Stalled` is held by no server we can reach
@@ -1338,13 +1343,16 @@ impl Store {
         Ok(())
     }
 
-    /// The countable deposits of one session, and the cursor past it, in one
-    /// write. A session written again replaces what it held.
+    /// The countable deposits of one session, the cursor past it and `at`,
+    /// when it was synced, in one write. A session written again replaces what
+    /// it held. An outpoint already stored for another session, or earlier in
+    /// this one, is left out, so each is counted once.
     pub(crate) fn add_session(
         &self,
         federation: &str,
         session: u64,
         deposits: &[SessionDeposit],
+        at: Timestamp,
     ) -> Result<()> {
         let tx = begin(&self.conn)?;
         tx.execute(
@@ -1352,7 +1360,21 @@ impl Store {
             params![federation, to_db(session)],
         )
         .map_err(db_err)?;
-        for (position, deposit) in deposits.iter().enumerate() {
+        let mut position = 0i64;
+        for deposit in deposits {
+            if let Some(reference) = &deposit.reference {
+                let known: bool = tx
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM anon_deposits
+                         WHERE federation_id = ?1 AND reference = ?2)",
+                        params![federation, reference],
+                        |r| r.get(0),
+                    )
+                    .map_err(db_err)?;
+                if known {
+                    continue;
+                }
+            }
             tx.execute(
                 "INSERT INTO anon_deposits
                     (federation_id, session, position, source, amount_msat, reference)
@@ -1360,24 +1382,33 @@ impl Store {
                 params![
                     federation,
                     to_db(session),
-                    i64::try_from(position).unwrap_or(i64::MAX),
+                    position,
                     source_str(deposit.source),
                     to_db(deposit.amount.msat),
                     deposit.reference
                 ],
             )
             .map_err(db_err)?;
+            position += 1;
         }
-        tx.execute(
-            "INSERT INTO cursors (name, value) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-            params![
-                session_cursor_name(federation),
-                to_db(session.saturating_add(1))
-            ],
-        )
-        .map_err(db_err)?;
+        for (name, value) in [
+            (session_cursor_name(federation), session.saturating_add(1)),
+            (session_synced_at_name(federation), at),
+        ] {
+            tx.execute(
+                "INSERT INTO cursors (name, value) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                params![name, to_db(value)],
+            )
+            .map_err(db_err)?;
+        }
         tx.commit().map_err(db_err)
+    }
+
+    /// When the newest synced session of `federation` was written, which is
+    /// no earlier than when it ended.
+    pub(crate) fn session_synced_at(&self, federation: &str) -> Result<Option<Timestamp>> {
+        self.cursor(&session_synced_at_name(federation))
     }
 
     /// The deposits of `federation` in sessions strictly after `after`, by
@@ -2489,11 +2520,11 @@ mod tests {
             reference: None,
         };
         store
-            .add_session("f", 5, &[on_chain.clone(), lightning.clone()])
+            .add_session("f", 5, &[on_chain.clone(), lightning.clone()], 1)
             .unwrap();
-        store.add_session("f", 6, &[]).unwrap();
+        store.add_session("f", 6, &[], 2).unwrap();
         store
-            .add_session("g", 9, std::slice::from_ref(&on_chain))
+            .add_session("g", 9, std::slice::from_ref(&on_chain), 3)
             .unwrap();
         assert_eq!(store.session_cursor("f").unwrap(), Some(7));
         assert_eq!(store.session_cursor("g").unwrap(), Some(10));
@@ -2507,11 +2538,61 @@ mod tests {
         refuse(&store, "cursors");
         assert!(
             store
-                .add_session("f", 7, std::slice::from_ref(&on_chain))
+                .add_session("f", 7, std::slice::from_ref(&on_chain), 4)
                 .is_err()
         );
         assert_eq!(store.session_cursor("f").unwrap(), Some(7));
         assert_eq!(store.session_deposits("f", 6).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_repeated_outpoint_is_stored_once() {
+        let (_d, store) = open();
+        let deposit = |sat| SessionDeposit {
+            source: DepositSource::OnChain,
+            amount: Amount::from_sat(sat),
+            reference: Some("txid:1".into()),
+        };
+        let lightning = SessionDeposit {
+            source: DepositSource::Lightning,
+            amount: Amount::from_sat(5_000),
+            reference: None,
+        };
+        store
+            .add_session(
+                "f",
+                1,
+                &[
+                    deposit(100_000),
+                    deposit(100_000),
+                    lightning.clone(),
+                    lightning.clone(),
+                ],
+                10,
+            )
+            .unwrap();
+        store.add_session("f", 2, &[deposit(300_000)], 20).unwrap();
+        assert_eq!(
+            store.session_deposits("f", 0).unwrap(),
+            vec![
+                (1, deposit(100_000)),
+                (1, lightning.clone()),
+                (1, lightning.clone()),
+            ]
+        );
+        assert_eq!(store.session_cursor("f").unwrap(), Some(3));
+        // Written again, a session is replaced, and the outpoint stays its own.
+        store
+            .add_session("f", 1, &[deposit(100_000), lightning.clone()], 30)
+            .unwrap();
+        store.add_session("g", 1, &[deposit(100_000)], 40).unwrap();
+        assert_eq!(
+            store.session_deposits("f", 0).unwrap(),
+            vec![(1, deposit(100_000)), (1, lightning)]
+        );
+        assert_eq!(store.session_deposits("g", 0).unwrap().len(), 1);
+        assert_eq!(store.session_synced_at("f").unwrap(), Some(30));
+        assert_eq!(store.session_synced_at("h").unwrap(), None);
     }
 
     #[test]

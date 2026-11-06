@@ -63,6 +63,10 @@ async fn deposit_of(
         .into_iter()
         .find(|info| info.index == index)
         .ok_or_else(|| unreadable(session, "a deposit's value", "no such output"))?;
+    if info.outpoint.is_none() {
+        // Counted, but it can be neither recognised as ours nor deduplicated.
+        eprintln!("fedimix: deposit output {index} of session {session} names no outpoint");
+    }
     Ok(Some(on_chain(info.value, info.outpoint)))
 }
 
