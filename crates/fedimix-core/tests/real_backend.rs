@@ -9442,3 +9442,48 @@ async fn fast_exits_are_refused_on_bitcoin() {
         ))
     );
 }
+
+/// Final review I1: a v1 fee quote shows its address to every guardian, so
+/// no quote of an exit, the scheduler's, a preview's or the start's, may
+/// name a Saving address. Only the withdrawal pays one.
+#[tokio::test]
+async fn exit_fee_quotes_never_show_a_saving_address() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    saving.harness.first.set_balance(mbtc(70));
+    saving.harness.first.set_withdraw_fee(EXIT_FEE);
+    let backend = saving.joined_with(SOFTWARE).await;
+    wait_queue(&*backend, &[mbtc(20)]).await;
+    let item = item_of(&*backend, mbtc(20)).await;
+    // The scheduler quotes while the item waits out its minimum time.
+    tick_until(&backend, &item, Some(fedimix_core::QueueItemStatus::Queued)).await;
+    wait_until("the scheduler's quote", || async {
+        tick(&backend).await;
+        !saving.harness.first.quoted_addresses().is_empty()
+    })
+    .await;
+    backend.set_settings(exit_settings()).await.unwrap();
+    let preview = backend.prepare_exit(item.clone()).await.unwrap();
+    backend.exit_now(preview.id).await.unwrap();
+    wait_withdrawals(&saving, 1).await;
+
+    let paid = saving.harness.first.withdrawn()[0].address.clone();
+    let next = backend.receive(on_chain()).await.unwrap().payload;
+    let quoted = saving.harness.first.quoted_addresses();
+    assert!(quoted.len() >= 3, "{quoted:?}");
+    for address in &quoted {
+        assert_ne!(*address, paid, "the exit's own address");
+        assert_ne!(*address, next, "Saving's next address");
+        assert!(
+            !exit_addresses_of(&saving.harness, &item).contains(address),
+            "{address}"
+        );
+    }
+    // One stand-in of Saving's script type for every quote.
+    assert!(quoted.iter().all(|address| *address == quoted[0]));
+    assert!(
+        quoted[0].starts_with("bcrt1q") && quoted[0].len() == 44,
+        "{}",
+        quoted[0]
+    );
+    backend.shutdown().await.unwrap();
+}

@@ -128,6 +128,8 @@ pub struct FakeClient {
     invoice_held: watch::Sender<bool>,
     invoice_calls: AtomicU32,
     quote_calls: AtomicU32,
+    /// The address of every `withdraw_quote`, in order.
+    quoted: Mutex<Vec<String>>,
     /// While set, `pay_invoice` hangs before it submits anything.
     pay_held: watch::Sender<bool>,
     pay_calls: AtomicU32,
@@ -178,6 +180,7 @@ impl FakeClient {
             invoice_held: watch::Sender::new(false),
             invoice_calls: AtomicU32::new(0),
             quote_calls: AtomicU32::new(0),
+            quoted: Mutex::default(),
             pay_held: watch::Sender::new(false),
             pay_calls: AtomicU32::new(0),
             withdraw_held: watch::Sender::new(false),
@@ -274,6 +277,11 @@ impl FakeClient {
     }
 
     /// Errors the next `lightning_quote` or `withdraw_quote`.
+    /// The addresses `withdraw_quote` was asked about, failed calls included.
+    pub fn quoted_addresses(&self) -> Vec<String> {
+        self.quoted.lock().unwrap().clone()
+    }
+
     /// Calls of `withdraw_quote`, failed ones included.
     pub fn quote_calls(&self) -> u32 {
         self.quote_calls.load(Ordering::SeqCst)
@@ -531,6 +539,7 @@ impl FederationClient for FakeClient {
 
     async fn withdraw_quote(&self, address: &str, amount: SendAmount) -> Result<WithdrawQuote> {
         self.quote_calls.fetch_add(1, Ordering::SeqCst);
+        self.quoted.lock().unwrap().push(address.to_string());
         Self::take_error(&self.quote_errors)?;
         let fee = *self.withdraw_fee.lock().unwrap();
         let amount = match amount {

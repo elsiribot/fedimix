@@ -32,6 +32,24 @@ const UNKNOWN_OUTCOME: &str = "Fedimix cannot tell whether this exit was sent. I
 const UNEXPECTED_QUOTE: &str =
     "The federation quoted a different withdrawal than the exit asked for.";
 
+/// Where every fee quote of an exit goes: a P2WPKH address nobody holds,
+/// of the script type of Saving's addresses, so the fee is the same. A v1
+/// quote shows its address to every guardian; only the withdrawal itself
+/// names the Saving address it pays.
+pub(super) fn quote_address(network: Network) -> Result<String> {
+    use bitcoin::hashes::{Hash, hash160};
+    let network = match network {
+        Network::Bitcoin => bitcoin::Network::Bitcoin,
+        Network::Signet => bitcoin::Network::Signet,
+        Network::Regtest => bitcoin::Network::Regtest,
+    };
+    let hash = hash160::Hash::hash(b"fedimix exit fee quote").to_byte_array();
+    let script = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(hash));
+    bitcoin::Address::from_script(&script, network)
+        .map(|address| address.to_string())
+        .map_err(|_| FedimixError::Internal("Fedimix could not make an address to quote.".into()))
+}
+
 /// An exit preview that can still be confirmed.
 pub(super) struct HeldExit {
     item_id: String,
@@ -84,15 +102,16 @@ impl Core {
         self.connected(federation)
     }
 
-    /// What exiting `item_id` now costs. The quote goes to the address Saving
-    /// would hand out next, which it does not hand out: the exit reveals its
+    /// What exiting `item_id` now costs. The quote goes to
+    /// [`quote_address`], never to a Saving address: the exit reveals its
     /// own at confirmation. The fee guard, the minimum time and the spacing
     /// apply to automatic exits only.
     pub(super) async fn prepare_exit(&self, item_id: &str) -> Result<ExitPreview> {
         let item = self.queued_item(item_id)?;
         let federation = &item.federation_id;
         let client = self.exit_client(federation)?;
-        let address = self.scanned_wallet()?.peek_receive_address()?;
+        self.scanned_wallet()?;
+        let address = quote_address(self.config.network)?;
         let exact = SendAmount::Exact(item.denomination);
         let quote = client.withdraw_quote(&address, exact).await?;
         if quote.amount != item.denomination {
@@ -152,14 +171,21 @@ impl Core {
         let wallet = self.scanned_wallet()?;
         // Revealed, and written, before anything can pay it: never reused.
         let address = wallet.next_receive_address()?;
+        // Quoted again to the stand-in: only the withdrawal names `address`.
+        let stand_in = quote_address(self.config.network)?;
         let exact = SendAmount::Exact(item.denomination);
-        let fresh = client.withdraw_quote(&address, exact).await?;
+        let fresh = client.withdraw_quote(&stand_in, exact).await?;
         if fresh.fee > quote.fee {
             return Err(FedimixError::PreviewExpired);
         }
-        if fresh.amount != item.denomination || fresh.address != address {
+        if fresh.amount != item.denomination || fresh.address != stand_in {
             return Err(FedimixError::Internal(UNEXPECTED_QUOTE.into()));
         }
+        // The fee depends only on the output's script type, which is the same.
+        let fresh = WithdrawQuote {
+            address: address.clone(),
+            ..fresh
+        };
         let needed = fresh.amount.checked_add(fresh.fee).ok_or_else(|| {
             FedimixError::Internal("The federation's fee is too large to add up.".into())
         })?;

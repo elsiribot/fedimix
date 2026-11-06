@@ -13,6 +13,7 @@ use std::time::Duration;
 use futures::FutureExt as _;
 use tokio::time::MissedTickBehavior;
 
+use super::exit::quote_address;
 use super::saving::stopping;
 use super::{Core, Gate, held};
 use crate::api::*;
@@ -339,8 +340,8 @@ impl Core {
     }
 
     /// Asks again for each denomination of `items` whose quote is missing
-    /// or old. The quote goes to the address Saving would hand out next,
-    /// which it does not hand out; an exit asks again for its own address.
+    /// or old. The quote goes to [`quote_address`], never to a Saving
+    /// address, as a v1 quote shows it to every guardian.
     async fn refresh_quotes(
         &self,
         federation: &str,
@@ -351,17 +352,17 @@ impl Core {
         let mut denominations: Vec<Amount> = items.iter().map(|item| item.denomination).collect();
         denominations.sort_unstable_by_key(|amount| amount.msat);
         denominations.dedup();
+        let address = match quote_address(self.config.network) {
+            Ok(address) => address,
+            Err(e) => {
+                eprintln!("fedimix: an address to quote exits to: {e}");
+                return;
+            }
+        };
         for denomination in denominations {
             if self.fresh_quote(federation, denomination, now).is_some() {
                 continue;
             }
-            let address = match self.scanned_wallet().and_then(|w| w.peek_receive_address()) {
-                Ok(address) => address,
-                Err(e) => {
-                    eprintln!("fedimix: an address to quote exits to: {e}");
-                    return;
-                }
-            };
             let exact = SendAmount::Exact(denomination);
             match client.withdraw_quote(&address, exact).await {
                 Ok(quote) if quote.amount == denomination => {
