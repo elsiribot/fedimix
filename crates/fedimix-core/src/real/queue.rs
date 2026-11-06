@@ -147,6 +147,13 @@ impl Counting {
         anonymity::estimate(&self.deposits, origin.session, denomination, &self.own)
     }
 
+    /// How many sessions [`Self::per_session`] measured its rate over.
+    fn window(&self) -> u64 {
+        self.synced
+            .min(FEDERATION_WINDOW_SESSIONS)
+            .min(self.head.saturating_add(1))
+    }
+
     fn per_session(&self, denomination: Amount) -> f64 {
         anonymity::per_session(
             &self.deposits,
@@ -564,6 +571,7 @@ impl Core {
                     counting.per_session(item.denomination),
                     expected,
                     session_secs,
+                    counting.window(),
                 );
                 attainable.push(u64::from(reachable));
                 waits.push(expected);

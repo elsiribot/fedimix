@@ -204,14 +204,18 @@ pub(crate) fn not_before(
 }
 
 /// `current` plus the deposits expected in `expected_secs` at `per_session`
-/// deposits per session of `session_secs`, rounded to the nearest.
+/// deposits per session of `session_secs`, rounded to the nearest. A rate
+/// measured over `window` sessions says nothing about longer: the
+/// projection covers at most `window` sessions, so it never adds more than
+/// were seen in them.
 pub(crate) fn attainable(
     current: u32,
     per_session: f64,
     expected_secs: u64,
     session_secs: u64,
+    window: u64,
 ) -> u32 {
-    let sessions = expected_secs as f64 / session_secs.max(1) as f64;
+    let sessions = (expected_secs as f64 / session_secs.max(1) as f64).min(window as f64);
     let more = (per_session.max(0.0) * sessions).round();
     // `as` saturates.
     current.saturating_add(more as u32)
@@ -443,9 +447,19 @@ mod tests {
 
     #[test]
     fn attainable_adds_the_deposits_expected_meanwhile() {
-        assert_eq!(attainable(10, 0.2, 3_600, 180), 14);
+        assert_eq!(attainable(10, 0.2, 3_600, 180, 480), 14);
         // 0.25 × 2 sessions = 0.5 more, rounded half away from zero.
-        assert_eq!(attainable(10, 0.25, 360, 180), 11);
+        assert_eq!(attainable(10, 0.25, 360, 180, 480), 11);
+    }
+
+    /// Four deposits in the one session synced so far, over a day of
+    /// minimum time (480 sessions of 180 s): not 1_920 more, as a day of
+    /// such sessions was never seen, but at most the four that were.
+    #[test]
+    fn attainable_never_projects_past_the_sessions_it_measured() {
+        assert_eq!(attainable(0, 4.0, 86_520, 180, 1), 4);
+        assert_eq!(attainable(0, 0.5, 86_400, 180, 20), 10);
+        assert_eq!(attainable(3, 1.0, 86_400, 180, 0), 3);
     }
 
     #[test]

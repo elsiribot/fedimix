@@ -17,6 +17,8 @@ Phases 3 (Saving) and 4 (automatic private exits) are complete. `fedimix` runs S
 - The GTK half of 6c91584 (Saving's scanning state, `open_again`, Receive reload) had no reviewer: only its gates (clippy, tests, real-UI runs) checked it.
 - Real pointer input, dark theme, accessibility, a real desktop (sway only).
 
+Final review fixes: exit fee quotes go to a fixed stand-in address, never a Saving one (v1 shows quote addresses to every guardian); the queue no longer oscillates while a send has no operation; the attainable estimate never projects past the sessions its rate was measured on.
+
 Next: Phase 5 (cover traffic).
 
 ## Needs user
