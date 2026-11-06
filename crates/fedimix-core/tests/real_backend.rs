@@ -8787,3 +8787,80 @@ async fn a_coin_landing_during_a_scan_is_labelled_after_it() {
     .await;
     backend.shutdown().await.unwrap();
 }
+
+const EXIT_UNKNOWN: &str = "Fedimix cannot tell whether this exit was sent. If it was, it lands in Saving; if not, the money stays in Spending.";
+const EXIT_LOST_RECORD: &str = "Fedimix lost its record of this exit and cannot tell whether it was sent. If it was, it lands in Saving; if not, the money stays in Spending.";
+
+/// v2 fails a withdrawal it had accepted, with no transaction: the money
+/// may have left, so the item must not go out again, and its coin still
+/// lands it.
+#[tokio::test]
+async fn an_exit_whose_outcome_is_unknown_is_not_requeued() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let events = backend.subscribe();
+    let (_, id) = exit_item(&backend, &item).await;
+    let op = operation_of(&saving.harness.first, &id).await;
+    saving.harness.first.push_update(
+        &op,
+        WatchUpdate::Unknown {
+            reason: "The federation accepted this withdrawal but reported no transaction, so the money may have left the wallet.".into(),
+        },
+    );
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(states.last(), Some(&failed_with(EXIT_UNKNOWN)));
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+    );
+    assert!(matches!(
+        backend.prepare_exit(item.clone()).await,
+        Err(FedimixError::UnknownItem(_))
+    ));
+    assert_eq!(saving.harness.first.withdraw_calls(), 1);
+
+    let address = saving.harness.first.withdrawn()[0].address.clone();
+    saving
+        .chain
+        .push_sync(confirmed(payment(&address, 1_000_000, 8), 2));
+    sync_saving_now(&backend);
+    wait_event(
+        &events,
+        &Event::Notification(Notice::ExitLanded { amount: mbtc(10) }),
+    )
+    .await;
+    assert_eq!(status_of(&*backend, &item).await, None);
+    backend.shutdown().await.unwrap();
+}
+
+/// A submitted exit not yet settled when the client database is lost: the
+/// rebuilt client cannot follow it, so it ends unknown rather than requeue.
+#[tokio::test]
+async fn a_lost_database_with_a_submitted_exit_does_not_requeue() {
+    let saving = SavingHarness::new();
+    let backend = saving.exiting(mbtc(60), &[mbtc(10)]).await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let (_, id) = exit_item(&backend, &item).await;
+    let op = operation_of(&saving.harness.first, &id).await;
+    wait_operation_on_disk(&saving.harness, &id, &op).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    let port = &saving.harness.port;
+    port.set_open_error(Some(FedimixError::UnknownItem("one".into())));
+    port.set_recover_held(true);
+    let backend = saving.open().await.unwrap();
+    let events = backend.subscribe();
+    let (states, _) = run_of_kind(&events, &id, OperationKind::Exit).await;
+    assert_eq!(states, [failed_with(EXIT_LOST_RECORD)]);
+    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    assert_eq!(
+        status_of(&*backend, &item).await,
+        Some(fedimix_core::QueueItemStatus::Withdrawing { txid: None })
+    );
+    assert_eq!(saving.harness.first.withdraw_calls(), 1);
+    port.set_recover_held(false);
+    backend.shutdown().await.unwrap();
+}

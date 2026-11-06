@@ -310,7 +310,10 @@ impl Core {
             }),
             // These name no amount, so they can only update a row. A deposit
             // watch that has none saw no deposit.
-            WatchUpdate::Expired | WatchUpdate::Refunded | WatchUpdate::Failed { .. } => {
+            WatchUpdate::Expired
+            | WatchUpdate::Refunded
+            | WatchUpdate::Failed { .. }
+            | WatchUpdate::Unknown { .. } => {
                 let row =
                     self.store()
                         .history_item(WalletKind::Spending, Some(federation), &watch.id)?;

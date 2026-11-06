@@ -204,19 +204,33 @@ impl Core {
     /// What `federation`'s exits with no operation, which no call is
     /// submitting, may still take: a crash between an exit's start and its
     /// submission leaves such an exit, whose money the balance may still
-    /// hold until the resolver settles it. The queue must not grow onto it.
+    /// hold until the resolver settles it. So may an exit whose outcome is
+    /// unknown, which stays on its way with no watch until it lands. The
+    /// queue must not grow onto either.
     fn unresolved_exits(&self, store: &Store, federation: &str) -> Result<Amount> {
         let submitting = self.submitting.borrow();
         let mut taking = Amount::ZERO;
+        let mut open = std::collections::HashSet::new();
         for (watch, operation) in store.sends()? {
-            if watch.kind != WatchKind::Exit
-                || watch.federation_id != federation
-                || operation.is_some()
-                || submitting.contains_key(&watch.id)
-            {
+            if watch.kind != WatchKind::Exit || watch.federation_id != federation {
+                continue;
+            }
+            open.insert(watch.id.clone());
+            if operation.is_some() || submitting.contains_key(&watch.id) {
                 continue;
             }
             if let Some(item) = store.exit_by_intent(&watch.id)? {
+                let fee = item.fee.unwrap_or(Amount::ZERO);
+                taking = sum([taking, item.denomination, fee]);
+            }
+        }
+        for item in store.exit_items(Some(federation))? {
+            let lost = item.state == ExitState::Withdrawing
+                && item.txid.is_none()
+                && item.intent.as_ref().is_some_and(|intent| {
+                    !open.contains(intent) && !submitting.contains_key(intent)
+                });
+            if lost {
                 let fee = item.fee.unwrap_or(Amount::ZERO);
                 taking = sum([taking, item.denomination, fee]);
             }

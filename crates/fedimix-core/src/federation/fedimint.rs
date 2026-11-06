@@ -71,6 +71,12 @@ pub(super) fn failed(reason: &str) -> WatchUpdate {
     }
 }
 
+pub(super) fn unknown(reason: &str) -> WatchUpdate {
+    WatchUpdate::Unknown {
+        reason: reason.to_string(),
+    }
+}
+
 pub(super) fn amount_of(amount: fedimint_core::Amount) -> Amount {
     Amount { msat: amount.msats }
 }

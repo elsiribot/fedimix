@@ -432,7 +432,9 @@ impl Core {
             }
             WatchUpdate::Refunded => (HistoryStatus::Refunded, failed_with(CAME_BACK)),
             WatchUpdate::Expired => (HistoryStatus::Failed, failed_with(EXPIRED)),
-            WatchUpdate::Failed { reason } => (HistoryStatus::Failed, failed_with(reason)),
+            WatchUpdate::Failed { reason } | WatchUpdate::Unknown { reason } => {
+                (HistoryStatus::Failed, failed_with(reason))
+            }
         };
         self.finish_send(watch, status, state)
     }

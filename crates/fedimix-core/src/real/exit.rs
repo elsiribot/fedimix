@@ -28,6 +28,7 @@ use crate::store::{ExitItem, ExitStart, ExitState, HistoryWrite, Watch, WatchKin
 const SET_UP_FIRST: &str = "Set up Saving first.";
 const NEVER_SENT: &str = "This exit was never sent, so no money left Spending.";
 const LOST_RECORD: &str = "Fedimix lost its record of this exit and cannot tell whether it was sent. If it was, it lands in Saving; if not, the money stays in Spending.";
+const UNKNOWN_OUTCOME: &str = "Fedimix cannot tell whether this exit was sent. If it was, it lands in Saving; if not, the money stays in Spending.";
 const UNEXPECTED_QUOTE: &str =
     "The federation quoted a different withdrawal than the exit asked for.";
 
@@ -307,8 +308,27 @@ impl Core {
             WatchUpdate::Refunded => failed_with(CAME_BACK),
             WatchUpdate::Expired => failed_with(EXPIRED),
             WatchUpdate::Failed { reason } => failed_with(reason),
+            WatchUpdate::Unknown { reason } => {
+                eprintln!("fedimix: exit {} may have left: {reason}", watch.id);
+                return self.lose_exit(watch, UNKNOWN_OUTCOME);
+            }
         };
         self.fail_exit(watch, state)
+    }
+
+    /// The exit under `watch` may have taken its money: its row ends with
+    /// `sentence`, and its item stays on its way, never to go out again by
+    /// itself. If it went out, its coin lands it; if not, the money is still
+    /// in the balance, and the queue books it anew.
+    fn lose_exit(&self, watch: &Watch, sentence: &str) -> Result<()> {
+        let failed = |row| HistoryItem {
+            status: HistoryStatus::Failed,
+            ..row
+        };
+        self.finish_row(watch, failed, failed_with(sentence))?;
+        self.events.emit(&Event::QueueChanged);
+        self.events.emit(&Event::SavingChanged);
+        Ok(())
     }
 
     /// The exits of `federation` with no operation that no call is working on.
@@ -316,17 +336,19 @@ impl Core {
         self.unsent_where(federation, is_exit)
     }
 
-    /// Before a client database is rebuilt: an exit with no operation can no
-    /// longer be looked up, so its row ends, and its item stays on its way
-    /// rather than go out again. If it was sent, its coin lands it; if not,
-    /// the money is still in the balance, and the queue books it anew.
+    /// Before a client database is rebuilt: an exit not yet settled, with an
+    /// operation or not, can no longer be looked up or followed, so its row
+    /// ends, and its item stays on its way rather than go out again.
     pub(super) fn finish_lost_exits(&self, federation: &str) -> Result<()> {
-        for watch in self.unsent_exits(federation) {
-            let failed = |row| HistoryItem {
-                status: HistoryStatus::Failed,
-                ..row
-            };
-            self.finish_row(&watch, failed, failed_with(LOST_RECORD))?;
+        let open = self.store().sends()?;
+        let submitting = self.submitting.borrow().clone();
+        for (watch, _) in open {
+            if is_exit(watch.kind)
+                && watch.federation_id == federation
+                && !submitting.contains_key(&watch.id)
+            {
+                self.lose_exit(&watch, LOST_RECORD)?;
+            }
         }
         Ok(())
     }

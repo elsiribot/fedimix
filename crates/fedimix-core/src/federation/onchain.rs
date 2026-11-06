@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 use super::fedimint::{
     INTENT_KEY, NO_RECORD, amount_of, failed, quote_error, read, sat_amount, settled_send,
-    submit_error, total_of, whole_sats,
+    submit_error, total_of, unknown, whole_sats,
 };
 use super::port::{DepositEvent, WatchUpdate, WithdrawQuote, WithdrawTerms};
 use crate::api::{Amount, NoteBucket, SendAmount};
@@ -42,6 +42,8 @@ use crate::error::{FedimixError, Result};
 const TOO_SMALL: &str =
     "This deposit was too small to cover the federation's fee, so it was not credited.";
 const CANNOT_SEND: &str = "The federation cannot send that much on chain right now.";
+const NOT_ACCEPTED: &str = "The federation did not accept the withdrawal.";
+const NO_OUTCOME: &str = "The federation stopped reporting this withdrawal before it finished, so the money may have left the wallet.";
 const NO_TXID: &str = "The federation accepted this withdrawal but reported no transaction, so the money may have left the wallet.";
 const NOT_CLAIMED: &str = "The federation did not credit this deposit.";
 const NO_FEERATE: &str =
@@ -427,7 +429,7 @@ async fn withdraw_v1(
     op: OperationId,
 ) -> WatchUpdate {
     let Ok(states) = w.subscribe_withdraw_updates(op).await else {
-        return failed(NO_RECORD);
+        return unknown(NO_RECORD);
     };
     let mut states = states.into_stream();
     while let Some(state) = states.next().await {
@@ -437,10 +439,11 @@ async fn withdraw_v1(
                 let details = withdrawn_v1(client, op).await;
                 return settled_send(details, Some(txid.to_string()));
             }
-            WithdrawState::Failed(_) => break,
+            WithdrawState::Failed(_) => return failed(NOT_ACCEPTED),
         }
     }
-    failed("The federation did not accept the withdrawal.")
+    // Ended with no final state: it may still go out.
+    unknown(NO_OUTCOME)
 }
 
 async fn withdrawn_v1(client: &Client, op: OperationId) -> Option<(Amount, Amount)> {
@@ -462,11 +465,10 @@ async fn withdraw_v2(
         Ok(FinalSendOperationState::Success(txid)) => {
             settled_send(withdrawn_v2(client, op).await, Some(txid.to_string()))
         }
-        Ok(FinalSendOperationState::Aborted) => {
-            failed("The federation did not accept the withdrawal.")
-        }
-        Ok(FinalSendOperationState::Failure) => failed(NO_TXID),
-        Err(_) => failed(NO_RECORD),
+        Ok(FinalSendOperationState::Aborted) => failed(NOT_ACCEPTED),
+        // Only after the federation accepted the transaction.
+        Ok(FinalSendOperationState::Failure) => unknown(NO_TXID),
+        Err(_) => unknown(NO_RECORD),
     }
 }
 

@@ -102,7 +102,13 @@ pub enum WatchUpdate {
     },
     Refunded,
     Expired,
+    /// The operation took no money: the federation rejected it.
     Failed {
+        reason: String,
+    },
+    /// The outcome cannot be told, so the money may have left: the client has
+    /// no record of the operation, or it ended without saying how.
+    Unknown {
         reason: String,
     },
 }
