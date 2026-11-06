@@ -132,9 +132,55 @@ with care: Saving is set up once per data folder, and Fedimix cannot yet switch
 it to a hardware wallet. To move later, send Saving's coins from Saving to an
 address of the hardware wallet.
 
+## Exits: Spending to Saving
+
+Spending keeps a target (default 0.05 BTC). Money above it is booked into a
+queue in denominations of the 1-2-5 series, from 1 BTC down to 0.001 BTC
+(Spending's "moving to Saving" link opens the queue). Each queued note leaves
+for Saving's next address on its own, or early by hand.
+
+- Anonymity estimate, two numbers. A note's own estimate counts other
+  people's deposits of at least its denomination in every synced session after
+  its own deposit (no window). Our own on-chain deposits are left out and
+  our own Lightning receives are subtracted. A queue row reads "current to
+  expected": the expected figure adds the deposits the federation's recent
+  rate predicts before the note's exit. A federation's estimate, shown in
+  Settings as "anon ~N" ("Most private" on the strictly largest), counts
+  deposits of at least 0.001 BTC in its newest 480 synced sessions. Neither
+  is a guarantee: they count deposits the exit could be mistaken for.
+- Wait: a note must first sit 24 h in the pool (Settings, "Minimum hours in
+  pool"). Then its exit time is drawn from an exponential distribution (a
+  Poisson process) whose mean is `3 h x (anonymity target / estimate)^2`,
+  never below 3 h and never above 30 days (the estimate counts as at least 1).
+  The default target is 50: an estimate of 50 or more waits 3 h on average,
+  25 waits 12 h, 5 waits 300 h (12.5 days), and 3 or fewer the 30-day cap.
+  One automatic exit per federation at most, and at least 1 h apart.
+- Nothing leaves while offline, within the grace period (default 10 min after
+  connecting), when the fee exceeds the fee guard (default 2% of the note), or
+  when Spending's remaining balance cannot pay the fee. The queue row says
+  which.
+- Early exit: "Exit now (lower privacy)" shows the fee and the anonymity set
+  the note leaves with. The fee guard does not apply; the grace period does.
+- Labels: Saving's coins read "From Spending". An early exit is tagged "early
+  exit"; an automatic one carries its "anon set N" at the time it left. Both show
+  on the Coins page and a coin's page.
+- A withdrawal whose outcome cannot be told stays "outcome unknown"; the app
+  cannot clear it yet.
+
+On the real backend the local devimint has no other depositors, so the
+estimate reads 0 in every real run here (the queue and exits still work). Try
+them on regtest with fast timing (a testing build; refused on bitcoin):
+
+```sh
+just test-real-ui                 # includes scripts/real-flows/exits.drive
+just record-exits                 # records them to ~/fedimix-demo/phase4/real-exits/exits.mp4
+just record-exits-demo            # the simulated exits on the demo backend (phase4/exits-demo.mp4)
+just demo                         # the simulated queue; or: cargo run -p fedimix-gtk -- --demo --demo-scenario exits
+```
+
 ## Not yet
 
-- Exits and cover traffic: their controls are hidden in the real wallet.
+- Cover traffic: its controls are hidden in the real wallet.
 - Trezor.
 - A proxy for federation traffic: fedimint has no SOCKS5 support, so setting a
   proxy keeps federations offline instead of connecting directly.
