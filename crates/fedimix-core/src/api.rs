@@ -230,6 +230,10 @@ pub enum HistoryStatus {
     /// A Saving payment on the network beside another of ours that spends a
     /// coin of it: at most one of the two confirms. Never stored.
     Contested,
+    /// An exit that may or may not have gone out: the federation stopped
+    /// reporting it, or Fedimix lost its record. Turns `Complete` if its
+    /// coin lands in Saving.
+    OutcomeUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

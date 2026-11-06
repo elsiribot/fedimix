@@ -8013,17 +8013,36 @@ async fn in_flight_counts_exits_until_they_confirm() {
         [FIRST_FEDERATION],
     )
     .unwrap();
+    raw.execute(
+        "INSERT INTO watches (id, federation_id, kind, created_at, finished, operation)
+         VALUES ('exit-leaving', ?1, 'exit', 0, 0, 'op-leaving')",
+        [FIRST_FEDERATION],
+    )
+    .unwrap();
     assert_eq!(backend.saving_state().await.unwrap().in_flight, mbtc(10));
+    let status = |queue: &fedimix_core::QueueState| {
+        let leaving = queue.items.iter().find(|item| item.id == "leaving");
+        leaving.unwrap().status.clone()
+    };
     let queue = backend.queue_state().await.unwrap();
-    let leaving = queue
-        .items
-        .iter()
-        .find(|item| item.id == "leaving")
-        .unwrap();
-    // No watch follows it, so it reads as an exit whose outcome is unknown;
-    // it is on its way all the same.
     assert_eq!(
-        leaving.status,
+        status(&queue),
+        fedimix_core::QueueItemStatus::Withdrawing { txid: None }
+    );
+    // Once nothing follows it, its outcome is unknown: it is no longer
+    // counted as depositing.
+    raw.execute(
+        "UPDATE watches SET finished = 1 WHERE id = 'exit-leaving'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        Amount::ZERO
+    );
+    let queue = backend.queue_state().await.unwrap();
+    assert_eq!(
+        status(&queue),
         fedimix_core::QueueItemStatus::OutcomeUnknown
     );
     // Only what is still queued is moving: an exit on its way has left.
@@ -8838,10 +8857,15 @@ async fn an_exit_whose_outcome_is_unknown_is_not_requeued() {
     );
     let (states, _) = run_of_kind(&events, &id, OperationKind::Exit).await;
     assert_eq!(states.last(), Some(&failed_with(EXIT_UNKNOWN)));
-    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    wait_status(&*backend, &id, HistoryStatus::OutcomeUnknown).await;
     assert_eq!(
         status_of(&*backend, &item).await,
         Some(fedimix_core::QueueItemStatus::OutcomeUnknown)
+    );
+    assert_eq!(
+        backend.saving_state().await.unwrap().in_flight,
+        Amount::ZERO,
+        "not counted as depositing"
     );
     assert!(matches!(
         backend.prepare_exit(item.clone()).await,
@@ -8850,9 +8874,9 @@ async fn an_exit_whose_outcome_is_unknown_is_not_requeued() {
     assert_eq!(saving.harness.first.withdraw_calls(), 1);
 
     let address = saving.harness.first.withdrawn()[0].address.clone();
-    saving
-        .chain
-        .push_sync(confirmed(payment(&address, 1_000_000, 8), 2));
+    let tx = payment(&address, 1_000_000, 8);
+    let txid = tx.compute_txid().to_string();
+    saving.chain.push_sync(confirmed(tx, 2));
     sync_saving_now(&backend);
     wait_event(
         &events,
@@ -8860,6 +8884,9 @@ async fn an_exit_whose_outcome_is_unknown_is_not_requeued() {
     )
     .await;
     assert_eq!(status_of(&*backend, &item).await, None);
+    // It went out after all: its row says so.
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, &id).txid, Some(txid));
     backend.shutdown().await.unwrap();
 }
 
@@ -8883,7 +8910,7 @@ async fn a_lost_database_with_a_submitted_exit_does_not_requeue() {
     let events = backend.subscribe();
     let (states, _) = run_of_kind(&events, &id, OperationKind::Exit).await;
     assert_eq!(states, [failed_with(EXIT_LOST_RECORD)]);
-    wait_status(&*backend, &id, HistoryStatus::Failed).await;
+    wait_status(&*backend, &id, HistoryStatus::OutcomeUnknown).await;
     assert_eq!(
         status_of(&*backend, &item).await,
         Some(fedimix_core::QueueItemStatus::OutcomeUnknown)
@@ -9300,4 +9327,118 @@ async fn offline_pauses_the_scheduler() {
     tick(&backend).await;
     wait_withdrawals(&saving, 1).await;
     backend.shutdown().await.unwrap();
+}
+
+/// Review I1 of Task 7: an exit whose outcome is unknown may have gone out,
+/// so it spaces the next automatic exit as one that did.
+#[tokio::test]
+async fn an_unknown_exit_still_spaces_the_next() {
+    let saving = SavingHarness::scheduled(draws(&[0.0]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(80), auto_settings(1), &[mbtc(20), mbtc(10)])
+        .await;
+    let start = saving.now();
+    let events = backend.subscribe();
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
+    let id = rows(&*backend)
+        .await
+        .into_iter()
+        .find(|row| matches!(row.kind, HistoryKind::ToSaving { .. }))
+        .unwrap()
+        .id;
+    let op = operation_of(&saving.harness.first, &id).await;
+    saving.harness.first.push_update(
+        &op,
+        WatchUpdate::Unknown {
+            reason: "No record.".into(),
+        },
+    );
+    run_of_kind(&events, &id, OperationKind::Exit).await;
+    wait_status(&*backend, &id, HistoryStatus::OutcomeUnknown).await;
+    let left = if saving.harness.first.withdrawn()[0].amount == mbtc(20) {
+        item_of(&*backend, mbtc(10)).await
+    } else {
+        item_of(&*backend, mbtc(20)).await
+    };
+
+    tick_until(&backend, &left, scheduled_at(start + 3_600)).await;
+    saving.set_time(start + 3_599);
+    tick(&backend).await;
+    assert_eq!(saving.harness.first.withdraw_calls(), 1);
+    saving.set_time(start + 3_600);
+    tick(&backend).await;
+    wait_withdrawals(&saving, 2).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// A start that fails after revealing its address waits longer each time,
+/// so a federation that keeps failing does not use up an address a tick.
+#[tokio::test]
+async fn a_failing_exit_backs_off() {
+    // Due within the fee quote's 600 s, so only the start asks for quotes.
+    let saving = SavingHarness::scheduled(draws(&[0.03]), SCHEDULED);
+    let backend = saving
+        .scheduling(mbtc(60), auto_settings(1), &[mbtc(10)])
+        .await;
+    let item = item_of(&*backend, mbtc(10)).await;
+    let client = &saving.harness.first;
+    let start = saving.now();
+    let due = start + delay(10_800, 0.03);
+    assert!(due + 180 < start + 600);
+    tick_until(&backend, &item, scheduled_at(due)).await;
+    let quoted = client.quote_calls();
+
+    // The start's own quote fails, twice.
+    let refused = || FedimixError::Internal("The federation is busy.".into());
+    client.fail_next_quote(refused());
+    client.fail_next_quote(refused());
+    saving.set_time(due);
+    tick(&backend).await;
+    assert_eq!(client.quote_calls(), quoted + 1);
+    tick(&backend).await;
+    assert_eq!(
+        client.quote_calls(),
+        quoted + 1,
+        "waits before trying again"
+    );
+
+    saving.set_time(due + 60);
+    tick(&backend).await;
+    assert_eq!(client.quote_calls(), quoted + 2);
+    saving.set_time(due + 179);
+    tick(&backend).await;
+    assert_eq!(client.quote_calls(), quoted + 2, "twice as long now");
+    saving.set_time(due + 180);
+    tick(&backend).await;
+    wait_withdrawals(&saving, 1).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// The fast exit clock gives the privacy away, so the core refuses it on
+/// real bitcoin whoever builds it.
+#[tokio::test]
+async fn fast_exits_are_refused_on_bitcoin() {
+    let harness = Harness::new();
+    let config = CoreConfig {
+        data_dir: harness.dir.path().to_str().unwrap().to_string(),
+        network: Network::Bitcoin,
+    };
+    let factory: ChainFactory = Arc::new(|_, _| Err(FedimixError::Offline));
+    let refused = real_backend_with(
+        config,
+        harness.port.clone(),
+        factory,
+        Arc::new(FakeDevices::new()),
+        Arc::new(|| 1_000),
+        draws(&[0.5]),
+        ExitTiming::FAST,
+    )
+    .await;
+    assert_eq!(
+        refused.err(),
+        Some(FedimixError::Internal(
+            "Fast exit timing is for test networks only.".into()
+        ))
+    );
 }

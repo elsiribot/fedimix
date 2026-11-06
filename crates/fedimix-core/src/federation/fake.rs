@@ -127,6 +127,7 @@ pub struct FakeClient {
     /// While set, `lightning_invoice` hangs, as a slow gateway does.
     invoice_held: watch::Sender<bool>,
     invoice_calls: AtomicU32,
+    quote_calls: AtomicU32,
     /// While set, `pay_invoice` hangs before it submits anything.
     pay_held: watch::Sender<bool>,
     pay_calls: AtomicU32,
@@ -176,6 +177,7 @@ impl FakeClient {
             close_held: watch::Sender::new(false),
             invoice_held: watch::Sender::new(false),
             invoice_calls: AtomicU32::new(0),
+            quote_calls: AtomicU32::new(0),
             pay_held: watch::Sender::new(false),
             pay_calls: AtomicU32::new(0),
             withdraw_held: watch::Sender::new(false),
@@ -272,6 +274,11 @@ impl FakeClient {
     }
 
     /// Errors the next `lightning_quote` or `withdraw_quote`.
+    /// Calls of `withdraw_quote`, failed ones included.
+    pub fn quote_calls(&self) -> u32 {
+        self.quote_calls.load(Ordering::SeqCst)
+    }
+
     pub fn fail_next_quote(&self, error: FedimixError) {
         self.quote_errors.lock().unwrap().push_back(error);
     }
@@ -523,6 +530,7 @@ impl FederationClient for FakeClient {
     }
 
     async fn withdraw_quote(&self, address: &str, amount: SendAmount) -> Result<WithdrawQuote> {
+        self.quote_calls.fetch_add(1, Ordering::SeqCst);
         Self::take_error(&self.quote_errors)?;
         let fee = *self.withdraw_fee.lock().unwrap();
         let amount = match amount {

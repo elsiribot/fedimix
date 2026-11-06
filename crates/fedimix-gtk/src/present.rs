@@ -586,6 +586,7 @@ pub fn history_row(item: &HistoryItem, now: Timestamp) -> HistoryRowView {
         HistoryStatus::Lost { .. } => "not sent".to_string(),
         HistoryStatus::Contested => "pending, one of two".to_string(),
         HistoryStatus::Expired => "expired".to_string(),
+        HistoryStatus::OutcomeUnknown => "outcome unknown".to_string(),
     };
     HistoryRowView {
         icon,
@@ -1779,6 +1780,7 @@ mod tests {
         assert_eq!(trailing(HistoryStatus::Pending), "pending");
         assert_eq!(trailing(HistoryStatus::Failed), "failed");
         assert_eq!(trailing(HistoryStatus::Refunded), "refunded");
+        assert_eq!(trailing(HistoryStatus::OutcomeUnknown), "outcome unknown");
         assert_eq!(trailing(HistoryStatus::Stalled), "not confirmed");
         assert_eq!(trailing(HistoryStatus::Expired), "expired");
     }

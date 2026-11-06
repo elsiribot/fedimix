@@ -431,12 +431,18 @@ impl Core {
         seen.map(|seen| seen.last.1)
     }
 
-    /// The exits on their way to Saving, of every federation.
+    /// The exits on their way to Saving, of every federation: what Saving
+    /// shows as depositing. One whose outcome is unknown is not counted.
     pub(super) fn exits_in_flight(&self) -> Result<Amount> {
-        let items = self.store().exit_items(None)?;
+        let store = self.store();
+        let items = store.exit_items(None)?;
+        let mut lost = HashSet::new();
+        for row in store.federations()? {
+            lost.extend(self.lost_exits(&store, &row.id)?);
+        }
         Ok(sum(items
             .iter()
-            .filter(|item| item.state == ExitState::Withdrawing)
+            .filter(|item| item.state == ExitState::Withdrawing && !lost.contains(&item.id))
             .map(|item| item.denomination)))
     }
 

@@ -316,16 +316,16 @@ impl Core {
         self.fail_exit(watch, state)
     }
 
-    /// The exit under `watch` may have taken its money: its row ends with
-    /// `sentence`, and its item stays on its way, never to go out again by
-    /// itself. If it went out, its coin lands it; if not, the money is still
-    /// in the balance, and the queue books it anew.
+    /// The exit under `watch` may have taken its money: its row ends as
+    /// `OutcomeUnknown`, the operation with `sentence`, and its item stays on
+    /// its way, never to go out again by itself. If it went out, its coin
+    /// lands it and completes the row; if not, the money stays in Spending.
     fn lose_exit(&self, watch: &Watch, sentence: &str) -> Result<()> {
-        let failed = |row| HistoryItem {
-            status: HistoryStatus::Failed,
+        let unknown = |row| HistoryItem {
+            status: HistoryStatus::OutcomeUnknown,
             ..row
         };
-        self.finish_row(watch, failed, failed_with(sentence))?;
+        self.finish_row(watch, unknown, failed_with(sentence))?;
         self.events.emit(&Event::QueueChanged);
         self.events.emit(&Event::SavingChanged);
         Ok(())
@@ -386,6 +386,10 @@ impl Core {
                     item.id, coin.outpoint
                 );
             }
+            // The row first: a crash in between lands it again next time.
+            if let Some(intent) = item.intent.as_deref() {
+                self.complete_landed_row(&item.federation_id, intent, coin_txid)?;
+            }
             self.store().exit_landed(&item.id)?;
             self.events.emit(&Event::Notification(Notice::ExitLanded {
                 amount: item.denomination,
@@ -397,6 +401,31 @@ impl Core {
             self.events.emit(&Event::SavingChanged);
         }
         Ok(())
+    }
+
+    /// A landed exit went out, whatever its row said: one whose outcome was
+    /// unknown turns `Complete`, with the coin's txid if it had none.
+    fn complete_landed_row(
+        &self,
+        federation: &str,
+        intent: &str,
+        coin_txid: Option<&str>,
+    ) -> Result<()> {
+        let row = self
+            .store()
+            .history_item(WalletKind::Spending, Some(federation), intent)?;
+        let Some(row) = row.filter(|row| row.status != HistoryStatus::Complete) else {
+            return Ok(());
+        };
+        let txid = row.txid.clone().or(coin_txid.map(str::to_string));
+        self.record(
+            federation,
+            &HistoryItem {
+                status: HistoryStatus::Complete,
+                txid,
+                ..row
+            },
+        )
     }
 }
 

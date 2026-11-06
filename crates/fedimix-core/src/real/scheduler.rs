@@ -24,6 +24,11 @@ use crate::store::{ExitItem, ExitState};
 
 /// How long a fee quote stands before the scheduler asks again.
 const QUOTE_TTL_SECS: u64 = 600;
+/// After a start that failed, the wait before the item may try again. It
+/// doubles with each failure in a row, up to [`MAX_RETRY_SECS`]: each try
+/// reveals a fresh Saving address.
+const FIRST_RETRY_SECS: u64 = 60;
+const MAX_RETRY_SECS: u64 = 3_600;
 
 /// A uniform draw in `[0, 1)`. Injected so tests are deterministic.
 pub type Draw = Arc<dyn Fn() -> f64 + Send + Sync>;
@@ -46,6 +51,16 @@ pub(super) struct Schedule {
     /// By federation and denomination (msat): when it was quoted, and the
     /// quote.
     quotes: HashMap<(String, u64), (Timestamp, WithdrawQuote)>,
+    /// By item id, with the item's federation: the starts that failed in a
+    /// row, and when it may try again. Kept through a redraw.
+    retries: HashMap<String, (String, u32, Timestamp)>,
+}
+
+/// The wait after the `failures`-th failed start in a row.
+fn retry_secs(failures: u32) -> u64 {
+    FIRST_RETRY_SECS
+        .saturating_mul(1u64 << failures.saturating_sub(1).min(16))
+        .min(MAX_RETRY_SECS)
 }
 
 /// The events after which a tick may decide differently.
@@ -205,9 +220,16 @@ impl Core {
                 .collect();
             (items, store.settings()?, store.latest_exit_at(federation)?)
         };
-        self.schedule()
-            .draws
-            .retain(|id, (of, _)| of != federation || items.iter().any(|item| item.id == *id));
+        {
+            let queued = |id: &String| items.iter().any(|item| item.id == *id);
+            let mut schedule = self.schedule();
+            schedule
+                .draws
+                .retain(|id, (of, _)| of != federation || queued(id));
+            schedule
+                .retries
+                .retain(|id, (of, _, _)| of != federation || queued(id));
+        }
         let now = (self.clock)();
         let saving_usable = self.saving_usable();
         if saving_usable {
@@ -251,6 +273,10 @@ impl Core {
             if at > now || exited {
                 continue;
             }
+            let failed = self.schedule().retries.get(&item.id).cloned();
+            if failed.as_ref().is_some_and(|(_, _, until)| *until > now) {
+                continue;
+            }
             // Due, but the last exit was too recent: drawn again from when
             // the next may go.
             if let Some(next) = not_before.filter(|next| *next > now) {
@@ -261,14 +287,23 @@ impl Core {
             match self.start_exit(item, quote, false).await {
                 Ok(_) => {
                     exited = true;
-                    self.schedule().draws.remove(&item.id);
+                    let mut schedule = self.schedule();
+                    schedule.draws.remove(&item.id);
+                    schedule.retries.remove(&item.id);
                 }
-                Err(FedimixError::PreviewExpired) => {
-                    // The fee rose: asked again on the next tick.
-                    let key = (federation.to_string(), item.denomination.msat);
-                    self.schedule().quotes.remove(&key);
+                Err(e) => {
+                    eprintln!("fedimix: starting the exit of item {}: {e}", item.id);
+                    let mut schedule = self.schedule();
+                    if e == FedimixError::PreviewExpired {
+                        // The fee rose: asked again before the next try.
+                        let key = (federation.to_string(), item.denomination.msat);
+                        schedule.quotes.remove(&key);
+                    }
+                    let failures = failed.map_or(1, |(_, failures, _)| failures + 1);
+                    let until = now.saturating_add(retry_secs(failures));
+                    let entry = (federation.to_string(), failures, until);
+                    schedule.retries.insert(item.id.clone(), entry);
                 }
-                Err(e) => eprintln!("fedimix: starting the exit of item {}: {e}", item.id),
             }
         }
         if changed {
@@ -350,4 +385,16 @@ pub fn run_scheduler_now(backend: &super::RealBackend) {
 #[cfg(feature = "testing")]
 pub async fn tick_scheduler(backend: &super::RealBackend) -> Result<()> {
     backend.core.schedule_tick().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_wait_a_minute_doubling_to_an_hour() {
+        let waits: Vec<u64> = (1..=8).map(retry_secs).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 960, 1_920, 3_600, 3_600]);
+        assert_eq!(retry_secs(u32::MAX), 3_600);
+    }
 }

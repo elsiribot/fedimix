@@ -825,17 +825,22 @@ impl Store {
         )
     }
 
-    /// When the latest exit of `federation` started that did not fail,
+    /// When the latest exit of `federation` started that may have gone out,
     /// automatic or not: the next automatic one keeps its distance from it.
+    /// Only an exit whose item was requeued is proven unsent; a failed row
+    /// whose item still holds its intent may have gone out.
     pub(crate) fn latest_exit_at(&self, federation_id: &str) -> Result<Option<Timestamp>> {
         let rows = self.spending_rows_where(federation_id, "ToSaving", |kind| {
             matches!(kind, HistoryKind::ToSaving { .. })
         })?;
-        Ok(rows
-            .iter()
-            .filter(|row| row.status != HistoryStatus::Failed)
-            .map(|row| row.timestamp)
-            .max())
+        let mut latest = None;
+        for row in rows {
+            if row.status == HistoryStatus::Failed && self.exit_by_intent(&row.id)?.is_none() {
+                continue;
+            }
+            latest = latest.max(Some(row.timestamp));
+        }
+        Ok(latest)
     }
 
     /// Spending's rows of `kind`, whose JSON holds `name` quoted.

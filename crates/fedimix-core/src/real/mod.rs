@@ -587,6 +587,12 @@ impl RealBackend {
         let devices = Arc::new(WithSoftware::new(devices, Arc::new(software)));
         let store = Store::open(&db)?;
         store.bind_network(config.network)?;
+        // Exits minutes apart give the privacy away: never on real bitcoin.
+        if config.network == Network::Bitcoin && timing != ExitTiming::DEFAULT {
+            return Err(FedimixError::Internal(
+                "Fast exit timing is for test networks only.".into(),
+            ));
+        }
         let seed_born_with_store = store.seed_born_with_store(seed_is_new)?;
         let settings = store.settings()?;
         let gate = Gate::of(&settings);
