@@ -1,6 +1,7 @@
 //! What Fedimix knows about Saving coins that the chain does not say: the
 //! privacy tag, the federation a coin came from, whether the user froze it,
-//! and which outgoing transactions sent change to Spending.
+//! which outgoing transactions sent change to Spending, and which addresses
+//! exits were given.
 //!
 //! A [`Labels`] is a snapshot read from the store; its setters write through
 //! first, so a crash never leaves the snapshot ahead of the database. Each
@@ -9,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::api::{PrivacyTag, SentChange};
+use crate::api::{Amount, PrivacyTag, SentChange};
 use crate::error::Result;
 use crate::store::Store;
 
@@ -81,18 +82,44 @@ pub struct SentRecord {
     pub refill: bool,
 }
 
+/// The exit an address was given to, kept for good: a coin that ever arrives
+/// there is that exit's, even after the exit failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitLabel {
+    pub item_id: String,
+    pub federation_id: String,
+    pub denomination: Amount,
+    /// The anonymity estimate when it left.
+    pub estimate: u32,
+    pub early: bool,
+}
+
+impl ExitLabel {
+    pub fn tag(&self) -> Tag {
+        let estimate = self.estimate;
+        if self.early {
+            Tag::EarlyExit { estimate }
+        } else {
+            Tag::Anonymity { estimate }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Labels {
     coins: HashMap<String, Label>,
     sent: HashMap<String, SentRecord>,
+    /// By address.
+    exits: HashMap<String, ExitLabel>,
 }
 
 impl Labels {
     pub(crate) fn from_rows(
         coins: HashMap<String, Label>,
         sent: HashMap<String, SentRecord>,
+        exits: HashMap<String, ExitLabel>,
     ) -> Self {
-        Labels { coins, sent }
+        Labels { coins, sent, exits }
     }
 
     pub(crate) fn load(store: &Store) -> Result<Labels> {
@@ -106,6 +133,27 @@ impl Labels {
 
     pub fn tag(&self, outpoint: &str) -> Tag {
         self.get(outpoint).and_then(|l| l.tag).unwrap_or_default()
+    }
+
+    /// The exit `address` was given to, if any.
+    pub fn exit_at(&self, address: &str) -> Option<&ExitLabel> {
+        self.exits.get(address)
+    }
+
+    /// The tag of the coin `outpoint` at `address`: its own label's tag, else
+    /// that of the exit the address was given to, else `Unmixed`.
+    pub fn coin_tag(&self, outpoint: &str, address: &str) -> Tag {
+        self.get(outpoint)
+            .and_then(|l| l.tag)
+            .or_else(|| self.exit_at(address).map(ExitLabel::tag))
+            .unwrap_or_default()
+    }
+
+    /// The federation the coin came from, as stored: an id.
+    pub fn coin_source(&self, outpoint: &str, address: &str) -> Option<String> {
+        self.get(outpoint)
+            .and_then(|l| l.source_federation.clone())
+            .or_else(|| self.exit_at(address).map(|e| e.federation_id.clone()))
     }
 
     pub fn is_frozen(&self, outpoint: &str) -> bool {

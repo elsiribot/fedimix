@@ -632,7 +632,8 @@ async fn follow(client: &Client, watch: Watch, tx: mpsc::Sender<WatchUpdate>) {
     match watch.kind {
         WatchKind::LnReceive => follow_ln_receive(client, op, &tx).await,
         WatchKind::LnSend => follow_ln_send(client, op, &tx).await,
-        WatchKind::Deposit | WatchKind::Withdraw => {
+        // An exit is a withdrawal to a Saving address.
+        WatchKind::Deposit | WatchKind::Withdraw | WatchKind::Exit => {
             let Ok(wallet) = OnChain::of(client) else {
                 let _ = tx.send(failed(NO_RECORD)).await;
                 return;

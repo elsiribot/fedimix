@@ -21,7 +21,7 @@ pub use devices::{HwiPort, WithSoftware, software_entry};
 pub use fake_chain::{BroadcastGoes, FakeChain};
 #[cfg(feature = "testing")]
 pub use fake_devices::FakeDevices;
-pub use labels::{Label, Labels, SentRecord, Tag};
+pub use labels::{ExitLabel, Label, Labels, SentRecord, Tag};
 pub use seed_signer::SeedSigner;
 pub use signer::{DevicePort, Signer};
 #[cfg(feature = "testing")]

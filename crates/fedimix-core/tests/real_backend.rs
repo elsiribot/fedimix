@@ -2589,6 +2589,22 @@ async fn a_deposit_settles_with_an_unreadable_session_count() {
     backend.shutdown().await.unwrap();
 }
 
+/// Own Lightning receives are subtracted by session, so they keep it as
+/// deposits do: the first answer, read when they settle.
+#[tokio::test]
+async fn a_lightning_receive_keeps_its_session() {
+    let harness = Harness::new();
+    harness.first.set_session_count(Ok(80));
+    let backend = harness.joined().await;
+    let info = backend.receive(invoice_request(5_000)).await.unwrap();
+    let id = watch_id(&info.payload).to_string();
+    assert_eq!(row_of(&rows(&*backend).await, &id).session, None);
+    harness.first.push_update(&id, settled(4_990));
+    wait_status(&*backend, &id, HistoryStatus::Complete).await;
+    assert_eq!(row_of(&rows(&*backend).await, &id).session, Some(80));
+    backend.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_preview_names_the_federation_it_spends_from() {
     let harness = Harness::new();
@@ -3556,6 +3572,56 @@ async fn saving_receive_is_a_fresh_address_labelled_unmixed() {
         state.history[0].kind,
         HistoryKind::Received { unmixed: true }
     );
+    backend.shutdown().await.unwrap();
+}
+
+/// An exit's coin names the federation it left, as the user knows it.
+#[tokio::test]
+async fn an_exit_coin_names_its_source_federation() {
+    let saving = SavingHarness::new();
+    let backend = saving.joined().await;
+    let federation = backend.federations().await.unwrap().remove(0);
+    let address = backend.receive(on_chain()).await.unwrap().payload;
+    let unknown = backend.receive(on_chain()).await.unwrap().payload;
+    let raw = raw_store(&saving.harness);
+    for (item, address, federation_id) in [
+        ("a", &address, federation.id.as_str()),
+        ("b", &unknown, "gone"),
+    ] {
+        raw.execute(
+            "INSERT INTO exit_addresses
+                (address, item_id, federation_id, denomination_msat, estimate, early)
+             VALUES (?1, ?2, ?3, 100000000, 42, 0)",
+            [address.as_str(), item, federation_id],
+        )
+        .unwrap();
+    }
+    for (n, address) in [&address, &unknown].into_iter().enumerate() {
+        let n = n as u32;
+        saving
+            .chain
+            .push_sync(confirmed(payment(address, 100_000, n), 2 + n));
+        sync_saving_now(&backend);
+        wait_until("the coin", || async {
+            backend.saving_state().await.unwrap().coins.len() == n as usize + 1
+        })
+        .await;
+    }
+    let state = backend.saving_state().await.unwrap();
+    let coin = |address: &str| {
+        state
+            .coins
+            .iter()
+            .find(|c| c.address == address)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(coin(&address).tag, PrivacyTag::Anonymity { estimate: 42 });
+    assert_eq!(
+        coin(&address).source_federation.as_deref(),
+        Some(federation.name.as_str())
+    );
+    assert_eq!(coin(&unknown).source_federation.as_deref(), Some("gone"));
     backend.shutdown().await.unwrap();
 }
 

@@ -176,16 +176,16 @@ impl Inner {
             .list_unspent()
             .map(|utxo| {
                 let outpoint = utxo.outpoint.to_string();
-                let label = labels.get(&outpoint);
+                let address = Address::from_script(&utxo.txout.script_pubkey, btc_network(network))
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
                 Coin {
                     amount: sat(utxo.txout.value),
-                    tag: labels.tag(&outpoint).to_public(),
+                    tag: labels.coin_tag(&outpoint, &address).to_public(),
                     received_at: position_time(&utxo.chain_position),
-                    address: Address::from_script(&utxo.txout.script_pubkey, btc_network(network))
-                        .map(|a| a.to_string())
-                        .unwrap_or_default(),
-                    source_federation: label.and_then(|l| l.source_federation.clone()),
-                    frozen: label.is_some_and(|l| l.frozen),
+                    source_federation: labels.coin_source(&outpoint, &address),
+                    frozen: labels.is_frozen(&outpoint),
+                    address,
                     confirmed: utxo.chain_position.is_confirmed(),
                     outpoint,
                 }
@@ -211,14 +211,30 @@ impl Inner {
         let txid = tx.compute_txid();
         let (sent, received) = wallet.sent_and_received(tx);
         if sent.to_sat() == 0 {
-            let unmixed = (0..tx.output.len() as u32).all(|vout| {
-                let outpoint = OutPoint { txid, vout };
-                !wallet.is_mine(tx.output[vout as usize].script_pubkey.clone())
-                    || labels.tag(&outpoint.to_string()) == Tag::Unmixed
+            let address = |output: &bitcoin::TxOut| {
+                Address::from_script(&output.script_pubkey, wallet.network())
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
+            };
+            // An exit pays its address exactly the denomination.
+            let exit = tx.output.iter().find(|output| {
+                wallet.is_mine(output.script_pubkey.clone())
+                    && labels.exit_at(&address(output)).is_some()
             });
+            let unmixed = tx.output.iter().zip(0u32..).all(|(output, vout)| {
+                let outpoint = OutPoint { txid, vout };
+                !wallet.is_mine(output.script_pubkey.clone())
+                    || labels.coin_tag(&outpoint.to_string(), &address(output)) == Tag::Unmixed
+            });
+            let kind = match exit {
+                Some(output) => HistoryKind::FromSpending {
+                    denomination: sat(output.value),
+                },
+                None => HistoryKind::Received { unmixed },
+            };
             return HistoryItem {
                 id: txid.to_string(),
-                kind: HistoryKind::Received { unmixed },
+                kind,
                 amount: sat(received),
                 incoming: true,
                 status,
@@ -907,7 +923,7 @@ mod tests {
     use super::*;
     use crate::api::{HistoryKind, HistoryStatus, PrivacyTag, SentChange};
     use crate::error::FedimixError;
-    use crate::saving::{FakeChain, Labels, Signer, SoftSigner};
+    use crate::saving::{FakeChain, Labels, Signer, SoftSigner, Tag};
     use crate::store::Store;
 
     const CONFIRMED_AT: u64 = 500;
@@ -1058,6 +1074,171 @@ mod tests {
         assert!(!coin.frozen);
         assert_eq!(w.balance(), Amount::from_sat(50_000));
         assert_eq!(w.in_flight(), Amount::ZERO);
+    }
+
+    /// Records `address` as the exit of a 100_000 sat item of federation "fed".
+    fn label_exit(store: &Store, n: u32, address: &str, estimate: u32, early: bool) {
+        use crate::scheduler::Origin;
+        use crate::store::{ExitItem, ExitStart, ExitState, Watch, WatchKind};
+        let id = format!("exit-{n}");
+        let denomination = Amount::from_sat(100_000);
+        store
+            .add_exit_items(&[ExitItem {
+                id: id.clone(),
+                federation_id: "fed".into(),
+                denomination,
+                origin: Origin { session: 1, at: 1 },
+                created_at: 1,
+                state: ExitState::Queued,
+                intent: None,
+                address: None,
+                txid: None,
+                fee: None,
+                estimate: None,
+                early: false,
+            }])
+            .unwrap();
+        let intent = format!("intent-{n}");
+        store
+            .begin_exit(&ExitStart {
+                item_id: id,
+                address: address.into(),
+                estimate,
+                early,
+                fee: Amount::from_sat(300),
+                row: HistoryItem {
+                    id: intent.clone(),
+                    kind: HistoryKind::ToSaving { denomination },
+                    amount: denomination,
+                    incoming: false,
+                    status: HistoryStatus::Pending,
+                    timestamp: 1,
+                    txid: None,
+                    fee: None,
+                    session: None,
+                },
+                watch: Watch {
+                    id: intent,
+                    federation_id: "fed".into(),
+                    kind: WatchKind::Exit,
+                    created_at: 1,
+                },
+            })
+            .unwrap();
+    }
+
+    /// Pays `sat` to `address` in a block.
+    fn pay(w: &SavingWallet, n: u32, address: &str, sat: u64) -> OutPoint {
+        let tx = tx_paying(unique_input(n), vec![(spk(address), sat)]);
+        show(w, &tx, Some(1));
+        OutPoint {
+            txid: tx.compute_txid(),
+            vout: 0,
+        }
+    }
+
+    fn coin_at<'a>(coins: &'a [Coin], outpoint: &OutPoint) -> &'a Coin {
+        let outpoint = outpoint.to_string();
+        coins.iter().find(|c| c.outpoint == outpoint).unwrap()
+    }
+
+    /// The label is read by address, so it holds for a coin that came before
+    /// the label was read and for one that came after.
+    #[test]
+    fn an_exit_coin_is_tagged_by_its_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        let store = Store::open(&db(&dir)).unwrap();
+        let address = w.next_receive_address().unwrap();
+        let early = pay(&w, 0, &address, 100_000);
+        label_exit(&store, 0, &address, 42, false);
+        let late_address = w.next_receive_address().unwrap();
+        label_exit(&store, 1, &late_address, 43, false);
+        let mut labels = Labels::load(&store).unwrap();
+        let late = pay(&w, 1, &late_address, 100_000);
+
+        let coins = w.coins(&labels);
+        for (outpoint, estimate) in [(&early, 42), (&late, 43)] {
+            let coin = coin_at(&coins, outpoint);
+            assert_eq!(coin.tag, PrivacyTag::Anonymity { estimate });
+            assert_eq!(coin.source_federation.as_deref(), Some("fed"));
+        }
+
+        // A freeze alone leaves the exit's tag; a tag on the outpoint wins.
+        labels.set_frozen(&store, &early.to_string(), true).unwrap();
+        labels
+            .set_tag(&store, &late.to_string(), Tag::SmallChange, None)
+            .unwrap();
+        let coins = w.coins(&labels);
+        assert_eq!(
+            coin_at(&coins, &early).tag,
+            PrivacyTag::Anonymity { estimate: 42 }
+        );
+        assert!(coin_at(&coins, &early).frozen);
+        assert_eq!(coin_at(&coins, &late).tag, PrivacyTag::SmallChange);
+        assert_eq!(
+            coin_at(&coins, &late).source_federation.as_deref(),
+            Some("fed")
+        );
+    }
+
+    #[test]
+    fn an_early_exit_coin_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        let store = Store::open(&db(&dir)).unwrap();
+        let address = w.next_receive_address().unwrap();
+        label_exit(&store, 0, &address, 7, true);
+        let outpoint = pay(&w, 0, &address, 100_000);
+        let coins = w.coins(&Labels::load(&store).unwrap());
+        let coin = coin_at(&coins, &outpoint);
+        assert_eq!(coin.tag, PrivacyTag::EarlyExit { estimate: 7 });
+        assert_eq!(coin.source_federation.as_deref(), Some("fed"));
+    }
+
+    #[test]
+    fn an_exit_reads_from_spending_in_saving_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        let store = Store::open(&db(&dir)).unwrap();
+        let address = w.next_receive_address().unwrap();
+        label_exit(&store, 0, &address, 42, false);
+        let outpoint = pay(&w, 0, &address, 100_000);
+        let history = w.history(&Labels::load(&store).unwrap());
+        assert_eq!(history.len(), 1);
+        let row = &history[0];
+        assert_eq!(
+            row.kind,
+            HistoryKind::FromSpending {
+                denomination: Amount::from_sat(100_000)
+            }
+        );
+        assert_eq!(row.amount, Amount::from_sat(100_000));
+        assert!(row.incoming);
+        assert_eq!(row.status, HistoryStatus::Complete);
+        assert_eq!(row.txid, Some(outpoint.txid.to_string()));
+    }
+
+    #[test]
+    fn direct_receives_stay_unmixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = new_wallet(&dir);
+        let store = Store::open(&db(&dir)).unwrap();
+        let exit_address = w.next_receive_address().unwrap();
+        label_exit(&store, 0, &exit_address, 42, false);
+        pay(&w, 0, &exit_address, 100_000);
+        let (direct, _) = fund(&w, 1, 30_000, Some(2));
+        let labels = Labels::load(&store).unwrap();
+        let coins = w.coins(&labels);
+        let coin = coin_at(&coins, &direct);
+        assert_eq!(coin.tag, PrivacyTag::Unmixed);
+        assert_eq!(coin.source_federation, None);
+        let history = w.history(&labels);
+        let row = history
+            .iter()
+            .find(|row| row.id == direct.txid.to_string())
+            .unwrap();
+        assert_eq!(row.kind, HistoryKind::Received { unmixed: true });
     }
 
     #[test]

@@ -242,7 +242,8 @@ impl Core {
         Ok(())
     }
 
-    /// The session count to keep on a settled deposit. A replay keeps the first
+    /// The session count to keep on a settled deposit or Lightning receive. A
+    /// replay keeps the first
     /// answer. A failed read leaves it unset, as a deposit must settle anyway.
     async fn deposit_session(
         &self,
@@ -490,7 +491,10 @@ async fn follow(
 ) {
     while let Some(update) = updates.next().await {
         let settled = matches!(update, WatchUpdate::Settled { .. });
-        let session = if settled && watch.kind == WatchKind::Deposit {
+        // Both kinds keep it: own Lightning receives are subtracted from the
+        // anonymity count by session.
+        let session = if settled && matches!(watch.kind, WatchKind::Deposit | WatchKind::LnReceive)
+        {
             core.deposit_session(client, &watch.federation_id, &watch.id)
                 .await
         } else {

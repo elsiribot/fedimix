@@ -6,6 +6,7 @@
 //! [`SavingLive`]. The `saving` lock nests with no other, and no lock is held
 //! across an await.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -205,11 +206,35 @@ impl Core {
             state.balance = snapshot.balance;
             state.in_flight = snapshot.in_flight;
             state.coins = snapshot.coins;
+            self.name_sources(&mut state.coins)?;
             state.history = snapshot.history;
             self.add_signed_rows(&wallet, &labels, &mut state.history)?;
             state.history.truncate(SNAPSHOT_HISTORY);
         }
         Ok(state)
+    }
+
+    /// Labels keep a coin's source federation by id; the user knows it by
+    /// name. An id no row names stays as it is.
+    fn name_sources(&self, coins: &mut [Coin]) -> Result<()> {
+        if coins.iter().all(|coin| coin.source_federation.is_none()) {
+            return Ok(());
+        }
+        let names: HashMap<String, String> = self
+            .store()
+            .federations()?
+            .into_iter()
+            .map(|row| (row.id, row.name))
+            .collect();
+        for source in coins
+            .iter_mut()
+            .filter_map(|coin| coin.source_federation.as_mut())
+        {
+            if let Some(name) = names.get(source.as_str()) {
+                source.clone_from(name);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn saving_history(&self, before: Option<&str>, limit: usize) -> Result<HistoryPage> {

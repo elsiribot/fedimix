@@ -7,14 +7,16 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::anonymity::{DepositSource, SessionDeposit};
 use crate::api::{
     Amount, ChainBackend, DeviceKind, HistoryItem, HistoryKind, HistoryStatus, Network,
     OperationKind, SentChange, Settings, Timestamp, WalletKind,
 };
 use crate::error::{FedimixError, Result};
-use crate::saving::{DeviceAccount, Label, Labels, SentRecord, Tag};
+use crate::saving::{DeviceAccount, ExitLabel, Label, Labels, SentRecord, Tag};
+use crate::scheduler::Origin;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA: &str = "
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL);
@@ -105,6 +107,47 @@ const SIGNED_KIND: &str = "ALTER TABLE saving_signed ADD COLUMN kind TEXT NOT NU
 /// unknown.
 const SIGNED_FEDERATION: &str = "ALTER TABLE saving_signed ADD COLUMN federation_id TEXT;";
 
+/// The exit queue (schema 10). `exit_items` lists every item until it lands,
+/// oldest first by `seq`. `exit_addresses` keeps each address an exit was
+/// given, also after a failed exit, so a coin there is always labelled and the
+/// address is never given again. `anon_deposits` holds the countable deposits
+/// of each synced session.
+const EXIT_SCHEMA: &str = "
+CREATE TABLE exit_items (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    federation_id TEXT NOT NULL,
+    denomination_msat INTEGER NOT NULL,
+    origin_session INTEGER NOT NULL,
+    origin_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    intent TEXT UNIQUE,
+    address TEXT,
+    txid TEXT,
+    fee_msat INTEGER,
+    estimate INTEGER,
+    early INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE exit_addresses (
+    address TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    federation_id TEXT NOT NULL,
+    denomination_msat INTEGER NOT NULL,
+    estimate INTEGER NOT NULL,
+    early INTEGER NOT NULL
+);
+CREATE TABLE anon_deposits (
+    federation_id TEXT NOT NULL,
+    session INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    amount_msat INTEGER NOT NULL,
+    reference TEXT,
+    PRIMARY KEY (federation_id, session, position)
+);
+";
+
 /// A write transaction that takes the write lock up front, so it waits for the
 /// busy timeout instead of failing halfway.
 fn begin(conn: &Connection) -> Result<Transaction<'_>> {
@@ -154,6 +197,7 @@ fn migrate_step(tx: &Transaction<'_>, from: i64) -> Result<()> {
         6 => tx.execute_batch(LOST_TO).map_err(db_err),
         7 => tx.execute_batch(SIGNED_KIND).map_err(db_err),
         8 => tx.execute_batch(SIGNED_FEDERATION).map_err(db_err),
+        9 => tx.execute_batch(EXIT_SCHEMA).map_err(db_err),
         _ => Err(FedimixError::Internal(format!(
             "Fedimix cannot upgrade its database from version {from}."
         ))),
@@ -179,6 +223,9 @@ pub enum WatchKind {
     LnSend,
     Deposit,
     Withdraw,
+    /// A withdrawal of a queued denomination to Saving. Resolved as a send,
+    /// but no Spending send.
+    Exit,
 }
 
 impl WatchKind {
@@ -188,6 +235,7 @@ impl WatchKind {
             Self::LnSend => "ln_send",
             Self::Deposit => "deposit",
             Self::Withdraw => "withdraw",
+            Self::Exit => "exit",
         }
     }
 
@@ -197,6 +245,7 @@ impl WatchKind {
             "ln_send" => Self::LnSend,
             "deposit" => Self::Deposit,
             "withdraw" => Self::Withdraw,
+            "exit" => Self::Exit,
             other => return Err(db_err(format!("unknown watch kind {other:?}"))),
         })
     }
@@ -211,6 +260,182 @@ pub struct Watch {
     pub federation_id: String,
     pub kind: WatchKind,
     pub created_at: Timestamp,
+}
+
+/// Where a queued denomination is on its way to Saving.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitState {
+    Queued,
+    /// Its withdrawal is written down and may have been submitted.
+    Withdrawing,
+    /// Its output has a confirmation in Saving.
+    Landed,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+impl ExitState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Withdrawing => "withdrawing",
+            Self::Landed => "landed",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "queued" => Self::Queued,
+            "withdrawing" => Self::Withdrawing,
+            "landed" => Self::Landed,
+            other => return Err(db_err(format!("unknown exit state {other:?}"))),
+        })
+    }
+}
+
+/// One denomination booked to leave Spending. The fields after `state`
+/// describe the exit under way, and are `None` while it is queued.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExitItem {
+    pub id: String,
+    pub federation_id: String,
+    pub denomination: Amount,
+    pub origin: Origin,
+    pub created_at: Timestamp,
+    pub state: ExitState,
+    pub intent: Option<String>,
+    pub address: Option<String>,
+    pub txid: Option<String>,
+    pub fee: Option<Amount>,
+    pub estimate: Option<u32>,
+    pub early: bool,
+}
+
+/// What [`Store::begin_exit`] writes before a withdrawal is submitted. The
+/// intent is `watch.id`; `row` is the Spending row it finishes.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExitStart {
+    pub item_id: String,
+    pub address: String,
+    pub estimate: u32,
+    pub early: bool,
+    pub fee: Amount,
+    pub row: HistoryItem,
+    pub watch: Watch,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+const EXIT_COLUMNS: &str = "id, federation_id, denomination_msat, origin_session, origin_at,
+    created_at, state, intent, address, txid, fee_msat, estimate, early";
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+fn exit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ExitItem, String)> {
+    Ok((
+        ExitItem {
+            id: r.get(0)?,
+            federation_id: r.get(1)?,
+            denomination: Amount {
+                msat: from_db(r.get(2)?),
+            },
+            origin: Origin {
+                session: from_db(r.get(3)?),
+                at: from_db(r.get(4)?),
+            },
+            created_at: from_db(r.get(5)?),
+            // Parsed by the caller, which can fail with a sentence.
+            state: ExitState::Queued,
+            intent: r.get(7)?,
+            address: r.get(8)?,
+            txid: r.get(9)?,
+            fee: r.get::<_, Option<i64>>(10)?.map(|msat| Amount {
+                msat: from_db(msat),
+            }),
+            estimate: r
+                .get::<_, Option<i64>>(11)?
+                .and_then(|e| u32::try_from(e).ok()),
+            early: r.get(12)?,
+        },
+        r.get(6)?,
+    ))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+fn source_str(source: DepositSource) -> &'static str {
+    match source {
+        DepositSource::OnChain => "on_chain",
+        DepositSource::Lightning => "lightning",
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+fn source_parse(s: &str) -> Result<DepositSource> {
+    match s {
+        "on_chain" => Ok(DepositSource::OnChain),
+        "lightning" => Ok(DepositSource::Lightning),
+        other => Err(db_err(format!("unknown deposit source {other:?}"))),
+    }
+}
+
+/// The next session to sync of `federation`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+fn session_cursor_name(federation: &str) -> String {
+    format!("anon:{federation}")
 }
 
 /// How far a signed transaction has come. `Signed` is an operation still
@@ -427,6 +652,7 @@ impl Store {
             tx.execute_batch(LOST_TO).map_err(db_err)?;
             tx.execute_batch(SIGNED_KIND).map_err(db_err)?;
             tx.execute_batch(SIGNED_FEDERATION).map_err(db_err)?;
+            tx.execute_batch(EXIT_SCHEMA).map_err(db_err)?;
             tx.execute(
                 "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
                 [SCHEMA_VERSION],
@@ -862,11 +1088,15 @@ impl Store {
         Ok(())
     }
 
-    /// Sends not yet finished, oldest first, each with its operation once known.
+    /// Sends and exits not yet finished, oldest first, each with its operation
+    /// once known: an exit's intent is resolved as a send's is.
     pub(crate) fn sends(&self) -> Result<Vec<(Watch, Option<String>)>> {
         let mut out = Vec::new();
         for watch in self.watches()? {
-            if matches!(watch.kind, WatchKind::LnSend | WatchKind::Withdraw) {
+            if matches!(
+                watch.kind,
+                WatchKind::LnSend | WatchKind::Withdraw | WatchKind::Exit
+            ) {
                 let operation = self.operation_of(&watch.id)?;
                 out.push((watch, operation));
             }
@@ -952,6 +1182,277 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(())
+    }
+}
+
+/// The exit queue and the synced session deposits.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
+    )
+)]
+impl Store {
+    fn exits_where(&self, condition: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<ExitItem>> {
+        let sql = format!("SELECT {EXIT_COLUMNS} FROM exit_items WHERE {condition} ORDER BY seq");
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt.query_map(args, exit_from_row).map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut item, state) = row.map_err(db_err)?;
+            item.state = ExitState::parse(&state)?;
+            out.push(item);
+        }
+        Ok(out)
+    }
+
+    /// The items not yet landed, of `federation` or of all, oldest first.
+    pub(crate) fn exit_items(&self, federation: Option<&str>) -> Result<Vec<ExitItem>> {
+        let landed = ExitState::Landed.as_str();
+        match federation {
+            Some(federation) => self.exits_where(
+                "state != ?1 AND federation_id = ?2",
+                &[&landed, &federation],
+            ),
+            None => self.exits_where("state != ?1", &[&landed]),
+        }
+    }
+
+    /// Appends `items` in their order, all or none.
+    pub(crate) fn add_exit_items(&self, items: &[ExitItem]) -> Result<()> {
+        let tx = begin(&self.conn)?;
+        for item in items {
+            tx.execute(
+                &format!(
+                    "INSERT INTO exit_items ({EXIT_COLUMNS})
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                ),
+                params![
+                    item.id,
+                    item.federation_id,
+                    to_db(item.denomination.msat),
+                    to_db(item.origin.session),
+                    to_db(item.origin.at),
+                    to_db(item.created_at),
+                    item.state.as_str(),
+                    item.intent,
+                    item.address,
+                    item.txid,
+                    item.fee.map(|fee| to_db(fee.msat)),
+                    item.estimate,
+                    item.early
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// Removes those of `ids` still queued, in one write. An item already
+    /// withdrawing, or unknown, is left alone.
+    pub(crate) fn remove_queued_exits(&self, ids: &[String]) -> Result<()> {
+        let tx = begin(&self.conn)?;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM exit_items WHERE id = ?1 AND state = ?2",
+                params![id, ExitState::Queued.as_str()],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// The commit point of an exit, before anything is submitted: the item
+    /// withdrawing to its address, the address's label, the Spending row and
+    /// the watch, in one write. Refused for an item not queued, or an address
+    /// any exit was ever given.
+    pub(crate) fn begin_exit(&self, start: &ExitStart) -> Result<()> {
+        let tx = begin(&self.conn)?;
+        let denomination: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT denomination_msat, federation_id FROM exit_items
+                 WHERE id = ?1 AND state = ?2",
+                params![start.item_id, ExitState::Queued.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some((denomination_msat, federation_id)) = denomination else {
+            return Err(FedimixError::UnknownItem(start.item_id.clone()));
+        };
+        tx.execute(
+            "UPDATE exit_items SET state = ?2, intent = ?3, address = ?4, txid = NULL,
+                fee_msat = ?5, estimate = ?6, early = ?7
+             WHERE id = ?1",
+            params![
+                start.item_id,
+                ExitState::Withdrawing.as_str(),
+                start.watch.id,
+                start.address,
+                to_db(start.fee.msat),
+                start.estimate,
+                start.early
+            ],
+        )
+        .map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO exit_addresses
+                (address, item_id, federation_id, denomination_msat, estimate, early)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                start.address,
+                start.item_id,
+                federation_id,
+                denomination_msat,
+                start.estimate,
+                start.early
+            ],
+        )
+        .map_err(db_err)?;
+        upsert_in(
+            &tx,
+            WalletKind::Spending,
+            &start.watch.federation_id,
+            &start.row,
+        )?;
+        insert_watch(&tx, &start.watch)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// The item whose exit has the intent `intent`, while it has one.
+    pub(crate) fn exit_by_intent(&self, intent: &str) -> Result<Option<ExitItem>> {
+        Ok(self
+            .exits_where("intent = ?1", &[&intent])?
+            .into_iter()
+            .next())
+    }
+
+    /// The federation signed the withdrawal as `txid`.
+    pub(crate) fn exit_settled(&self, item_id: &str, txid: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE exit_items SET txid = ?2 WHERE id = ?1",
+                [item_id, txid],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// A failed exit goes back to the queue with its origin. Its address
+    /// keeps its label in `exit_addresses`. Only a withdrawing item moves.
+    pub(crate) fn requeue_exit(&self, item_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE exit_items SET state = ?2, intent = NULL, address = NULL, txid = NULL
+                 WHERE id = ?1 AND state = ?3",
+                [
+                    item_id,
+                    ExitState::Queued.as_str(),
+                    ExitState::Withdrawing.as_str(),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn exit_landed(&self, item_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE exit_items SET state = ?2 WHERE id = ?1",
+                [item_id, ExitState::Landed.as_str()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The countable deposits of one session, and the cursor past it, in one
+    /// write. A session written again replaces what it held.
+    pub(crate) fn add_session(
+        &self,
+        federation: &str,
+        session: u64,
+        deposits: &[SessionDeposit],
+    ) -> Result<()> {
+        let tx = begin(&self.conn)?;
+        tx.execute(
+            "DELETE FROM anon_deposits WHERE federation_id = ?1 AND session = ?2",
+            params![federation, to_db(session)],
+        )
+        .map_err(db_err)?;
+        for (position, deposit) in deposits.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO anon_deposits
+                    (federation_id, session, position, source, amount_msat, reference)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    federation,
+                    to_db(session),
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                    source_str(deposit.source),
+                    to_db(deposit.amount.msat),
+                    deposit.reference
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        tx.execute(
+            "INSERT INTO cursors (name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            params![
+                session_cursor_name(federation),
+                to_db(session.saturating_add(1))
+            ],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// The deposits of `federation` in sessions strictly after `after`, by
+    /// session and then in session order.
+    pub(crate) fn session_deposits(
+        &self,
+        federation: &str,
+        after: u64,
+    ) -> Result<Vec<(u64, SessionDeposit)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session, source, amount_msat, reference FROM anon_deposits
+                 WHERE federation_id = ?1 AND session > ?2
+                 ORDER BY session, position",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![federation, to_db(after)], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (session, source, msat, reference) = row.map_err(db_err)?;
+            out.push((
+                from_db(session),
+                SessionDeposit {
+                    source: source_parse(&source)?,
+                    amount: Amount {
+                        msat: from_db(msat),
+                    },
+                    reference,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The next session to sync of `federation`, once one was.
+    pub(crate) fn session_cursor(&self, federation: &str) -> Result<Option<u64>> {
+        self.cursor(&session_cursor_name(federation))
     }
 }
 
@@ -1067,7 +1568,35 @@ impl Store {
             });
             sent.insert(txid, SentRecord { change, refill });
         }
-        Ok(Labels::from_rows(coins, sent))
+        let mut exits = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT address, item_id, federation_id, denomination_msat, estimate, early
+                 FROM exit_addresses",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    ExitLabel {
+                        item_id: r.get(1)?,
+                        federation_id: r.get(2)?,
+                        denomination: Amount {
+                            msat: from_db(r.get(3)?),
+                        },
+                        estimate: u32::try_from(r.get::<_, i64>(4)?).unwrap_or(u32::MAX),
+                        early: r.get(5)?,
+                    },
+                ))
+            })
+            .map_err(db_err)?;
+        for row in rows {
+            let (address, label) = row.map_err(db_err)?;
+            exits.insert(address, label);
+        }
+        Ok(Labels::from_rows(coins, sent, exits))
     }
 
     /// Sets the tag and source of `outpoint`, and leaves `frozen` alone.
@@ -1320,7 +1849,10 @@ fn device_kind_parse(s: &str) -> Result<DeviceKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anonymity::{DepositSource, SessionDeposit};
     use crate::api::*;
+    use crate::saving::ExitLabel;
+    use crate::scheduler::Origin;
 
     fn open() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -1713,6 +2245,309 @@ mod tests {
         assert_eq!(store.is_send("nothing"), Ok(false));
     }
 
+    fn exit_item(id: &str, federation: &str, sat: u64, session: u64) -> ExitItem {
+        ExitItem {
+            id: id.into(),
+            federation_id: federation.into(),
+            denomination: Amount::from_sat(sat),
+            origin: Origin {
+                session,
+                at: session * 10,
+            },
+            created_at: 1_000 - session,
+            state: ExitState::Queued,
+            intent: None,
+            address: None,
+            txid: None,
+            fee: None,
+            estimate: None,
+            early: false,
+        }
+    }
+
+    fn exit_start(item_id: &str, intent: &str, address: &str) -> ExitStart {
+        ExitStart {
+            item_id: item_id.into(),
+            address: address.into(),
+            estimate: 12,
+            early: true,
+            fee: Amount::from_sat(300),
+            row: HistoryItem {
+                kind: HistoryKind::ToSaving {
+                    denomination: Amount::from_sat(100_000),
+                },
+                ..item(intent, 5)
+            },
+            watch: Watch {
+                id: intent.into(),
+                federation_id: "f".into(),
+                kind: WatchKind::Exit,
+                created_at: 5,
+            },
+        }
+    }
+
+    fn exit_ids(items: &[ExitItem]) -> Vec<&str> {
+        items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    /// Makes every later insert into `table` fail.
+    fn refuse(store: &Store, table: &str) {
+        let raw = rusqlite::Connection::open(store.conn.path().unwrap()).unwrap();
+        raw.execute_batch(&format!(
+            "CREATE TRIGGER refuse_{table} BEFORE INSERT ON {table}
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_version_9_database_gains_the_exit_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fedimix.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
+                     UPDATE schema_version SET version = 9;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.exit_items(None).unwrap(), Vec::new());
+        assert_eq!(store.session_cursor("f").unwrap(), None);
+        assert_eq!(store.session_deposits("f", 0).unwrap(), Vec::new());
+        assert!(store.saving_labels().unwrap().exit_at("address").is_none());
+        store
+            .add_exit_items(&[exit_item("a", "f", 100_000, 1)])
+            .unwrap();
+        assert_eq!(exit_ids(&store.exit_items(None).unwrap()), ["a"]);
+    }
+
+    /// Oldest first is write order, whatever the clock said.
+    #[test]
+    fn exit_items_keep_their_order_and_origin() {
+        let (_d, store) = open();
+        store
+            .add_exit_items(&[
+                exit_item("a", "f", 20_000_000, 3),
+                exit_item("b", "g", 200_000, 7),
+            ])
+            .unwrap();
+        store
+            .add_exit_items(&[exit_item("c", "f", 100_000, 9)])
+            .unwrap();
+        assert_eq!(
+            store.exit_items(None).unwrap(),
+            vec![
+                exit_item("a", "f", 20_000_000, 3),
+                exit_item("b", "g", 200_000, 7),
+                exit_item("c", "f", 100_000, 9),
+            ]
+        );
+        assert_eq!(exit_ids(&store.exit_items(Some("f")).unwrap()), ["a", "c"]);
+        assert!(store.exit_items(Some("h")).unwrap().is_empty());
+        // A duplicate id is refused, and nothing of its batch is written.
+        assert!(
+            store
+                .add_exit_items(&[exit_item("d", "f", 100_000, 1), exit_item("a", "f", 1, 1)])
+                .is_err()
+        );
+        assert_eq!(exit_ids(&store.exit_items(None).unwrap()), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn begin_exit_writes_item_address_row_and_watch_together() {
+        let (_d, store) = open();
+        store
+            .add_exit_items(&[
+                exit_item("a", "f", 100_000, 1),
+                exit_item("b", "f", 100_000, 2),
+            ])
+            .unwrap();
+        let start = exit_start("a", "intent-a", "address-a");
+        store.begin_exit(&start).unwrap();
+        let item = store.exit_by_intent("intent-a").unwrap().unwrap();
+        assert_eq!(item.id, "a");
+        assert_eq!(item.state, ExitState::Withdrawing);
+        assert_eq!(item.address.as_deref(), Some("address-a"));
+        assert_eq!(item.intent.as_deref(), Some("intent-a"));
+        assert_eq!(item.estimate, Some(12));
+        assert_eq!(item.fee, Some(Amount::from_sat(300)));
+        assert!(item.early);
+        assert_eq!(item.origin, exit_item("a", "f", 100_000, 1).origin);
+        assert_eq!(
+            store.saving_labels().unwrap().exit_at("address-a"),
+            Some(&ExitLabel {
+                item_id: "a".into(),
+                federation_id: "f".into(),
+                denomination: Amount::from_sat(100_000),
+                estimate: 12,
+                early: true,
+            })
+        );
+        assert_eq!(
+            store
+                .history_item(WalletKind::Spending, Some("f"), "intent-a")
+                .unwrap(),
+            Some(start.row.clone())
+        );
+        assert_eq!(store.watches().unwrap(), vec![start.watch.clone()]);
+        // Only a queued item begins.
+        assert!(
+            store
+                .begin_exit(&exit_start("a", "intent-x", "address-x"))
+                .is_err()
+        );
+
+        store.exit_settled("a", "txid-a").unwrap();
+        let settled = store.exit_by_intent("intent-a").unwrap().unwrap();
+        assert_eq!(settled.txid.as_deref(), Some("txid-a"));
+        assert_eq!(settled.state, ExitState::Withdrawing);
+        store.exit_landed("a").unwrap();
+        assert_eq!(exit_ids(&store.exit_items(None).unwrap()), ["b"]);
+
+        refuse(&store, "watches");
+        assert!(
+            store
+                .begin_exit(&exit_start("b", "intent-b", "address-b"))
+                .is_err()
+        );
+        let b = &store.exit_items(None).unwrap()[0];
+        assert_eq!(b.state, ExitState::Queued);
+        assert_eq!(b.address, None);
+        assert_eq!(b.intent, None);
+        assert!(
+            store
+                .saving_labels()
+                .unwrap()
+                .exit_at("address-b")
+                .is_none()
+        );
+        assert_eq!(
+            store.history_item(WalletKind::Spending, Some("f"), "intent-b"),
+            Ok(None)
+        );
+        assert_eq!(store.exit_by_intent("intent-b"), Ok(None));
+    }
+
+    /// A failed exit keeps its origin, and its address stays labelled for a
+    /// late payment there, never to be used again.
+    #[test]
+    fn requeue_keeps_the_address_label() {
+        let (_d, store) = open();
+        let queued = exit_item("a", "f", 100_000, 4);
+        store.add_exit_items(std::slice::from_ref(&queued)).unwrap();
+        store
+            .begin_exit(&exit_start("a", "intent-a", "address-a"))
+            .unwrap();
+        store.exit_settled("a", "txid-a").unwrap();
+        store.requeue_exit("a").unwrap();
+        let item = &store.exit_items(None).unwrap()[0];
+        assert_eq!(item.state, ExitState::Queued);
+        assert_eq!(item.intent, None);
+        assert_eq!(item.address, None);
+        assert_eq!(item.txid, None);
+        assert_eq!(item.origin, queued.origin);
+        assert_eq!(store.exit_by_intent("intent-a"), Ok(None));
+        let labels = store.saving_labels().unwrap();
+        assert_eq!(labels.exit_at("address-a").unwrap().item_id, "a");
+        // The address is never handed out again.
+        assert!(
+            store
+                .begin_exit(&exit_start("a", "intent-b", "address-a"))
+                .is_err()
+        );
+        store
+            .begin_exit(&exit_start("a", "intent-b", "address-b"))
+            .unwrap();
+    }
+
+    #[test]
+    fn remove_skips_a_withdrawing_item() {
+        let (_d, store) = open();
+        store
+            .add_exit_items(&[
+                exit_item("a", "f", 100_000, 1),
+                exit_item("b", "f", 100_000, 2),
+                exit_item("c", "f", 100_000, 3),
+            ])
+            .unwrap();
+        store
+            .begin_exit(&exit_start("a", "intent-a", "address-a"))
+            .unwrap();
+        store
+            .remove_queued_exits(&["a".into(), "b".into(), "unknown".into()])
+            .unwrap();
+        let left = store.exit_items(None).unwrap();
+        assert_eq!(exit_ids(&left), ["a", "c"]);
+        assert_eq!(left[0].state, ExitState::Withdrawing);
+    }
+
+    #[test]
+    fn a_session_and_its_cursor_are_one_write() {
+        let (_d, store) = open();
+        let on_chain = SessionDeposit {
+            source: DepositSource::OnChain,
+            amount: Amount::from_sat(100_000),
+            reference: Some("txid:1".into()),
+        };
+        let lightning = SessionDeposit {
+            source: DepositSource::Lightning,
+            amount: Amount { msat: 4_983_000 },
+            reference: None,
+        };
+        store
+            .add_session("f", 5, &[on_chain.clone(), lightning.clone()])
+            .unwrap();
+        store.add_session("f", 6, &[]).unwrap();
+        store
+            .add_session("g", 9, std::slice::from_ref(&on_chain))
+            .unwrap();
+        assert_eq!(store.session_cursor("f").unwrap(), Some(7));
+        assert_eq!(store.session_cursor("g").unwrap(), Some(10));
+        assert_eq!(store.cursor("anon:f").unwrap(), Some(7));
+        assert_eq!(
+            store.session_deposits("f", 4).unwrap(),
+            vec![(5, on_chain.clone()), (5, lightning)]
+        );
+        assert_eq!(store.session_deposits("f", 5).unwrap(), Vec::new());
+
+        refuse(&store, "cursors");
+        assert!(
+            store
+                .add_session("f", 7, std::slice::from_ref(&on_chain))
+                .is_err()
+        );
+        assert_eq!(store.session_cursor("f").unwrap(), Some(7));
+        assert_eq!(store.session_deposits("f", 6).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn exit_watches_count_as_sends_for_resolving() {
+        let (_d, store) = open();
+        store
+            .add_exit_items(&[exit_item("a", "f", 100_000, 1)])
+            .unwrap();
+        let start = exit_start("a", "intent-a", "address-a");
+        store.begin_exit(&start).unwrap();
+        assert_eq!(store.sends().unwrap(), vec![(start.watch.clone(), None)]);
+        store.set_operation("intent-a", "op").unwrap();
+        assert_eq!(
+            store.sends().unwrap(),
+            vec![(start.watch, Some("op".to_string()))]
+        );
+        assert_eq!(
+            store.is_send("intent-a"),
+            Ok(false),
+            "it is no Spending send"
+        );
+    }
+
     #[test]
     fn a_version_1_database_gains_the_operation_column() {
         let dir = tempfile::tempdir().unwrap();
@@ -1736,6 +2571,9 @@ mod tests {
                      ALTER TABLE watches DROP COLUMN operation;
                      ALTER TABLE federations DROP COLUMN joined_session;
                      ALTER TABLE federations DROP COLUMN has_lightning;
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 1;",
                 )
                 .unwrap();
@@ -1762,6 +2600,9 @@ mod tests {
                      DROP TABLE saving_sent;
                      ALTER TABLE federations DROP COLUMN joined_session;
                      ALTER TABLE federations DROP COLUMN has_lightning;
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 2;",
                 )
                 .unwrap();
@@ -1784,6 +2625,9 @@ mod tests {
                      DROP TABLE saving_device;
                      DROP TABLE saving_labels;
                      DROP TABLE saving_sent;
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 4;",
                 )
                 .unwrap();
@@ -1803,6 +2647,9 @@ mod tests {
                 .conn
                 .execute_batch(
                     "DROP TABLE saving_signed;
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 5;",
                 )
                 .unwrap();
@@ -1902,6 +2749,9 @@ mod tests {
                     "ALTER TABLE saving_signed DROP COLUMN lost_to;
                      ALTER TABLE saving_signed DROP COLUMN kind;
                      ALTER TABLE saving_signed DROP COLUMN federation_id;
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 6;",
                 )
                 .unwrap();
@@ -1924,6 +2774,9 @@ mod tests {
                      ALTER TABLE saving_signed DROP COLUMN federation_id;
                      INSERT INTO saving_signed (id, txid, tx_hex, state, created_at)
                      VALUES ('saving-1', 'txid', '00', 'seen', 1);
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 7;",
                 )
                 .unwrap();
@@ -1950,6 +2803,9 @@ mod tests {
                     "ALTER TABLE saving_signed DROP COLUMN federation_id;
                      INSERT INTO saving_signed (id, txid, tx_hex, state, created_at, kind)
                      VALUES ('saving-1', 'txid', '00', 'seen', 1, 'refill');
+                     DROP TABLE exit_items;
+                     DROP TABLE exit_addresses;
+                     DROP TABLE anon_deposits;
                      UPDATE schema_version SET version = 8;",
                 )
                 .unwrap();
