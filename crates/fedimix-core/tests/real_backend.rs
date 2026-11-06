@@ -14,9 +14,9 @@ use bdk_wallet::bitcoin::{
 use bdk_wallet::chain::spk_client::{FullScanResponse, SyncResponse};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use fedimix_core::testing::{
-    BroadcastGoes, ChainClient, ChainFactory, DepositEvent, FakeChain, FakeClient, FakeDevices,
-    FakePort, FederationClient, SendHalt, Signer, SoftSigner, WatchUpdate, halt_sends,
-    real_backend, regtest_address, sync_saving_now,
+    BroadcastGoes, ChainClient, ChainFactory, DepositEvent, DepositSource, FakeChain, FakeClient,
+    FakeDevices, FakePort, FederationClient, SendHalt, SessionDeposit, Signer, SoftSigner,
+    WatchUpdate, halt_sends, item_estimate, real_backend, regtest_address, sync_saving_now,
 };
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
@@ -7409,5 +7409,278 @@ async fn a_credited_send_finishes_its_saving_row() {
         .find(|tx| tx.compute_txid().to_string() == txid)
         .unwrap();
     credited_payment_finishes_its_row(&saving, &backend, &tx, &watch, change).await;
+    backend.shutdown().await.unwrap();
+}
+
+// Session sync and anonymity estimates.
+
+/// 0.001 BTC, the smallest denomination and the federation estimate's.
+const SMALLEST: Amount = Amount { msat: 100_000_000 };
+
+fn chain_deposit(sat: u64, outpoint: &str) -> SessionDeposit {
+    SessionDeposit {
+        source: DepositSource::OnChain,
+        amount: Amount::from_sat(sat),
+        reference: Some(outpoint.to_string()),
+    }
+}
+
+fn lightning_deposit(sat: u64) -> SessionDeposit {
+    SessionDeposit {
+        source: DepositSource::Lightning,
+        amount: Amount::from_sat(sat),
+        reference: None,
+    }
+}
+
+/// An outpoint unique to `n`.
+fn outpoint(n: u64) -> String {
+    format!("{n:064x}:0")
+}
+
+/// The next session the sync of the first federation would fetch.
+fn anon_cursor(harness: &Harness) -> Option<u64> {
+    use rusqlite::OptionalExtension as _;
+    raw_store(harness)
+        .query_row(
+            "SELECT value FROM cursors WHERE name = ?1",
+            [format!("anon:{FIRST_FEDERATION}")],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(|value| u64::try_from(value).unwrap())
+}
+
+/// The sessions holding stored deposits of the first federation.
+fn stored_sessions(harness: &Harness) -> Vec<u64> {
+    let conn = raw_store(harness);
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session FROM anon_deposits WHERE federation_id = ?1
+             ORDER BY session",
+        )
+        .unwrap();
+    stmt.query_map([FIRST_FEDERATION], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(|session| u64::try_from(session.unwrap()).unwrap())
+        .collect()
+}
+
+async fn wait_synced_to(harness: &Harness, cursor: u64) {
+    wait_until("the session sync", || async {
+        anon_cursor(harness) == Some(cursor)
+    })
+    .await;
+}
+
+async fn federation_estimate(backend: &dyn Backend) -> u32 {
+    backend.federations().await.unwrap()[0].anonymity_estimate
+}
+
+async fn wait_federation_estimate(backend: &dyn Backend, estimate: u32) {
+    wait_until("the federation estimate", || async {
+        federation_estimate(backend).await == estimate
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sync_starts_at_the_join() {
+    let harness = Harness::new();
+    for n in 0..3 {
+        harness
+            .first
+            .push_session(vec![chain_deposit(200_000, &outpoint(n))]);
+    }
+    let backend = harness.joined().await;
+    let events = backend.subscribe();
+    for n in 3..5 {
+        harness
+            .first
+            .push_session(vec![chain_deposit(200_000, &outpoint(n))]);
+    }
+    wait_synced_to(&harness, 5).await;
+    wait_event(&events, &Event::QueueChanged).await;
+    assert_eq!(stored_sessions(&harness), [3, 4]);
+    for session in 0..3 {
+        assert_eq!(
+            harness.first.session_fetches(session),
+            0,
+            "session {session}"
+        );
+    }
+    wait_federation_estimate(&*backend, 2).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sync_resumes_from_its_cursor_after_restart() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    for n in 0..2 {
+        harness
+            .first
+            .push_session(vec![chain_deposit(200_000, &outpoint(n))]);
+    }
+    wait_synced_to(&harness, 2).await;
+    backend.shutdown().await.unwrap();
+    drop(backend);
+
+    for n in 2..4 {
+        harness
+            .first
+            .push_session(vec![chain_deposit(200_000, &outpoint(n))]);
+    }
+    let backend = harness.open().await.unwrap();
+    wait_online(&*backend, true).await;
+    wait_synced_to(&harness, 4).await;
+    for session in 0..4 {
+        assert_eq!(
+            harness.first.session_fetches(session),
+            1,
+            "session {session}"
+        );
+    }
+    assert_eq!(stored_sessions(&harness), [0, 1, 2, 3]);
+    wait_federation_estimate(&*backend, 4).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn own_deposits_are_left_out_of_the_count() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    harness.first.push_session(Vec::new());
+    wait_synced_to(&harness, 1).await;
+
+    // A deposit known by its txid, as on v1.
+    let info = backend.receive(address_request()).await.unwrap();
+    let by_txid = watch_id(&info.payload).to_string();
+    let own_txid = format!("{:064x}", 1);
+    harness.first.push_update(
+        &by_txid,
+        WatchUpdate::Settled {
+            amount: Amount::from_sat(199_000),
+            fee: Amount::from_sat(1_000),
+            txid: Some(own_txid.clone()),
+        },
+    );
+    // A deposit known by its outpoint, as on v2.
+    let own_outpoint = format!("{:064x}:1", 2);
+    harness.first.push_deposit(DepositEvent {
+        cursor: 1,
+        id: own_outpoint.clone(),
+        amount: Amount::from_sat(199_000),
+        fee: Amount::from_sat(1_000),
+        txid: Some(format!("{:064x}", 2)),
+        confirmed: true,
+    });
+    // A Lightning receive, which is kept with its session.
+    let info = backend.receive(invoice_request(200_000)).await.unwrap();
+    let by_lightning = watch_id(&info.payload).to_string();
+    harness.first.push_update(&by_lightning, settled(200_000));
+    for id in [&by_txid, &own_outpoint, &by_lightning] {
+        wait_status(&*backend, id, HistoryStatus::Complete).await;
+    }
+    let row = rows(&*backend)
+        .await
+        .into_iter()
+        .find(|row| row.id == by_lightning)
+        .unwrap();
+    assert_eq!(row.session, Some(1));
+
+    harness.first.push_session(vec![
+        chain_deposit(200_000, &format!("{own_txid}:0")),
+        chain_deposit(200_000, &own_outpoint),
+        chain_deposit(200_000, &outpoint(3)),
+        lightning_deposit(200_000),
+        lightning_deposit(200_000),
+    ]);
+    wait_synced_to(&harness, 2).await;
+    // Someone else's deposit and one of the two Lightning receives.
+    wait_federation_estimate(&*backend, 2).await;
+    let estimate = |sat| item_estimate(&backend, FIRST_FEDERATION, 0, Amount::from_sat(sat));
+    assert_eq!(estimate(200_000).unwrap(), 2);
+    assert_eq!(estimate(500_000).unwrap(), 0);
+    // The item's own session never counts.
+    assert_eq!(
+        item_estimate(&backend, FIRST_FEDERATION, 1, SMALLEST).unwrap(),
+        0
+    );
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn federation_estimate_counts_the_recent_window() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    // 600 sessions: the oldest 120 each hold 0.01 BTC, the newest 480 one
+    // 0.001 BTC deposit every four sessions and 0.0005 BTC in between.
+    for n in 0..600 {
+        let sat = match n {
+            n if n < 120 => 1_000_000,
+            n if n % 4 == 0 => 100_000,
+            _ => 50_000,
+        };
+        harness
+            .first
+            .push_session(vec![chain_deposit(sat, &outpoint(n))]);
+    }
+    wait_synced_to(&harness, 600).await;
+    wait_federation_estimate(&*backend, 120).await;
+    backend.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_undecodable_session_stalls_counting_but_not_exits() {
+    let harness = Harness::new();
+    let backend = harness.joined().await;
+    for n in 0..3 {
+        harness
+            .first
+            .push_session(vec![chain_deposit(100_000, &outpoint(n))]);
+    }
+    wait_synced_to(&harness, 3).await;
+    wait_federation_estimate(&*backend, 3).await;
+
+    harness.first.fail_session(
+        3,
+        FedimixError::Internal("This session does not decode.".into()),
+    );
+    for n in 3..6 {
+        harness
+            .first
+            .push_session(vec![chain_deposit(100_000, &outpoint(n))]);
+    }
+    // Tried again, never skipped.
+    wait_until("a retry of the failed session", || async {
+        harness.first.session_fetches(3) >= 2
+    })
+    .await;
+    assert_eq!(anon_cursor(&harness), Some(3));
+    assert_eq!(stored_sessions(&harness), [0, 1, 2]);
+    for session in 4..6 {
+        assert_eq!(
+            harness.first.session_fetches(session),
+            0,
+            "session {session}"
+        );
+    }
+    assert_eq!(federation_estimate(&*backend).await, 3);
+    // An item's estimate still answers, with what was counted.
+    assert_eq!(
+        item_estimate(&backend, FIRST_FEDERATION, 0, SMALLEST).unwrap(),
+        2
+    );
+
+    harness.first.clear_session_failure(3);
+    wait_synced_to(&harness, 6).await;
+    assert_eq!(stored_sessions(&harness), [0, 1, 2, 3, 4, 5]);
+    wait_federation_estimate(&*backend, 6).await;
+    assert_eq!(
+        item_estimate(&backend, FIRST_FEDERATION, 0, SMALLEST).unwrap(),
+        5
+    );
     backend.shutdown().await.unwrap();
 }

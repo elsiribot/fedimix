@@ -38,6 +38,8 @@ use super::port::{
     DepositEvent, FederationClient, FederationPort, FederationPreview, LightningInvoice,
     LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
 };
+use super::sessions;
+use crate::anonymity::SessionDeposit;
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
 use crate::seed::{Seed, open_data_dir};
@@ -697,6 +699,11 @@ impl FederationClient for FedimintClient {
         read(client.api().session_count())
             .await?
             .map_err(|_| FedimixError::Offline)
+    }
+
+    async fn session_deposits(&self, session: u64) -> Result<Option<Vec<SessionDeposit>>> {
+        let client = self.client()?;
+        sessions::session_deposits(&client, session).await
     }
 
     async fn min_deposit(&self) -> Result<Amount> {

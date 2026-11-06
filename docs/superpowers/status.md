@@ -5,7 +5,7 @@ Phase 3 (Saving) is complete. `fedimix` runs Spending and Saving on the real bac
 ## What works (commands run in `nix develop`)
 - `just run [--data-dir PATH] [--network bitcoin|signet|regtest]`: the real wallet. `just demo`: the complete UI over the demo backend.
 - `just clippy`, `just fmt`, `just test`.
-- `just test-integration`: devimint, both module sets (36 tests each at `FM_FED_SIZE=1`).
+- `just test-integration`: devimint, both module sets (38 tests each at `FM_FED_SIZE=1`).
 - `just test-real-ui`: the real binary through Join, Lightning, restart, Saving on "This computer" (setup, receive, send, refill) and a `--test-signer` Ledger stand-in, under headless sway.
 - `just interact-demo`, `just screenshot-all`, `nix build` / `just build-nix`.
 
@@ -15,7 +15,7 @@ Phase 3 (Saving) is complete. `fedimix` runs Spending and Saving on the real bac
 - Real pointer input, dark theme, accessibility, a real desktop (sway only).
 
 ## Next
-Phase 4 (scheduler and anonymity estimate): plan `docs/superpowers/plans/2026-10-30-fedimix-phase-4.md`. Task 1 spike: sessions decode on both generations. Tasks 2, 3 and 8 done (Task 8: the demo backend exits on its own, `just demo` scenario `exits`, flow 30). Task 2: pure `scheduler` and `anonymity` modules with unit tests; nothing calls them yet. Task 3 done: schema 10 stores the exit queue, exit addresses and session deposits; Saving coins at an exit address are tagged by it and read "From Spending"; Lightning receives keep their session. Nothing writes the queue yet. Next: Tasks 4-11.
+Phase 4 (scheduler and anonymity estimate): plan `docs/superpowers/plans/2026-10-30-fedimix-phase-4.md`. Task 1 spike: sessions decode on both generations. Tasks 2, 3 and 8 done (Task 8: the demo backend exits on its own, `just demo` scenario `exits`, flow 30). Task 2: pure `scheduler` and `anonymity` modules with unit tests; Task 4 calls `anonymity`. Task 3 done: schema 10 stores the exit queue, exit addresses and session deposits; Saving coins at an exit address are tagged by it and read "From Spending"; Lightning receives keep their session. Nothing writes the queue yet. Task 4 done: each connection syncs the federation's signed sessions (v1 and v2 deposits, LNv2 receives) into the store from the join on, retrying a session that fails; `FederationInfo.anonymity_estimate` counts other people's deposits of at least 0.001 BTC in the last 480 synced sessions, and `Core::item_estimate` an item's. Next: Tasks 5-7, 9-11.
 Demo fixes done: Saving's refill (or send) row turns final when Spending credits its deposit, no restart needed; the header shows "Regtest" or "Signet" off mainnet.
 
 ## Needs user

@@ -5,6 +5,7 @@
 //! the supervisors in [`events`] keep up to date. The `store` and `state` locks
 //! never nest, and neither is held across an await.
 
+mod anonymity;
 mod events;
 mod receive;
 mod refill;
@@ -22,6 +23,8 @@ use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "testing")]
+pub use self::anonymity::item_estimate;
 use self::events::{Events, left_open, supervise};
 #[cfg(feature = "testing")]
 pub use self::saving::sync_saving_now;
@@ -39,6 +42,7 @@ use crate::federation::{FederationClient, FederationPort, FederationPreview, Fed
 use crate::saving::{
     ChainClient, DevicePort, HwiPort, SavingWallet, SeedSigner, WithSoftware, connect_chain,
 };
+use crate::scheduler::ExitTiming;
 use crate::seed::{DataDirLock, Seed};
 use crate::store::{FederationRow, SignedState, Store, Watch};
 
@@ -172,6 +176,8 @@ struct Core {
     /// this seed may have been used at a federation the store does not list.
     seed_born_with_store: bool,
     clock: Clock,
+    /// The exit clock's constants; the session sync polls at its pace.
+    timing: ExitTiming,
     store: Mutex<Store>,
     state: Mutex<State>,
     saving: Mutex<SavingLive>,
@@ -239,7 +245,7 @@ impl Core {
             id: row.id.clone(),
             name: row.name.clone(),
             online: open && online,
-            anonymity_estimate: 0,
+            anonymity_estimate: self.federation_estimate(&row.id),
             balance: Amount {
                 msat: row.balance_msat,
             },
@@ -466,7 +472,15 @@ impl RealBackend {
         let devices = Arc::new(HwiPort::new(dir, config.network));
         let chain_factory =
             Arc::new(|backend: &ChainBackend, proxy: Option<&str>| connect_chain(backend, proxy));
-        Self::build(config, port, chain_factory, devices, Arc::new(system_clock)).await
+        Self::build(
+            config,
+            port,
+            chain_factory,
+            devices,
+            Arc::new(system_clock),
+            ExitTiming::DEFAULT,
+        )
+        .await
     }
 
     /// [`Self::open`] over the given seams.
@@ -477,7 +491,15 @@ impl RealBackend {
         chain_factory: ChainFactory,
         devices: Arc<dyn DevicePort>,
     ) -> Result<Arc<RealBackend>> {
-        Self::build(config, port, chain_factory, devices, Arc::new(system_clock)).await
+        Self::build(
+            config,
+            port,
+            chain_factory,
+            devices,
+            Arc::new(system_clock),
+            ExitTiming::DEFAULT,
+        )
+        .await
     }
 
     pub(crate) async fn build(
@@ -486,6 +508,7 @@ impl RealBackend {
         chain_factory: ChainFactory,
         devices: Arc<dyn DevicePort>,
         clock: Clock,
+        timing: ExitTiming,
     ) -> Result<Arc<RealBackend>> {
         let dir = PathBuf::from(&config.data_dir);
         // The lock comes first: it decides who may touch the seed and the store.
@@ -521,6 +544,7 @@ impl RealBackend {
             seed,
             seed_born_with_store,
             clock,
+            timing,
             store: Mutex::new(store),
             state: Mutex::default(),
             saving: Mutex::new(saving),

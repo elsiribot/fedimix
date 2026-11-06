@@ -9,6 +9,7 @@ use crate::api::Amount;
 /// How far back the per-session deposit rate looks.
 pub(crate) const FEDERATION_WINDOW_SESSIONS: u64 = 480;
 /// The session length assumed until one has been measured.
+#[expect(dead_code, reason = "the real backend uses it from Phase 4 Task 5 on")]
 pub(crate) const DEFAULT_SESSION_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

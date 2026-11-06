@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::anonymity::SessionDeposit;
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::Result;
 use crate::seed::Seed;
@@ -165,6 +166,11 @@ pub trait FederationClient: Send + Sync {
     async fn notes(&self) -> Result<Vec<NoteBucket>>;
     /// How many consensus sessions the federation has finished.
     async fn session_count(&self) -> Result<u64>;
+    /// What a completed session accepted: wallet deposit inputs of either
+    /// generation and LNv2 incoming contracts. `None` while it is not
+    /// complete. An error means the session could not be fetched or decoded;
+    /// it is never to be skipped.
+    async fn session_deposits(&self, session: u64) -> Result<Option<Vec<SessionDeposit>>>;
     /// A deposit at or below this is never credited. Exceeding it is necessary
     /// but not sufficient: the fee moves with the feerate on v2, and the claim
     /// also pays the ecash fee.

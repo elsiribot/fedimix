@@ -263,13 +263,6 @@ pub struct Watch {
 }
 
 /// Where a queued denomination is on its way to Saving.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitState {
     Queued,
@@ -279,13 +272,6 @@ pub(crate) enum ExitState {
     Landed,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 impl ExitState {
     fn as_str(self) -> &'static str {
         match self {
@@ -307,13 +293,6 @@ impl ExitState {
 
 /// One denomination booked to leave Spending. The fields after `state`
 /// describe the exit under way, and are `None` while it is queued.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExitItem {
     pub id: String,
@@ -332,13 +311,6 @@ pub(crate) struct ExitItem {
 
 /// What [`Store::begin_exit`] writes before a withdrawal is submitted. The
 /// intent is `watch.id`; `row` is the Spending row it finishes.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExitStart {
     pub item_id: String,
@@ -350,23 +322,9 @@ pub(crate) struct ExitStart {
     pub watch: Watch,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 const EXIT_COLUMNS: &str = "id, federation_id, denomination_msat, origin_session, origin_at,
     created_at, state, intent, address, txid, fee_msat, estimate, early";
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 fn exit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ExitItem, String)> {
     Ok((
         ExitItem {
@@ -397,13 +355,6 @@ fn exit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ExitItem, String)> 
     ))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 fn source_str(source: DepositSource) -> &'static str {
     match source {
         DepositSource::OnChain => "on_chain",
@@ -411,13 +362,6 @@ fn source_str(source: DepositSource) -> &'static str {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 fn source_parse(s: &str) -> Result<DepositSource> {
     match s {
         "on_chain" => Ok(DepositSource::OnChain),
@@ -427,13 +371,6 @@ fn source_parse(s: &str) -> Result<DepositSource> {
 }
 
 /// The next session to sync of `federation`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
-)]
 fn session_cursor_name(federation: &str) -> String {
     format!("anon:{federation}")
 }
@@ -871,16 +808,39 @@ impl Store {
     /// Spending's deposit rows of `federation`, in no order. A row that no
     /// longer parses is skipped, as in [`Self::history_page`].
     pub(crate) fn deposit_rows(&self, federation_id: &str) -> Result<Vec<HistoryItem>> {
+        self.spending_rows_of(federation_id, &HistoryKind::Deposit, "Deposit")
+    }
+
+    /// As [`Self::deposit_rows`], for Lightning receives.
+    pub(crate) fn lightning_receive_rows(&self, federation_id: &str) -> Result<Vec<HistoryItem>> {
+        self.spending_rows_of(
+            federation_id,
+            &HistoryKind::ReceivedLightning,
+            "ReceivedLightning",
+        )
+    }
+
+    /// Spending's rows of `kind`, whose JSON holds `name` quoted.
+    fn spending_rows_of(
+        &self,
+        federation_id: &str,
+        kind: &HistoryKind,
+        name: &str,
+    ) -> Result<Vec<HistoryItem>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT json FROM history WHERE wallet = ?1 AND federation_id = ?2
-                 AND json LIKE '%\"Deposit\"%'",
+                 AND json LIKE ?3",
             )
             .map_err(db_err)?;
         let rows = stmt
             .query_map(
-                params![wallet_name(WalletKind::Spending), federation_id],
+                params![
+                    wallet_name(WalletKind::Spending),
+                    federation_id,
+                    format!("%\"{name}\"%")
+                ],
                 |r| r.get::<_, String>(0),
             )
             .map_err(db_err)?;
@@ -888,7 +848,7 @@ impl Store {
         for json in rows {
             let json = json.map_err(db_err)?;
             match serde_json::from_str::<HistoryItem>(&json) {
-                Ok(item) if item.kind == HistoryKind::Deposit => out.push(item),
+                Ok(item) if item.kind == *kind => out.push(item),
                 Ok(_) => {}
                 Err(e) => eprintln!("fedimix: skipping a history row that does not parse: {e}"),
             }
@@ -1188,10 +1148,7 @@ impl Store {
 /// The exit queue and the synced session deposits.
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "the real backend uses it from Phase 4 Tasks 4 and 5 on"
-    )
+    expect(dead_code, reason = "the real backend uses it from Phase 4 Task 5 on")
 )]
 impl Store {
     fn exits_where(&self, condition: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<ExitItem>> {
@@ -1415,16 +1372,28 @@ impl Store {
         federation: &str,
         after: u64,
     ) -> Result<Vec<(u64, SessionDeposit)>> {
+        match after.checked_add(1) {
+            Some(first) => self.session_deposits_from(federation, first),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// As [`Self::session_deposits`], from session `first` on, which can be 0.
+    pub(crate) fn session_deposits_from(
+        &self,
+        federation: &str,
+        first: u64,
+    ) -> Result<Vec<(u64, SessionDeposit)>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT session, source, amount_msat, reference FROM anon_deposits
-                 WHERE federation_id = ?1 AND session > ?2
+                 WHERE federation_id = ?1 AND session >= ?2
                  ORDER BY session, position",
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(params![federation, to_db(after)], |r| {
+            .query_map(params![federation, to_db(first)], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,

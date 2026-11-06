@@ -6,6 +6,7 @@ pub(crate) mod fake;
 mod fedimint;
 mod onchain;
 mod port;
+mod sessions;
 
 pub use fedimint::FedimintPort;
 pub use port::{

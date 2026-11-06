@@ -15,9 +15,9 @@ use fedimint_core::PeerId;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
 use fedimix_core::testing::{
-    ChainFactory, DataDirLock, DepositEvent, FakeDevices, FederationClient, FederationPort,
-    FedimintPort, Seed, SendHalt, SoftSigner, Watch, WatchKind, WatchUpdate, connect_chain,
-    halt_sends, sync_saving_now,
+    ChainFactory, DataDirLock, DepositEvent, DepositSource, FakeDevices, FederationClient,
+    FederationPort, FedimintPort, Seed, SendHalt, SoftSigner, Watch, WatchKind, WatchUpdate,
+    connect_chain, halt_sends, item_estimate, real_backend, sync_saving_now,
 };
 use fedimix_core::{
     Amount, Backend, ChainBackend, ChangeDestination, CoreConfig, DeviceKind, Event, EventStream,
@@ -2250,5 +2250,183 @@ async fn refill_reaches_spending() {
                 .any(|r| r.txid.as_ref() == Some(&txid) && r.status == HistoryStatus::Complete)
     })
     .await;
+    backend.shutdown().await.unwrap();
+}
+
+// Session sync and anonymity estimates.
+
+/// 0.001 BTC, the smallest denomination.
+const SMALLEST: Amount = Amount { msat: 100_000_000 };
+
+/// Mines a block a second until the federation has completed `count` sessions.
+async fn sessions_reach(client: &dyn FederationClient, count: u64) {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while client.session_count().await.unwrap() < count {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            mine(1);
+        }
+    })
+    .await
+    .expect("the federation completes its sessions");
+}
+
+/// Deposits `sat` to a fresh address of `client` and returns the funding txid
+/// and, where the generation names it, the outpoint, once it is credited.
+async fn deposit_to(client: &dyn FederationClient, sat: u64) -> (String, Option<String>) {
+    let (address, watch_id) = client.deposit_address().await.unwrap();
+    fund(&address, sat);
+    match &watch_id {
+        Some(id) => {
+            let stream = client.watch(watch(id, WatchKind::Deposit));
+            match mine_until(stream, WatchUpdate::is_final).await {
+                WatchUpdate::Settled { txid, .. } => (txid.unwrap(), None),
+                other => panic!("{other:?}"),
+            }
+        }
+        None => {
+            let event = mine_until(client.deposits(0), |e: &DepositEvent| e.confirmed).await;
+            (event.txid.unwrap(), Some(event.id))
+        }
+    }
+}
+
+fn funded_by(reference: Option<&str>, txid: &str) -> bool {
+    reference.is_some_and(|r| r.split_once(':').is_some_and(|(t, _)| t == txid))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn session_deposits_see_a_deposit_and_a_lightning_receive() {
+    let wallet = Wallet::new();
+    let client = wallet.join().await;
+    let first = client.session_count().await.unwrap();
+    let (txid, outpoint) = deposit_to(&*client, 100_000).await;
+    let id = pay_with_lnd(&*client, Amount::from_sat(5_000)).await;
+    let update = until_final(client.watch(watch(&id, WatchKind::LnReceive))).await;
+    assert!(matches!(update, WatchUpdate::Settled { .. }), "{update:?}");
+    let open = client.session_count().await.unwrap();
+    sessions_reach(&*client, open + 1).await;
+    let count = client.session_count().await.unwrap();
+
+    let mut found = Vec::new();
+    for session in first..count {
+        let deposits = client.session_deposits(session).await.unwrap();
+        found.extend(deposits.expect("a counted session is complete"));
+    }
+    assert_eq!(client.session_deposits(count + 5).await.unwrap(), None);
+    let ours: Vec<_> = found
+        .iter()
+        .filter(|d| d.source == DepositSource::OnChain && funded_by(d.reference.as_deref(), &txid))
+        .collect();
+    assert_eq!(ours.len(), 1, "{found:?}");
+    assert_eq!(
+        ours[0].amount,
+        Amount::from_sat(100_000),
+        "gross: {found:?}"
+    );
+    if let Some(outpoint) = outpoint {
+        assert_eq!(ours[0].reference.as_ref(), Some(&outpoint));
+    }
+    let received: Vec<_> = found
+        .iter()
+        .filter(|d| {
+            d.source == DepositSource::Lightning
+                && d.amount >= Amount::from_sat(4_900)
+                && d.amount <= Amount::from_sat(5_000)
+        })
+        .collect();
+    // The sessions are shared: other receives of the same size can land in
+    // them too, so ours is one of those found.
+    assert!(!received.is_empty(), "{found:?}");
+    client.shutdown().await.unwrap();
+}
+
+fn joined_session(dir: &TempDir) -> u64 {
+    let conn = rusqlite::Connection::open(dir.path().join("fedimix.db")).unwrap();
+    let joined: i64 = conn
+        .query_row("SELECT joined_session FROM federations", [], |r| r.get(0))
+        .unwrap();
+    u64::try_from(joined).unwrap()
+}
+
+/// `(session, amount_msat, reference)` of the stored deposits of `federation`.
+fn stored_deposits(dir: &TempDir, federation: &str) -> Vec<(u64, u64, Option<String>)> {
+    let conn = rusqlite::Connection::open(dir.path().join("fedimix.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT session, amount_msat, reference FROM anon_deposits
+             WHERE federation_id = ?1",
+        )
+        .unwrap();
+    stmt.query_map([federation], |r| {
+        Ok((
+            u64::try_from(r.get::<_, i64>(0)?).unwrap(),
+            u64::try_from(r.get::<_, i64>(1)?).unwrap(),
+            r.get(2)?,
+        ))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Waits until the backend's sync has stored the deposit funded by `txid`.
+async fn wait_stored(dir: &TempDir, federation: &str, txid: &str) {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            let stored = stored_deposits(dir, federation);
+            if stored.iter().any(|(_, _, r)| funded_by(r.as_deref(), txid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            mine(1);
+        }
+    })
+    .await
+    .expect("the sync stores the deposit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs devimint"]
+async fn another_wallets_deposit_raises_the_estimate() {
+    let (dir, config) = folder();
+    let clock = Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    });
+    let port = Arc::new(FedimintPort::new(dir.path()));
+    let backend = real_backend(config, port, clock).await.unwrap();
+    backend.join_federation(invite()).await.unwrap();
+    wait_online(&backend).await;
+    let federation = backend.federations().await.unwrap()[0].id.clone();
+    let events = backend.subscribe();
+    let info = address(&backend).await;
+    fund(&info.payload, 100_000);
+    let row = mine_until_received(&backend, &events).await;
+    let own_txid = row.txid.clone().unwrap();
+    let joined = joined_session(&dir);
+
+    // The sync has seen our own deposit, and does not count it.
+    wait_stored(&dir, &federation, &own_txid).await;
+    let before = item_estimate(&backend, &federation, joined, SMALLEST).unwrap();
+    let others = stored_deposits(&dir, &federation)
+        .iter()
+        .filter(|(session, msat, reference)| {
+            *session > joined
+                && *msat >= SMALLEST.msat
+                && !funded_by(reference.as_deref(), &own_txid)
+        })
+        .count();
+    assert_eq!(before as usize, others);
+
+    let other = Wallet::new();
+    let client = other.join().await;
+    let (txid, _) = deposit_to(&*client, 200_000).await;
+    wait_stored(&dir, &federation, &txid).await;
+    let after = item_estimate(&backend, &federation, joined, SMALLEST).unwrap();
+    assert_eq!(after, before + 1);
+    client.shutdown().await.unwrap();
     backend.shutdown().await.unwrap();
 }

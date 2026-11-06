@@ -15,6 +15,7 @@ use super::port::{
     DepositEvent, FederationClient, FederationPort, FederationPreview, LightningInvoice,
     LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote, WithdrawTerms,
 };
+use crate::anonymity::SessionDeposit;
 use crate::api::{Amount, Network, NoteBucket, SendAmount};
 use crate::error::{FedimixError, Result};
 use crate::seed::Seed;
@@ -93,6 +94,11 @@ pub struct FakeClient {
     withdraw_fee: Mutex<Amount>,
     receive_fee: Mutex<Option<Amount>>,
     session_count: Mutex<Result<u64>>,
+    /// What completed sessions accepted, by index; one not listed was empty.
+    sessions: Mutex<HashMap<u64, Vec<SessionDeposit>>>,
+    /// Sessions whose fetch fails, until cleared.
+    session_failures: Mutex<HashMap<u64, FedimixError>>,
+    session_fetches: Mutex<HashMap<u64, u32>>,
     /// Next results of these calls; empty means the call works.
     invoice_errors: Mutex<VecDeque<FedimixError>>,
     quote_errors: Mutex<VecDeque<FedimixError>>,
@@ -142,6 +148,9 @@ impl FakeClient {
             withdraw_fee: Mutex::new(Amount::from_sat(300)),
             receive_fee: Mutex::new(None),
             session_count: Mutex::new(Ok(0)),
+            sessions: Mutex::default(),
+            session_failures: Mutex::default(),
+            session_fetches: Mutex::default(),
             invoice_errors: Mutex::default(),
             quote_errors: Mutex::default(),
             pay_errors: Mutex::default(),
@@ -212,6 +221,30 @@ impl FakeClient {
 
     pub fn set_session_count(&self, count: Result<u64>) {
         *self.session_count.lock().unwrap() = count;
+    }
+
+    /// Completes the next session with `deposits`: the session count follows.
+    pub fn push_session(&self, deposits: Vec<SessionDeposit>) {
+        let mut count = self.session_count.lock().unwrap();
+        let next = count.clone().unwrap_or(0);
+        self.sessions.lock().unwrap().insert(next, deposits);
+        *count = Ok(next + 1);
+    }
+
+    /// Fetching `session` fails with `error` until
+    /// [`Self::clear_session_failure`].
+    pub fn fail_session(&self, session: u64, error: FedimixError) {
+        self.session_failures.lock().unwrap().insert(session, error);
+    }
+
+    pub fn clear_session_failure(&self, session: u64) {
+        self.session_failures.lock().unwrap().remove(&session);
+    }
+
+    /// Calls of `session_deposits` for `session`, failed ones included.
+    pub fn session_fetches(&self, session: u64) -> u32 {
+        let fetches = self.session_fetches.lock().unwrap();
+        fetches.get(&session).copied().unwrap_or(0)
     }
 
     pub fn set_receive_fee(&self, fee: Option<Amount>) {
@@ -383,6 +416,24 @@ impl FederationClient for FakeClient {
 
     async fn session_count(&self) -> Result<u64> {
         self.session_count.lock().unwrap().clone()
+    }
+
+    async fn session_deposits(&self, session: u64) -> Result<Option<Vec<SessionDeposit>>> {
+        *self
+            .session_fetches
+            .lock()
+            .unwrap()
+            .entry(session)
+            .or_default() += 1;
+        if let Some(error) = self.session_failures.lock().unwrap().get(&session) {
+            return Err(error.clone());
+        }
+        let count = self.session_count.lock().unwrap().clone()?;
+        if session >= count {
+            return Ok(None);
+        }
+        let sessions = self.sessions.lock().unwrap();
+        Ok(Some(sessions.get(&session).cloned().unwrap_or_default()))
     }
 
     async fn min_deposit(&self) -> Result<Amount> {

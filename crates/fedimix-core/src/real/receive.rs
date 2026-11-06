@@ -454,6 +454,11 @@ impl Watches {
             .spawn(async move { follow(&core, &*client, &watch, updates).await });
     }
 
+    /// Runs `task` for as long as the connection lasts.
+    pub(super) fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.spawn(task);
+    }
+
     /// Settles what a crash left of sends with no operation. Runs each time the
     /// federation comes online and on a slow timer while it stays online, so a
     /// lookup that failed, or an operation id that could not be saved, is tried

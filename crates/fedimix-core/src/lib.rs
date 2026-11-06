@@ -1,6 +1,5 @@
 //! Fedimix core logic, independent of any UI toolkit.
 
-#[expect(dead_code, reason = "the real backend uses it from Phase 4 Task 4 on")]
 mod anonymity;
 pub mod api;
 pub mod backend;
@@ -46,7 +45,9 @@ pub mod testing {
         LightningInvoice, LightningQuote, LightningTerms, WatchUpdate, WithdrawQuote,
     };
     #[cfg(feature = "testing")]
-    pub use crate::real::{ChainFactory, Clock, SendHalt, halt_sends, sync_saving_now};
+    pub use crate::real::{
+        ChainFactory, Clock, SendHalt, halt_sends, item_estimate, sync_saving_now,
+    };
     #[cfg(feature = "testing")]
     pub use crate::saving::{BroadcastGoes, FakeChain, FakeDevices, SoftSigner};
     pub use crate::saving::{
@@ -93,7 +94,8 @@ pub mod testing {
     }
 
     /// [`crate::RealBackend`] over `port`, reading the time from `clock`, with
-    /// the real chain connector and no devices.
+    /// the real chain connector and no devices. The exit clock runs at its
+    /// test pace, so the session sync polls every 2 s.
     #[cfg(feature = "testing")]
     pub async fn real_backend(
         config: crate::CoreConfig,
@@ -108,6 +110,7 @@ pub mod testing {
             }),
             std::sync::Arc::new(FakeDevices::new()),
             clock,
+            crate::scheduler::ExitTiming::FAST,
         )
         .await
     }

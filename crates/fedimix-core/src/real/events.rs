@@ -8,6 +8,7 @@ use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::anonymity::follow_sessions;
 use super::{Core, Gate, held, problem_of};
 use crate::api::{Amount, WalletKind};
 use crate::error::{FedimixError, Result};
@@ -181,6 +182,11 @@ async fn connect_and_forward(core: Arc<Core>, id: String) {
         },
     };
     let mut watches = core.resume_watches(&client, &id);
+    watches.spawn(follow_sessions(
+        Arc::clone(&core),
+        Arc::clone(&client),
+        id.clone(),
+    ));
     let mut balances = client.balance_changes();
     let mut online = client.online_changes();
     let mut resolve = tokio::time::interval_at(Instant::now() + RESOLVE_INTERVAL, RESOLVE_INTERVAL);
