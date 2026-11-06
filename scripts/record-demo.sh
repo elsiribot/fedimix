@@ -24,10 +24,7 @@ size=1280x800
 
 # ---- Inside `devimint dev-fed --exec` ----
 
-rec_pid=""
-segments=0
-output=""
-
+# rec_pid, segments and output are demo-lib.sh's (see demo_rec_start).
 cleanup() {
     [[ -n "$rec_pid" ]] && kill -INT "$rec_pid" 2>/dev/null || true
     [[ -n "${demo_flow_pid:-}" ]] && kill "$demo_flow_pid" 2>/dev/null || true
@@ -36,31 +33,12 @@ cleanup() {
     rm -f "$demo_pid_file"
 }
 
-rec_start() {
-    [[ -z "$rec_pid" ]] || return 0
-    segments=$((segments + 1))
-    local file
-    file=$(printf '%s/seg-%02d.mp4' "$demo_work" "$segments")
-    # -D: every frame, so a still screen keeps its time in the video.
-    wf-recorder -D -o "$output" -f "$file" -c libx264 -x yuv420p -r 30 \
-        </dev/null >"$demo_work/wf-recorder-$segments.log" 2>&1 &
-    rec_pid=$!
-    sleep 1
-}
-
-rec_stop() {
-    [[ -n "$rec_pid" ]] || return 0
-    kill -INT "$rec_pid" 2>/dev/null || true
-    wait "$rec_pid" 2>/dev/null || true
-    rec_pid=""
-}
-
 # Payments run in the background: the app waits at most 10 s for a shot's answer.
 demo_on_shot() {
     local shot="$1"
     case "$shot" in
-        _rec) rec_start; return ;;
-        _cut) rec_stop; return ;;
+        _rec) demo_rec_start; return ;;
+        _cut) demo_rec_stop; return ;;
     esac
     demo_grim "$shots/$shot.png"
     say "screenshot $shot.png"
@@ -75,24 +53,6 @@ demo_on_shot() {
             (demo_send_onchain "$(cat "$demo_work/saving-address-2.txt")" 0.005 >/dev/null) &
             ;;
     esac
-}
-
-join_segments() {
-    local list="$demo_work/segments.txt" seg
-    : > "$list"
-    for seg in "$demo_work"/seg-*.mp4; do
-        [[ -s "$seg" ]] && echo "file '$seg'" >> "$list"
-    done
-    [[ -s "$list" ]] || die "no video segments were recorded"
-    # wf-recorder writes limited-range frames but tags them full range (yuvj420p):
-    # re-tag the stream, or the video comes out about 8% too dark.
-    ffmpeg -loglevel error -y -f concat -safe 0 -i "$list" -c:v copy \
-        -bsf:v h264_metadata=video_full_range_flag=0 "$demo_work/joined.mp4"
-    ffmpeg -loglevel error -y -i "$demo_work/joined.mp4" \
-        -c:v libx264 -pix_fmt yuv420p -r 30 -movflags +faststart "$video"
-    local secs
-    secs=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video")
-    say "video: $video (${secs%.*} s, $segments segments)"
 }
 
 inner() {
@@ -111,12 +71,12 @@ inner() {
     FEDIMIX_SAVING_DEST=$(btc getnewaddress)
     local t0=$SECONDS
     demo_flow "$root/scripts/demo-story/story.drive" "$demo_wallet" 2400 || {
-        rec_stop
+        demo_rec_stop
         die "the story failed after $((SECONDS - t0))s; logs in $demo_work"
     }
-    rec_stop
+    demo_rec_stop
     say "story done in $((SECONDS - t0))s"
-    join_segments
+    demo_join_segments
     # The dark theme, on the wallet the story left.
     demo_on_shot() {
         local name

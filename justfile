@@ -41,6 +41,10 @@ demo-live *args:
 record-demo:
     scripts/record-demo.sh
 
+# Record exits on the real backend (regtest devimint, --exit-timing fast) to ~/fedimix-demo/phase4/real-exits
+record-exits:
+    scripts/record-exits.sh
+
 # Record the Phase 4 exits story on the demo backend (simulated) to ~/fedimix-demo/phase4 (video and screenshots)
 record-exits-demo:
     scripts/record-exits-demo.sh

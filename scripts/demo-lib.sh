@@ -64,7 +64,8 @@ demo_check_shell() {
 demo_build() {
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
     echo "building fedimix (fast when nothing changed)..." >&2
-    (cd "$root" && cargo build -q -p fedimix-gtk) || die "cargo build failed"
+    # demo_features: extra cargo features, e.g. fedimix-gtk/testing for --exit-timing.
+    (cd "$root" && cargo build -q -p fedimix-gtk ${demo_features:+--features "$demo_features"}) || die "cargo build failed"
     demo_app="$CARGO_TARGET_DIR/debug/fedimix"
     export demo_app
 }
@@ -207,10 +208,12 @@ demo_output_name() {
 # Runs the real app on <data dir> under the current sway with
 # --demo-drive <drive file>. For each `shot NAME` it calls `demo_on_shot NAME`
 # (defined by the caller), then lets the app go on. Fails unless the drive
-# ends with DRIVE OK and the app exits 0 with no CRITICAL or panic.
+# ends with DRIVE OK and the app exits 0 with no CRITICAL or panic. The words
+# of $demo_flow_args, if set, go to the app as well.
 demo_flow() {
     local drive="$1" dir="$2" limit="${3:-900}"
-    local name out err stdin fd pid seen=0 total line status="" code=0 deadline
+    local name out err stdin fd pid seen=0 total line status="" code=0 deadline extra=()
+    read -r -a extra <<<"${demo_flow_args:-}"
     name=$(basename "$drive" .drive)
     out="$demo_work/$name.out" err="$demo_work/$name.err" stdin="$demo_work/$name.stdin"
     deadline=$((SECONDS + limit))
@@ -220,7 +223,7 @@ demo_flow() {
     exec {fd}<>"$stdin"
     (cd "$demo_work" && LD_LIBRARY_PATH="$FEDIMIX_UI_LD_LIBRARY_PATH" \
         GDK_BACKEND=wayland GSK_RENDERER=cairo GTK_A11Y=none \
-        exec "$demo_app" --data-dir "$dir" --network regtest --demo-drive "$drive") \
+        exec "$demo_app" --data-dir "$dir" --network regtest ${extra[@]+"${extra[@]}"} --demo-drive "$drive") \
         <&"$fd" >"$out" 2>"$err" &
     pid=$!
     demo_flow_pid=$pid
@@ -253,6 +256,51 @@ demo_flow() {
         return 1
     fi
     say "flow $name: ok"
+}
+
+# ---- Recording ----
+
+# Video segments for `shot _rec` / `shot _cut`. The caller sets `output` (the
+# sway output, demo_output_name) and `video` (the final file) first.
+rec_pid=""
+segments=0
+output=""
+
+demo_rec_start() {
+    [[ -z "$rec_pid" ]] || return 0
+    segments=$((segments + 1))
+    local file
+    file=$(printf '%s/seg-%02d.mp4' "$demo_work" "$segments")
+    # -D: every frame, so a still screen keeps its time in the video.
+    wf-recorder -D -o "$output" -f "$file" -c libx264 -x yuv420p -r 30 \
+        </dev/null >"$demo_work/wf-recorder-$segments.log" 2>&1 &
+    rec_pid=$!
+    sleep 1
+}
+
+demo_rec_stop() {
+    [[ -n "$rec_pid" ]] || return 0
+    kill -INT "$rec_pid" 2>/dev/null || true
+    wait "$rec_pid" 2>/dev/null || true
+    rec_pid=""
+}
+
+demo_join_segments() {
+    local list="$demo_work/segments.txt" seg
+    : > "$list"
+    for seg in "$demo_work"/seg-*.mp4; do
+        [[ -s "$seg" ]] && echo "file '$seg'" >> "$list"
+    done
+    [[ -s "$list" ]] || die "no video segments were recorded"
+    # wf-recorder writes limited-range frames but tags them full range (yuvj420p):
+    # re-tag the stream, or the video comes out about 8% too dark.
+    ffmpeg -loglevel error -y -f concat -safe 0 -i "$list" -c:v copy \
+        -bsf:v h264_metadata=video_full_range_flag=0 "$demo_work/joined.mp4"
+    ffmpeg -loglevel error -y -i "$demo_work/joined.mp4" \
+        -c:v libx264 -pix_fmt yuv420p -r 30 -movflags +faststart "$video"
+    local secs
+    secs=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video")
+    say "video: $video (${secs%.*} s, $segments segments)"
 }
 
 # Takes a 1280x800 screenshot of the headless output.

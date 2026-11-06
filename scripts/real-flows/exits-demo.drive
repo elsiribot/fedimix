@@ -1,0 +1,122 @@
+# scripts/record-exits.sh: exits on the real backend, paced for a viewer; the
+# same steps as exits.drive, with holds so each screen can be read. `shot
+# NN-name` is a screenshot; `shot _rec` and `shot _cut` start and stop a video
+# segment, so waits on blocks and on the scheduler are left out of the video.
+# The script answers `shot 03-deposit-1` and `shot 09-deposit-2` by paying the
+# address on screen. No text is added to the video.
+
+expect-slow Join a federation
+shot _rec
+wait 2000
+type-env "Paste an invite code" FM_INVITE_CODE
+wait 2000
+click Join
+shot _cut
+expect-slow Devimint Federation
+shot _rec
+wait 2000
+# Chain server, and a small target with no grace, so exits show in minutes.
+action app.settings
+type-env "Server URL" FEDIMIX_CHAIN_URL
+apply Server URL
+wait 800
+expect Anonymity target
+expect anon ~
+type "Target (BTC)" 0.002
+type "Anonymity target" 1
+type "Grace minutes" 0
+wait 800
+shot 01-settings
+wait 3000
+click Back
+# Saving on this computer.
+click Saving
+click Set up
+expect This computer
+click Set up
+expect-slow Saving is set up
+wait 2500
+shot 02-saving-ready
+click Spending
+click Receive
+click On-chain
+expect-within 120 bcrt1
+save-text bcrt1 exits-deposit-1.txt
+wait 3000
+shot 03-deposit-1
+close-dialog
+shot _cut
+expect-within 300 0.01 moving to Saving
+shot _rec
+wait 3000
+shot 04-moving
+click-containing moving to Saving
+expect Est. anonymity
+expect 0.01
+wait 4000
+shot 05-queue
+# An early exit: the fee and the warning first.
+click Item actions
+click Exit now (lower privacy)
+expect-slow Exit now?
+expect this note leaves with an anonymity set of about
+expect Withdrawal fee:
+wait 4500
+shot 06-exit-dialog
+click Exit now
+click Back
+click Saving
+expect-within 60 +0.0100 BTC depositing
+wait 3000
+shot 07-depositing
+shot _cut
+expect-gone-within 300 depositing
+expect 0.0100 BTC
+shot _rec
+wait 2500
+click 0.0100 BTC
+expect anon set
+expect early exit
+wait 4500
+shot 08-landed-early
+click Back
+# A second deposit, which leaves on its own.
+click Spending
+click Receive
+click On-chain
+expect-within 120 bcrt1
+save-text bcrt1 exits-deposit-2.txt
+wait 2500
+shot 09-deposit-2
+close-dialog
+shot _cut
+expect-within 300 0.02 moving to Saving
+shot _rec
+wait 2500
+click-containing moving to Saving
+expect Est. anonymity
+wait 3500
+shot 10-queue-2
+click Back
+action app.settings
+type "Minimum hours in pool" 0
+wait 3000
+shot 11-settings-no-minimum
+click Back
+click Saving
+# Nothing to press: the scheduler draws its time.
+shot _cut
+expect-within 300 0.0300 BTC
+expect-not depositing
+shot _rec
+wait 2500
+click 0.0300 BTC
+click 0.0200 BTC
+expect Anonymity at exit
+expect-not early exit
+wait 4500
+shot 12-landed-automatic
+click Back
+expect early exit
+wait 4500
+shot 13-coins

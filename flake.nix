@@ -180,6 +180,7 @@
                 fmPkgs.procps
                 fmPkgs.netcat
                 fmPkgs.which
+                pkgs.wf-recorder
               ];
               FM_ESPLORA_BASE_EXECUTABLE = "${fmPkgs.esplora-electrs}/bin/esplora";
               # (inputsFrom merges the default shellHook, but not env vars.)
