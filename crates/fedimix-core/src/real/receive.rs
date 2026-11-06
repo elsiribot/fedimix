@@ -197,6 +197,7 @@ impl Core {
         } else {
             Event::FederationChanged
         });
+        self.wake_saving_for(item);
         let was_complete = *write
             == HistoryWrite::Changed {
                 was: HistoryStatus::Complete,
@@ -208,6 +209,28 @@ impl Core {
             } else {
                 Notice::SendConfirmed { amount }
             }));
+        }
+    }
+
+    /// A deposit of a payment from Saving that the federation sees in a block
+    /// is on chain, so Saving's row of it may be final: Saving syncs now. Its
+    /// idle sync can be minutes away, and Saving's row would say pending
+    /// beside a credited deposit in Spending until then.
+    fn wake_saving_for(&self, item: &HistoryItem) {
+        let on_chain = matches!(
+            item.status,
+            HistoryStatus::Confirming { .. } | HistoryStatus::Complete
+        );
+        let Some(txid) = item.txid.as_deref().filter(|_| on_chain) else {
+            return;
+        };
+        if item.kind != HistoryKind::Deposit {
+            return;
+        }
+        match self.store().is_signed_txid(txid) {
+            Ok(true) => self.saving_wake.notify_one(),
+            Ok(false) => {}
+            Err(e) => eprintln!("fedimix: looking up the deposit of {txid}: {e}"),
         }
     }
 

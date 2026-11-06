@@ -1266,6 +1266,17 @@ impl Store {
             .map_err(db_err)
     }
 
+    /// Whether `txid` is a stored transaction's: a payment from Saving.
+    pub(crate) fn is_signed_txid(&self, txid: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM saving_signed WHERE txid = ?1)",
+                [txid],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+    }
+
     pub(crate) fn put_saving_sent(&self, txid: &str, sent: &SentRecord) -> Result<()> {
         let (msat, to_spending) = match &sent.change {
             Some(c) => (Some(to_db(c.amount.msat)), c.to_spending),

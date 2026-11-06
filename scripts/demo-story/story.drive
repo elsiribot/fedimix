@@ -152,8 +152,8 @@ wait 4000
 shot 21-refill-in-saving
 shot _cut
 
-# 8. History, once Spending has credited the refill. (Saving's refill row
-# still says pending at this point; see REPORT.md.)
+# 8. History, once Spending has credited the refill. The credit makes Saving
+# sync, so its refill row is final too.
 click Spending
 expect-within 400 for spending
 expect-not Refill from Saving

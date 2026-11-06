@@ -7269,3 +7269,79 @@ async fn software_wallet_refills() {
     assert_signed(&tx, &coins);
     backend.shutdown().await.unwrap();
 }
+
+/// Spending credits a payment of Saving's: `tx`, to the federation's deposit
+/// `watch`, `gross` sat. Saving's next sync, whenever it comes, shows `tx` in
+/// a block. Then its row in Saving reaches `Complete` and Saving tells the
+/// front end, with no restart and no sync asked for by the test.
+async fn credited_payment_finishes_its_row(
+    saving: &SavingHarness,
+    backend: &Real,
+    tx: &Transaction,
+    watch: &str,
+    gross: Amount,
+) {
+    let txid = tx.compute_txid().to_string();
+    // The sync that the broadcast asked for has run and found it pending,
+    // and so has any a wake left over from `synced` starts: Saving is idle.
+    saving.synced(backend).await;
+    let scans = saving.chain.scans_made();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        saving.chain.scans_made() <= scans + 1,
+        "Saving keeps syncing"
+    );
+    let row = |rows: Vec<HistoryItem>| rows.into_iter().find(|r| r.txid.as_ref() == Some(&txid));
+    assert_eq!(
+        row(saving_rows(backend).await).map(|r| r.status),
+        Some(HistoryStatus::Pending)
+    );
+    saving.chain.push_sync(confirmed(tx.clone(), 9));
+    let events = backend.subscribe();
+    credit(saving, backend, false, watch, &txid, gross).await;
+    wait_until("Saving's row to finish", || async {
+        row(saving_rows(backend).await).is_some_and(|r| r.status == HistoryStatus::Complete)
+    })
+    .await;
+    within("Saving's event", async {
+        while !matches!(
+            events.next().await,
+            Some(Event::SavingChanged)
+                | Some(Event::HistoryItemUpdated {
+                    wallet: WalletKind::Saving,
+                    ..
+                })
+        ) {}
+    })
+    .await;
+}
+
+/// A refill's row in Saving is finished once Spending credits it, without a
+/// restart: the credit is news for Saving too.
+#[tokio::test]
+async fn a_credited_refill_finishes_its_saving_row() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(30_000).await;
+    saving.fund(&backend, 100_000, 0).await;
+    let tx = saving.refilled(&backend).await;
+    let watch = saving.harness.first.last_deposit().unwrap();
+    let gross = sat(tx.output[0].value.to_sat());
+    credited_payment_finishes_its_row(&saving, &backend, &tx, &watch, gross).await;
+    backend.shutdown().await.unwrap();
+}
+
+/// The same for a Saving send whose change Spending credits.
+#[tokio::test]
+async fn a_credited_send_finishes_its_saving_row() {
+    let saving = SavingHarness::new();
+    let backend = saving.refillable(100_000).await;
+    let (change, watch, txid) = change_on_its_way(&saving, &backend).await;
+    let tx = saving
+        .chain
+        .broadcasts()
+        .into_iter()
+        .find(|tx| tx.compute_txid().to_string() == txid)
+        .unwrap();
+    credited_payment_finishes_its_row(&saving, &backend, &tx, &watch, change).await;
+    backend.shutdown().await.unwrap();
+}
